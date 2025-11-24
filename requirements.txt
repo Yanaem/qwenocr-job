@@ -2,5 +2,5 @@ requests
 pypdf
 pdf2image
 Pillow
-tk  # si tu utilises tkinter; sinon tu peux le virer
+google-cloud-storage
 python-dotenv
