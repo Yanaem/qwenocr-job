@@ -30,28 +30,28 @@ def parse_gs_uri(uri: str) -> Tuple[str, str]:
 
 def download_from_gcs(gs_uri: str, local_path: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print(f"📥 Téléchargement GCS → local")
-    print(f"   Bucket : {bucket_name}")
-    print(f"   Objet  : {blob_name}")
+    print("📥 Téléchargement GCS → local")
+    print(f"Bucket : {bucket_name}")
+    print(f"Objet : {blob_name}")
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
     blob.download_to_filename(local_path)
-    print(f"   ✅ Téléchargé dans : {local_path}")
+    print(f"✅ Téléchargé dans : {local_path}")
 
 
 def upload_to_gcs(local_path: str, gs_uri: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print(f"📤 Upload local → GCS")
-    print(f"   Fichier local : {local_path}")
-    print(f"   Bucket        : {bucket_name}")
-    print(f"   Objet         : {blob_name}")
+    print("📤 Upload local → GCS")
+    print(f"Fichier local : {local_path}")
+    print(f"Bucket        : {bucket_name}")
+    print(f"Objet         : {blob_name}")
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_path)
-    print(f"   ✅ Upload terminé")
+    print("✅ Upload terminé")
 
 
 # ---------- Runner logique ----------
@@ -128,7 +128,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None) 
 
             if page_num % 5 == 0:
                 ocr.save_progress(pdf_path, completed_pages)
-                print(f"         💾 Progression sauvegardée")
+                print("         💾 Progression sauvegardée")
 
             print(f"         ✅ Page {page_num} terminée\n")
 
@@ -148,7 +148,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None) 
                 }
             )
 
-            print(f"         ⚠️  Marquée comme erreur, continuation...\n")
+            print("         ⚠️  Marquée comme erreur, continuation...\n")
 
     duration = time.time() - start_time
 
@@ -210,33 +210,53 @@ def main():
         local_input = os.getenv("INPUT_PDF_PATH")  # fallback éventuel
 
         if gcs_input:
-            # Mode GCS
+            # -------- Mode GCS (Cloud Run / Lovable) --------
             local_pdf = "/tmp/input.pdf"
             download_from_gcs(gcs_input, local_pdf)
 
-            # Si pas de GCS_OUTPUT_URI, on génère le .md à côté du PDF source
+            # Si pas de GCS_OUTPUT_URI fourni, on dérive automatiquement :
+            # gs://BUCKET/in/xxx.pdf  →  gs://BUCKET/out/xxx.md
             if not gcs_output:
-                # même chemin + .md
                 bucket, blob = parse_gs_uri(gcs_input)
-                if "." in blob:
-                    base = blob.rsplit(".", 1)[0]
+
+                # blob ex : "in/0b74e8....pdf"
+                if blob.startswith("in/"):
+                    rest = blob[len("in/"):]
+                    if "." in rest:
+                        base = rest.rsplit(".", 1)[0]
+                    else:
+                        base = rest
+                    out_blob = f"out/{base}.md"
                 else:
-                    base = blob
-                gcs_output = f"gs://{bucket}/{base}.md"
+                    # cas plus générique : même chemin, extension .md
+                    if "." in blob:
+                        base = blob.rsplit(".", 1)[0]
+                    else:
+                        base = blob
+                    out_blob = f"{base}.md"
+
+                gcs_output = f"gs://{bucket}/{out_blob}"
 
             # Chemin local temporaire pour le .md
             local_md = "/tmp/output.md"
             md_path = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
 
+            # Upload du Markdown vers GCS
             upload_to_gcs(md_path, gcs_output)
 
+            # Ligne spéciale pour Lovable
+            print("=" * 70)
+            print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
+            print("=" * 70)
+
         elif local_input:
-            # Mode fichier local uniquement
+            # -------- Mode fichier local uniquement --------
             run_for_pdf(local_input, api_key)
+
         else:
             raise RuntimeError(
                 "Ni GCS_INPUT_URI ni INPUT_PDF_PATH définis.\n"
-                "Définis au moins GCS_INPUT_URI=gs://qwenvl/chemin/facture.pdf "
+                "Définis au moins GCS_INPUT_URI=gs://qwenvl/in/chemin/facture.pdf "
                 "pour traiter un fichier depuis ton bucket."
             )
 
