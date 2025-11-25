@@ -10,8 +10,9 @@ from typing import Dict, List, Tuple
 
 import ocr_qwenVL as ocr  # ton script OCR
 from google.cloud import storage
+import requests
 
-# Bucket dédié Qwen
+# Bucket dédié Qwen (figé sur qwenvl par défaut)
 QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
 
 
@@ -39,7 +40,7 @@ def parse_gs_uri(path: str) -> Tuple[str, str]:
 
 def download_from_gcs(gs_uri: str, local_path: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print(f"📥 Téléchargement GCS → local")
+    print("📥 Téléchargement GCS → local")
     print(f"   Bucket : {bucket_name}")
     print(f"   Objet  : {blob_name}")
     client = storage.Client()
@@ -52,7 +53,7 @@ def download_from_gcs(gs_uri: str, local_path: str) -> None:
 
 def upload_to_gcs(local_path: str, gs_uri: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print(f"📤 Upload local → GCS")
+    print("📤 Upload local → GCS")
     print(f"   Fichier local : {local_path}")
     print(f"   Bucket        : {bucket_name}")
     print(f"   Objet         : {blob_name}")
@@ -60,15 +61,21 @@ def upload_to_gcs(local_path: str, gs_uri: str) -> None:
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_path)
-    print(f"✅ Upload terminé")
+    print("✅ Upload terminé")
 
 
 # ---------- Runner logique ----------
 
-def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None) -> str:
+def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     """
     Lance toute la chaîne OCR sur un PDF local.
-    Retourne le chemin du fichier .md généré.
+    Retourne:
+      - chemin du fichier .md généré
+      - page_count
+      - duration
+      - md_size_kb
+      - all_stats
+      - costs
     """
 
     pdf_path = os.path.abspath(pdf_path)
@@ -205,7 +212,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None) 
         )
     print("=" * 70 + "\n")
 
-    return str(md_path)
+    return str(md_path), page_count, duration, md_size_kb, all_stats, costs
 
 
 def main():
@@ -226,11 +233,9 @@ def main():
             # Si pas de GCS_OUTPUT_URI, on dérive la sortie :
             # Entrée : gs://qwenvl/in/xxx.pdf → Sortie : gs://qwenvl/out/xxx.md
             if not gcs_output:
-                # Dérive automatiquement le chemin de sortie dans le bucket QWEN
-                # Entrée :  gs://qwenvl/in/xxx.pdf  →  Sortie : gs://qwenvl/out/xxx.md
                 bucket, blob = parse_gs_uri(gcs_input)
                 if blob.startswith("in/"):
-                    rest = blob[len("in/"): ]
+                    rest = blob[len("in/"):]
                 else:
                     rest = blob
                 if "." in rest:
@@ -242,13 +247,49 @@ def main():
 
             # Chemin local temporaire pour le .md
             local_md = "/tmp/output.md"
-            md_path = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
+            (
+                md_path,
+                page_count,
+                duration,
+                md_size_kb,
+                all_stats,
+                costs,
+            ) = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
 
             upload_to_gcs(md_path, gcs_output)
 
             print("=" * 70)
             print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
             print("=" * 70)
+
+            # Notifier Supabase / Lovable de la fin du job
+            callback_url = os.getenv("CALLBACK_URL")
+            ocr_job_id = os.getenv("OCR_JOB_ID")
+
+            if callback_url and ocr_job_id:
+                try:
+                    total_in = sum(s.get("input_tokens", 0) for s in all_stats)
+                    total_out = sum(s.get("output_tokens", 0) for s in all_stats)
+
+                    payload = {
+                        "ocrJobId": ocr_job_id,
+                        "gcsOutputPath": gcs_output,
+                        "status": "success",
+                        "pageCount": page_count,
+                        "durationSeconds": duration,
+                        "markdownSizeKb": md_size_kb,
+                        "stats": {
+                            "inputTokens": total_in,
+                            "outputTokens": total_out,
+                            "cost": costs["cost_total"],
+                        },
+                    }
+
+                    print(f"📡 Envoi du callback à {callback_url} ...")
+                    resp = requests.post(callback_url, json=payload, timeout=30)
+                    print(f"✅ Callback envoyé ({resp.status_code})")
+                except Exception as e:
+                    print(f"⚠️ Erreur callback: {e}")
 
         elif local_input:
             # Mode fichier local uniquement
