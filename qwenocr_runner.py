@@ -6,12 +6,62 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import ocr_qwenVL as ocr  # ton script OCR
+from google.cloud import storage
 
 
-def run_for_pdf(pdf_path: str, api_key: str) -> None:
+# ---------- GCS utils ----------
+
+def parse_gs_uri(uri: str) -> Tuple[str, str]:
+    """
+    Parse une URI GCS du type gs://bucket/chemin/fichier
+    → (bucket, chemin/fichier)
+    """
+    if not uri.startswith("gs://"):
+        raise ValueError(f"URI GCS invalide: {uri}")
+    path = uri[5:]
+    parts = path.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"URI GCS invalide: {uri}")
+    return parts[0], parts[1]
+
+
+def download_from_gcs(gs_uri: str, local_path: str) -> None:
+    bucket_name, blob_name = parse_gs_uri(gs_uri)
+    print(f"📥 Téléchargement GCS → local")
+    print(f"   Bucket : {bucket_name}")
+    print(f"   Objet  : {blob_name}")
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(local_path)
+    print(f"   ✅ Téléchargé dans : {local_path}")
+
+
+def upload_to_gcs(local_path: str, gs_uri: str) -> None:
+    bucket_name, blob_name = parse_gs_uri(gs_uri)
+    print(f"📤 Upload local → GCS")
+    print(f"   Fichier local : {local_path}")
+    print(f"   Bucket        : {bucket_name}")
+    print(f"   Objet         : {blob_name}")
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    print(f"   ✅ Upload terminé")
+
+
+# ---------- Runner logique ----------
+
+def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None) -> str:
+    """
+    Lance toute la chaîne OCR sur un PDF local.
+    Retourne le chemin du fichier .md généré.
+    """
+
     pdf_path = os.path.abspath(pdf_path)
 
     print("\n" + "=" * 70)
@@ -109,9 +159,8 @@ def run_for_pdf(pdf_path: str, api_key: str) -> None:
 
     final_markdown = "\n\n".join(all_markdown)
 
-    output_md = os.getenv("OUTPUT_MD_PATH")
-    if output_md:
-        md_path = Path(output_md)
+    if output_md_path:
+        md_path = Path(output_md_path)
     else:
         md_path = Path(pdf_path).with_suffix(".md")
 
@@ -138,21 +187,16 @@ def run_for_pdf(pdf_path: str, api_key: str) -> None:
     print(f"💾 Taille Markdown  : {md_size_kb:.1f} KB")
     print(f"⏱️  Durée totale     : {duration // 60:.0f}min {duration % 60:.0f}s")
     print(f"⚡ Vitesse moyenne  : {duration / page_count:.1f}s/page")
-
-    print("\n💰 TOKENS")
-    print(f"📥 Input  : {costs['total_input']:,}")
-    print(f"📤 Output : {costs['total_output']:,}")
-    print(f"📊 Total  : {costs['total_tokens']:,}")
-    print(f"💵 Coût total : ${costs['cost_total']:.4f}")
-
+    print(f"💵 Coût total       : ${costs['cost_total']:.4f}")
     if validation["stats"]:
         stats = validation["stats"]
         print(
             f"📊 {stats.get('montants_detectes', 0)} montants, "
             f"{stats.get('lignes_tableaux', 0)} lignes tableaux"
         )
-
     print("=" * 70 + "\n")
+
+    return str(md_path)
 
 
 def main():
@@ -161,14 +205,40 @@ def main():
         if not api_key:
             raise RuntimeError("DASHSCOPE_API_KEY non définie.")
 
-        pdf_path = os.getenv("INPUT_PDF_PATH")
-        if not pdf_path:
-            raise RuntimeError(
-                "INPUT_PDF_PATH non définie. "
-                "Donne le chemin du PDF à traiter via cette variable."
-            )
+        gcs_input = os.getenv("GCS_INPUT_URI")
+        gcs_output = os.getenv("GCS_OUTPUT_URI")
+        local_input = os.getenv("INPUT_PDF_PATH")  # fallback éventuel
 
-        run_for_pdf(pdf_path, api_key)
+        if gcs_input:
+            # Mode GCS
+            local_pdf = "/tmp/input.pdf"
+            download_from_gcs(gcs_input, local_pdf)
+
+            # Si pas de GCS_OUTPUT_URI, on génère le .md à côté du PDF source
+            if not gcs_output:
+                # même chemin + .md
+                bucket, blob = parse_gs_uri(gcs_input)
+                if "." in blob:
+                    base = blob.rsplit(".", 1)[0]
+                else:
+                    base = blob
+                gcs_output = f"gs://{bucket}/{base}.md"
+
+            # Chemin local temporaire pour le .md
+            local_md = "/tmp/output.md"
+            md_path = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
+
+            upload_to_gcs(md_path, gcs_output)
+
+        elif local_input:
+            # Mode fichier local uniquement
+            run_for_pdf(local_input, api_key)
+        else:
+            raise RuntimeError(
+                "Ni GCS_INPUT_URI ni INPUT_PDF_PATH définis.\n"
+                "Définis au moins GCS_INPUT_URI=gs://qwenvl/chemin/facture.pdf "
+                "pour traiter un fichier depuis ton bucket."
+            )
 
     except Exception as e:
         print("\n❌ Erreur fatale dans qwenocr_runner.py :", e, file=sys.stderr)
