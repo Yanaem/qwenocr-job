@@ -11,28 +11,37 @@ from typing import Dict, List, Tuple
 import ocr_qwenVL as ocr  # ton script OCR
 from google.cloud import storage
 
+# Bucket dédié Qwen
+QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
+
 
 # ---------- GCS utils ----------
 
-def parse_gs_uri(uri: str) -> Tuple[str, str]:
+def parse_gs_uri(path: str) -> Tuple[str, str]:
     """
-    Parse une URI GCS du type gs://bucket/chemin/fichier
-    → (bucket, chemin/fichier)
+    Normalise un chemin GCS pour utiliser toujours le bucket QWEN_BUCKET.
+
+    - Accepte "gs://bucket/chemin/fichier" ou "chemin/fichier"
+    - Retourne (QWEN_BUCKET, "chemin/fichier")
     """
-    if not uri.startswith("gs://"):
-        raise ValueError(f"URI GCS invalide: {uri}")
-    path = uri[5:]
-    parts = path.split("/", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(f"URI GCS invalide: {uri}")
-    return parts[0], parts[1]
+    if path.startswith("gs://"):
+        rest = path[5:]
+        parts = rest.split("/", 1)
+        obj = parts[1] if len(parts) == 2 else ""
+    else:
+        obj = path.lstrip("/")
+
+    if not obj:
+        raise ValueError(f"Chemin objet GCS invalide: {path}")
+
+    return QWEN_BUCKET, obj
 
 
 def download_from_gcs(gs_uri: str, local_path: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print("📥 Téléchargement GCS → local")
-    print(f"Bucket : {bucket_name}")
-    print(f"Objet : {blob_name}")
+    print(f"📥 Téléchargement GCS → local")
+    print(f"   Bucket : {bucket_name}")
+    print(f"   Objet  : {blob_name}")
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
@@ -43,15 +52,15 @@ def download_from_gcs(gs_uri: str, local_path: str) -> None:
 
 def upload_to_gcs(local_path: str, gs_uri: str) -> None:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print("📤 Upload local → GCS")
-    print(f"Fichier local : {local_path}")
-    print(f"Bucket        : {bucket_name}")
-    print(f"Objet         : {blob_name}")
+    print(f"📤 Upload local → GCS")
+    print(f"   Fichier local : {local_path}")
+    print(f"   Bucket        : {bucket_name}")
+    print(f"   Objet         : {blob_name}")
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_path)
-    print("✅ Upload terminé")
+    print(f"✅ Upload terminé")
 
 
 # ---------- Runner logique ----------
@@ -210,54 +219,45 @@ def main():
         local_input = os.getenv("INPUT_PDF_PATH")  # fallback éventuel
 
         if gcs_input:
-            # -------- Mode GCS (Cloud Run / Lovable) --------
+            # Mode GCS
             local_pdf = "/tmp/input.pdf"
             download_from_gcs(gcs_input, local_pdf)
 
-            # Si pas de GCS_OUTPUT_URI fourni, on dérive automatiquement :
-            # gs://BUCKET/in/xxx.pdf  →  gs://BUCKET/out/xxx.md
+            # Si pas de GCS_OUTPUT_URI, on dérive la sortie :
+            # Entrée : gs://qwenvl/in/xxx.pdf → Sortie : gs://qwenvl/out/xxx.md
             if not gcs_output:
+                # Dérive automatiquement le chemin de sortie dans le bucket QWEN
+                # Entrée :  gs://qwenvl/in/xxx.pdf  →  Sortie : gs://qwenvl/out/xxx.md
                 bucket, blob = parse_gs_uri(gcs_input)
-
-                # blob ex : "in/0b74e8....pdf"
                 if blob.startswith("in/"):
-                    rest = blob[len("in/"):]
-                    if "." in rest:
-                        base = rest.rsplit(".", 1)[0]
-                    else:
-                        base = rest
-                    out_blob = f"out/{base}.md"
+                    rest = blob[len("in/"): ]
                 else:
-                    # cas plus générique : même chemin, extension .md
-                    if "." in blob:
-                        base = blob.rsplit(".", 1)[0]
-                    else:
-                        base = blob
-                    out_blob = f"{base}.md"
-
+                    rest = blob
+                if "." in rest:
+                    base = rest.rsplit(".", 1)[0]
+                else:
+                    base = rest
+                out_blob = f"out/{base}.md"
                 gcs_output = f"gs://{bucket}/{out_blob}"
 
             # Chemin local temporaire pour le .md
             local_md = "/tmp/output.md"
             md_path = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
 
-            # Upload du Markdown vers GCS
             upload_to_gcs(md_path, gcs_output)
 
-            # Ligne spéciale pour Lovable
             print("=" * 70)
             print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
             print("=" * 70)
 
         elif local_input:
-            # -------- Mode fichier local uniquement --------
+            # Mode fichier local uniquement
             run_for_pdf(local_input, api_key)
-
         else:
             raise RuntimeError(
                 "Ni GCS_INPUT_URI ni INPUT_PDF_PATH définis.\n"
                 "Définis au moins GCS_INPUT_URI=gs://qwenvl/in/chemin/facture.pdf "
-                "pour traiter un fichier depuis ton bucket."
+                "pour traiter un fichier depuis ton bucket dédié Qwen."
             )
 
     except Exception as e:
