@@ -1,0 +1,30 @@
+# cloudbuild.yaml pour qwenocr
+options:
+  # => règle le problème de logs directement ici
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _AR_REGION: us-central1
+  _AR_REPO: qwen-job          # nom de ton dépôt Artifact Registry
+  _IMAGE_NAME: qwenocr        # nom de l’image
+  _TAG: $SHORT_SHA
+
+steps:
+  # 1) build l'image à partir du Dockerfile à la racine
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${_TAG}
+      - .
+
+  # 2) tag en "latest" en plus du tag $SHORT_SHA
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - tag
+      - ${_AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${_TAG}
+      - ${_AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
+
+images:
+  - ${_AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${_TAG}
+  - ${_AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
