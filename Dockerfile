@@ -1,25 +1,24 @@
 FROM python:3.11-slim
 
-# Options Python pour un runtime plus propre
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Installation des dépendances système nécessaires (notamment poppler-utils pour pdf2image)
+# Dépendances système :
+# - poppler-utils : pour pdf2image
+# - python3-tk : pour que l'import tkinter de ocr_qwenVL.py ne casse pas
 RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
+        python3-tk \
     && rm -rf /var/lib/apt/lists/*
 
-# Dossier de travail dans le conteneur
 WORKDIR /app
 
-# Copier les dépendances Python spécifiques à qwenocr
-COPY qwenocr/requirements.txt /app/requirements.txt
-
-# Installer les dépendances Python
+# requirements.txt est à la RACINE du repo
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copier le code qwenocr (runner + ton script ocr_qwenVL.py + éventuels modules annexes)
-COPY qwenocr/ /app/
+# On copie tout le code Python à la racine
+COPY . /app/
 
-# Commande par défaut : lancer le runner qwenocr
+# Entrée du job : le runner batch
 CMD ["python", "-u", "qwenocr_runner.py"]
