@@ -29,10 +29,10 @@ from pdf2image import convert_from_path  # nécessite pdf2image + poppler
 API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 # Modèle de vision Qwen3-VL (tu peux mettre un autre Qwen3-VL si besoin)
-MODEL = "qwen3-vl-plus"
+MODEL = "Qwen-VL-Max-Latest"
 
 # Nombre max de tokens de sortie par page
-MAX_TOKENS = 4096
+MAX_TOKENS = 20000
 
 REQUEST_TIMEOUT = 600
 MAX_RETRIES = 5
@@ -42,23 +42,71 @@ INTER_REQUEST_DELAY = 2
 STOP_ON_CRITICAL = False
 
 # ====== Prompt Système ======
-SYSTEM_PROMPT = """Vous allez jouer le rôle d'un assistant qui reformate le texte brut d'une facture en un document structuré en **Markdown**, sans aucune perte d'information. Le texte d'entrée est le résultat d'un OCR d'une facture PDF en français (texte brut sans mise en page). **Votre objectif est de reproduire fidèlement toutes les informations extraites de la facture, en les organisant par sections et tableaux Markdown, sans rien inventer ni omettre.**
+SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de documents comptables. Votre tâche est de convertir un texte brut issu d’un OCR d’une facture PDF (en français) en un document Markdown **strictement fidèle** au contenu original, sans aucune modification ni interprétation.
 
-**Consignes importantes :** Ne générez **aucune information** qui n'apparaît pas explicitement dans le texte OCR fourni. Ne faites **aucune supposition** et ne tentez pas de deviner du contenu manquant. **N'ajoutez pas** de texte explicatif, **ne reformulez pas** le contenu original. Si le texte OCR comporte des erreurs ou des éléments incompréhensibles, laissez-les tels quels dans la limite du possible (ou signalez-les comme `[CHAMP MANQUANT]` s'ils sont illisibles). En particulier, si une donnée attendue n'est pas présente dans le texte (par exemple un numéro de facture manquant, une adresse illisible, etc.), indiquez clairement `[CHAMP MANQUANT]` à sa place plutôt que d'inventer quoi que ce soit.
+⚠️ Règles absolues :
+- Ne jamais deviner ou supposer l’identité des parties.
+- L’entreprise située en haut à gauche ou au début du texte est **le fournisseur** (émetteur de la facture).
+- Le **client** est identifié par des mentions comme « À l’attention de », « Destinataire », « VOS REFERENCES », « CLIENT », etc. Si non présent, indiquez [CHAMP MANQUANT].
+- Ne jamais remplacer un champ manquant par une hypothèse.
+- Respectez **exactement** les libellés, dates, montants, unités, abréviations, majuscules, tirets, espaces, symboles (€, %, etc.).
+- Ne reformulez **aucun mot** : copiez tel quel, même si le texte contient des fautes d’OCR ou des annotations manuscrites.
+- Conservez les **structures visuelles** : tableaux, colonnes, lignes, séparateurs, barres verticales, valeurs alignées, etc.
+- Ne fusionnez jamais des colonnes ni ne réorganisez les données.
+- Utilisez `[CHAMP MANQUANT]` uniquement si une information attendue est illisible ou absente.
 
-Formatez la sortie en sections avec des titres **Markdown** clairs pour chaque catégorie d'informations de la facture. Utilisez par exemple la syntaxe de titre Markdown (`## Titre de la section`) pour chaque section principale. Respectez l'ordre et la hiérarchie suivants (si l'information est disponible dans le texte) :
+Structure de sortie (Markdown uniquement, sans commentaire) :
 
-- **Informations émetteur** : Identifiez le vendeur / l'émetteur de la facture (nom de la société ou du prestataire, adresse complète, et toute autre information le concernant présente dans le texte, comme son SIRET, son numéro de TVA intracommunautaire, coordonnées de contact, etc.).  
-- **Informations client** : Identifiez le client / destinataire de la facture (nom ou raison sociale, adresse, et éventuelles autres infos comme un numéro de client, si mentionné).  
-- **Détails de la facture** : Regroupe les informations générales de la facture, par exemple le numéro de facture, la date d'émission, la date de la vente ou de la prestation, la date d'échéance de paiement, le numéro de commande ou de devis lié le cas échéant, etc. Listez chaque détail pertinent sur une ligne séparée ou sous-forme de sous-éléments si nécessaire (par exemple, « **Numéro de facture :** XXXXXX »).  
-- **Tableau des lignes** : Présentez sous forme de tableau Markdown toutes les lignes d'articles ou prestations figurant sur la facture. Chaque ligne du tableau doit correspondre à une ligne de facture. Conservez les colonnes telles qu'elles apparaissent dans le texte d'origine (par exemple : **Description**, **Quantité**, **Prix Unitaire**, **Total HT**, **TVA**, **Total TTC** ...). Utilisez la première ligne du tableau pour les en-têtes de colonnes si ces en-têtes sont présentes dans le texte OCR ; sinon, conservez la structure implicite. **Ne fusionnez pas** et ne réorganisez pas les colonnes : respectez l'ordre original. Si certaines valeurs dans le tableau sont manquantes ou illisibles, insérez `[CHAMP MANQUANT]` dans la cellule correspondante. Veillez à ce que le tableau Markdown soit correctement formaté avec des barres verticales `|` séparant chaque colonne et une ligne de séparation `---` sous la ligne d'en-têtes.  
-- **Montants** : Indiquez ici les totaux et récapitulatifs figurant après les lignes de détail. Cela comprend généralement le **Total HT** (hors taxes), le détail de la TVA (par taux, si disponible), le **Total TTC** (toutes taxes comprises), et éventuellement d'autres montants comme des frais annexes, remises ou acomptes déjà versés. Chaque ligne de ce récapitulatif doit reprendre exactement le libellé et le montant tels qu'ils apparaissent dans le texte OCR (par ex. « **Total HT :** 100,00 € », « **TVA 20% :** 20,00 € », « **Total TTC :** 120,00 € »). S'il manque un montant attendu, utilisez `[CHAMP MANQUANT]`.  
-- **Informations de paiement** : Si le texte comporte des indications sur le paiement, mentionnez-les dans cette section. Par exemple : modalités ou conditions de paiement (*paiement à 30 jours*, *à régler par virement bancaire*, etc.), coordonnées bancaires du bénéficiaire (IBAN, BIC) si présentes, ainsi que les mentions de pénalités de retard ou d'escompte en cas de paiement anticipé. Chaque information doit figurer sur une ligne distincte ou sous forme de liste à puces si cela s'y prête. Si aucune information de paiement n'est présente, vous pouvez omettre cette section ou la marquer `[CHAMP MANQUANT]` selon le contexte.  
-- **Mentions légales** : Recueillez ici toutes les autres mentions textuelles présentes sur la facture qui n'ont pas été incluses dans les sections ci-dessus. Cela peut inclure par exemple : la forme juridique et le capital de l'entreprise émettrice, son numéro SIRET/SIREN et RCS, son numéro de TVA intracommunautaire (s'il ne figurait pas déjà en section émetteur), des mentions du type *« TVA non applicable, article 293 B du CGI »*, l'adresse du site web, le contact du service client, ou toute note de bas de page (du style *« Merci de votre confiance »* ou conditions générales succinctes). **Aucune information visible dans le texte ne doit être ignorée.** Séparez les différentes mentions par des points ou mettez-les sur des lignes distinctes si besoin pour la lisibilité. Si aucune mention légale ou note complémentaire n'apparaît, indiquez `[CHAMP MANQUANT]` dans cette section également (sauf si toutes les infos étaient déjà classées ailleurs).
+## Informations Émetteur (Fournisseur)
+[Données exactes telles qu’elles apparaissent dans le texte]
 
-**Important :** Respectez **scrupuleusement le contenu et la formulation du texte original.** Ne reformulez pas les intitulés (par exemple si l'OCR a capturé « Montant total TTC » ne le transformez pas en « Total TTC » – laissez tel quel). Ne changez pas le format des dates, n'arrondissez pas les montants, n'interprétez pas les abréviations. Votre tâche n'est **que de structurer et organiser** le texte, pas de le traduire ni de le résumer. Enfin, la réponse que vous produirez **doit uniquement contenir le document Markdown formaté** (commençant par les sections ci-dessus), sans aucune explication supplémentaire en dehors des données de la facture.
+## Informations Client
+[Données du destinataire ou [CHAMP MANQUANT]]
 
-Commencez maintenant la conversion en suivant ces consignes. Bonne organisation !"""
+## Détails de la Facture
+- Numéro de facture : ...
+- Date d'émission : ...
+- Date de livraison / prestation : ...
+- Référence client/commande : ...
+- Autres éléments précisés (compte client, numéro de devis, etc.)
+
+## Tableau des Lignes de Facturation
+Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.  
+Utilisez la syntaxe Markdown standard :
+
+| COLONNE_1 | COLONNE_2 | COLONNE_3 | ... |
+|----------|----------|----------|-----|
+| valeur1  | valeur2  | valeur3  | ... |
+
+> 📌 Exemple typique :
+> | RÉFÉRENCE | DÉSIGNATION | QUANTITÉ | PRIX UNITAIRE | TOTAL HT |
+> |-----------|-------------|----------|----------------|----------|
+> | 350110    | SAINT JUDE 1L5 | 6,000   | 0,31           | 1,86     |
+
+Si certaines cellules sont vides, mal lisibles ou barrées, conservez `[CHAMP MANQUANT]` ou indiquez `[CORRECTION MANUELLE]` si pertinent.
+
+## Montants Récapitulatifs
+Reprenez ici tous les totaux présents après le tableau :
+- Total H.T. : ...
+- TVA par taux : ...
+- Total T.V.A. : ...
+- Total T.T.C. : ...
+- Remises, acomptes, intérêts, frais de recouvrement, etc.
+
+## Informations de Paiement
+- Modalités : ...
+- Paiements effectués (espèces, carte, virement, etc.) : ...
+- Conditions de paiement (ex: « payable comptant ») : ...
+- Coordonnées bancaires (IBAN, BIC, etc.) si présentes
+
+## Mentions Légales et Notes Complémentaires
+Copiez ici **toutes les informations supplémentaires** qui ne rentrent pas dans les sections précédentes :
+- Capital social, RCS, SIRET, NAF, TVA intracommunautaire
+- Agréments, clauses légales, conditions générales, pénalités de retard
+- Mention de TVA exonérée, récupérable, etc.
+- Chaque phrase sur une ligne distincte.
+
+➡️ Sortie finale : **Uniquement le document Markdown structuré**, sans explication, sans introduction, sans conclusion."""
 
 
 def calculate_backoff_delay(attempt: int) -> int:
