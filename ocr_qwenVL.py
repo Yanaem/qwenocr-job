@@ -29,7 +29,7 @@ from pdf2image import convert_from_path  # nécessite pdf2image + poppler
 API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 # Modèle de vision Qwen3-VL (tu peux mettre un autre Qwen3-VL si besoin)
-MODEL = "Qwen-VL-Max-Latest"
+MODEL = "qwen-vl-max"
 
 # Nombre max de tokens de sortie par page
 MAX_TOKENS = 20000
