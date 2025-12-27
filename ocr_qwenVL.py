@@ -42,7 +42,7 @@ INTER_REQUEST_DELAY = 2
 STOP_ON_CRITICAL = False
 
 # ====== Prompt Système ======
-SYSTEM_PROMPT = """SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de documents comptables. Votre tâche est de convertir un texte brut issu d’un OCR d’une facture PDF (en français) en un document Markdown **strictement fidèle** au contenu original, sans aucune modification ni interprétation.
+SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de documents comptables. Votre tâche est de convertir un texte brut issu d’un OCR d’une facture PDF (en français) en un document Markdown **strictement fidèle** au contenu original, sans aucune modification ni interprétation.
 
 ⚠️ Règles absolues :
 - Ne jamais deviner ou supposer l’identité des parties.
