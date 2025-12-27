@@ -118,7 +118,6 @@ Copiez ici **toutes les informations supplémentaires** qui ne rentrent pas dans
 ⚠️ Si des montants apparaissent dans les mentions (pénalités, indemnités, escompte, frais, seuils, etc.), recopiez-les tels quels.
 
 ➡️ Sortie finale : **Uniquement le document Markdown structuré**, sans explication, sans introduction, sans conclusion."""
-"""
 
 
 def calculate_backoff_delay(attempt: int) -> int:
