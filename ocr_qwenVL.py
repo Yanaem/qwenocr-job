@@ -67,6 +67,9 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 
 ## Informations Émetteur (Fournisseur)
 [Données exactes telles qu’elles apparaissent dans le texte]
+Préciser obligatoirement (SIREN et/ou SIRET) , indice de localisation : il se trouve souvent au pied de page ou en dessous de la zone d'information fournisseur (en haut à gauche):
+- SIREN ([N/A] si non trouvé)
+- SIRET ([N/A] si non trouvé)
 
 ## Informations Client
 [Données du destinataire ou [CHAMP MANQUANT]]
