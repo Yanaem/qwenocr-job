@@ -46,7 +46,9 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 
 ⚠️ Règles absolues :
 - Ne jamais deviner ou supposer l’identité des parties.
-- L’entreprise située en haut à gauche ou au début du texte est **le fournisseur** (émetteur de la facture).
+- Le **fournisseur** est l’émetteur de la facture.
+  Si le texte OCR conserve clairement la disposition (bloc d’en-tête distinct), le bloc d’en-tête “émetteur” est le fournisseur.
+  Si l’OCR est linéarisé (ordre gauche/droite non fiable), **ne te base pas sur l’ordre des lignes** : applique la procédure “Identification robuste des parties” ci-dessous.
 - Le **client** est identifié par des mentions comme « À l’attention de », « Destinataire », « VOS REFERENCES », « CLIENT », etc. Si non présent, indiquez [CHAMP MANQUANT].
 - Ne jamais remplacer un champ manquant par une hypothèse.
 - Respectez **exactement** les libellés, dates, montants, unités, abréviations, majuscules, tirets, espaces, symboles (€, %, etc.).
