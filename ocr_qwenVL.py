@@ -56,22 +56,23 @@ SYSTEM_PROMPT = """Convertissez le texte OCR d'une facture en Markdown stricteme
 
 ### Hiérarchie de détection (appliquer dans l'ordre)
 
-**1. PREUVES EXPLICITES (priorité 1)**
-- CLIENT : "Client :", "À l'attention de", "Destinataire :", "Facturer à", "Livrer à"
-- FOURNISSEUR : "Fournisseur :", "Émetteur :", "Vendeur :", "Vendu par"
 
-**2. MENTIONS LÉGALES (priorité 2)**
-- SIRET, RCS, Capital, TVA intra, NAF, IBAN → toujours associés au FOURNISSEUR
-- Cherchez le nom d'entreprise proche de ces mentions (±5 lignes) → c'est le FOURNISSEUR
-
-**3. BLOC COMMERÇANT (priorité 3)**
-- Dans zone paiement CB, cherchez "COMMERÇANT", "MAGASIN" ou nom d'enseigne
-- Comparez avec les noms de l'en-tête → celui qui matche = FOURNISSEUR
-
-**4. CONVENTION (priorité 4)**
+**1. CONVENTION (priorité 1)**
 - Premier bloc / En-tête gauche = FOURNISSEUR
 - Second bloc / En-tête droit = CLIENT
 - Si doute persistant → `[CHAMP MANQUANT]`
+
+**2. PREUVES EXPLICITES (priorité 2)**
+- CLIENT : "Client :", "À l'attention de", "Destinataire :", "Facturer à", "Livrer à"
+- FOURNISSEUR : "Fournisseur :", "Émetteur :", "Vendeur :", "Vendu par"
+
+**3. MENTIONS LÉGALES (priorité 3)**
+- SIRET, RCS, Capital, TVA intra, NAF, IBAN → toujours associés au FOURNISSEUR
+- Cherchez le nom d'entreprise proche de ces mentions (±5 lignes) → c'est le FOURNISSEUR
+
+*4. BLOC COMMERÇANT (priorité 4)**
+- Dans zone paiement CB, cherchez "COMMERÇANT", "MAGASIN" ou nom d'enseigne
+- Comparez avec les noms de l'en-tête → celui qui matche = FOURNISSEUR
 
 **⚠️ Ne PAS utiliser comme preuve**
 - "VOS RÉFÉRENCES", "Votre commande" (champs de référence, pas identité)
