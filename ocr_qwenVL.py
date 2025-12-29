@@ -42,106 +42,92 @@ INTER_REQUEST_DELAY = 2
 STOP_ON_CRITICAL = False
 
 # ====== Prompt Système ======
-SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
-Convertissez le texte OCR d'une facture en Markdown strictement fidèle au contenu original.
+SYSTEM_PROMPT = """Convertissez le texte OCR d'une facture en Markdown strictement fidèle à l'original.
 
-## 📋 RÈGLE D'OR : Copier, jamais inventer
-- Recopiez exactement : libellés, dates, montants, symboles, majuscules, espaces
-- Ne reformulez RIEN, même en cas de faute OCR
-- `[CHAMP MANQUANT]` uniquement si illisible/absent
-- Conservez la structure visuelle (tableaux, colonnes, alignements)
-
----
-
-## 🏢 IDENTIFICATION FOURNISSEUR / CLIENT
-
-### Règles d'identification (ordre de priorité) :
-
-**1️⃣ PREUVES EXPLICITES FORTES (priorité absolue)**
-
-✅ **CLIENT identifié par** :
-- Mentions directes : "Client :", "À l'attention de", "Destinataire :", "Facturer à :", "Livrer à :", "Adresse de facturation"
-
-✅ **FOURNISSEUR identifié par** :
-- Mentions directes : "Fournisseur :", "Émetteur :", "Vendu par"
-- **Bloc "COMMERÇANT"/"MAGASIN"** dans la zone paiement carte bancaire (en bas de facture)
-- **Mentions légales** (Capital, RCS/R.C., SIRET, NAF, IBAN) → généralement associées au fournisseur
-
-**2️⃣ CONVENTION DE MISE EN PAGE (si aucune preuve explicite)**
-
-Sur une facture française standard :
-- **Zone supérieure gauche** = généralement le FOURNISSEUR
-- **Zone supérieure droite** = généralement le CLIENT
-
-⚠️ **ATTENTION** : Cette règle s'applique à la **disposition visuelle originale**, pas à l'ordre de lecture OCR linéarisé.
-
-**3️⃣ INDICES À NE PAS UTILISER (pièges courants)**
-
-❌ **NE PAS utiliser pour identifier le CLIENT** :
-- "VOS RÉFÉRENCES", "Votre commande", "Votre devis" → ce sont des **champs de référence**, pas des identifiants de partie
-- "TICKET CLIENT", "CARTE BANCAIRE", "VISA", "CB", "DÉBIT" → ce sont des libellés de paiement
-
-❌ **NE PAS se fier uniquement à l'ordre de lecture OCR** si le texte semble mélangé
-
-**4️⃣ VALIDATION CROISÉE (contrôle anti-erreur)**
-
-Avant de finaliser :
-- Si vous avez identifié un FOURNISSEUR, vérifiez qu'il correspond bien au bloc "COMMERÇANT" (si présent en bas)
-- Si vous avez identifié un CLIENT, vérifiez qu'il ne contient PAS les mentions légales (Capital/RCS/NAF)
-- En cas d'incohérence → réévaluez ou utilisez `[CHAMP MANQUANT]`
-
-**EN CAS DE DOUTE PERSISTANT** :
-- Privilégiez la convention de mise en page (règle 2)
-- Si vraiment impossible → `[CHAMP MANQUANT]`
+## RÈGLES DE BASE
+- Recopiez EXACTEMENT : libellés, dates, montants, symboles, majuscules, espaces
+- Ne reformulez RIEN, ne devinez RIEN
+- `[CHAMP MANQUANT]` uniquement si réellement absent/illisible
+- Conservez les structures visuelles (tableaux, colonnes)
 
 ---
 
-## 💰 RÈGLES MONTANTS (priorité maximale)
+## IDENTIFICATION FOURNISSEUR / CLIENT
 
-- Recopiez **tous les montants tels quels** : séparateurs, espaces, symboles
-- Ne jamais supprimer, résumer, normaliser ou dédupliquer
-- Tableaux récapitulatifs : conservez toutes les lignes, même avec cellules vides
-- Cellule vide dans l'OCR = cellule vide (pas de `[CHAMP MANQUANT]`)
-- Si un montant apparaît plusieurs fois, recopiez chaque occurrence
+### Hiérarchie de détection (appliquer dans l'ordre)
+
+**1. PREUVES EXPLICITES (priorité 1)**
+- CLIENT : "Client :", "À l'attention de", "Destinataire :", "Facturer à", "Livrer à"
+- FOURNISSEUR : "Fournisseur :", "Émetteur :", "Vendeur :", "Vendu par"
+
+**2. MENTIONS LÉGALES (priorité 2)**
+- SIRET, RCS, Capital, TVA intra, NAF, IBAN → toujours associés au FOURNISSEUR
+- Cherchez le nom d'entreprise proche de ces mentions (±5 lignes) → c'est le FOURNISSEUR
+
+**3. BLOC COMMERÇANT (priorité 3)**
+- Dans zone paiement CB, cherchez "COMMERÇANT", "MAGASIN" ou nom d'enseigne
+- Comparez avec les noms de l'en-tête → celui qui matche = FOURNISSEUR
+
+**4. CONVENTION (priorité 4)**
+- Premier bloc / En-tête gauche = FOURNISSEUR
+- Second bloc / En-tête droit = CLIENT
+- Si doute persistant → `[CHAMP MANQUANT]`
+
+**⚠️ Ne PAS utiliser comme preuve**
+- "VOS RÉFÉRENCES", "Votre commande" (champs de référence, pas identité)
+- "TICKET CLIENT", "CB", "VISA" (libellés, pas identité)
 
 ---
 
-## 📄 STRUCTURE DE SORTIE (Markdown uniquement)
+## RÈGLES MONTANTS
+- Recopiez TOUS les montants TELS QUELS (séparateurs, espaces, symboles)
+- Ne supprimez, ne résumez, ne normalisez AUCUN montant
+- Tableaux : gardez toutes lignes et colonnes, même vides
+- Cellule vide = laissez vide (pas de `[CHAMP MANQUANT]`)
+
+---
+
+## STRUCTURE DE SORTIE
 
 ### Informations Émetteur (Fournisseur)
-[Nom, adresse, coordonnées tels qu'ils apparaissent]
+[Nom, adresse, coordonnées]
 
 ### Informations Client
-[Données du destinataire ou [CHAMP MANQUANT]]
+[Nom, adresse, coordonnées ou [CHAMP MANQUANT]]
 
 ### Détails de la Facture
-- Numéro de facture : ...
-- Date d'émission : ...
-- Date de livraison : ...
-- Référence client/commande : ...
-- Vos références : ... [si présent]
-- Compte : ... [si présent]
+- Numéro : ...
+- Date : ...
+- Référence commande : ...
+- Compte client : ...
+[Tous les champs d'identification présents]
 
 ### Tableau des Lignes de Facturation
-| REFERENCE | DESIGNATION | CARTONS | CONDIT. | QUANTITE | PRIX UNIT. | ... |
-|-----------|-------------|---------|---------|----------|------------|-----|
-| ...       | ...         | ...     | ...     | ...      | ...        | ... |
+[Reproduire TOUTES les colonnes et lignes dans l'ordre exact]
 
-[Reproduire toutes les colonnes dans l'ordre exact, toutes les lignes]
+| COL1 | COL2 | COL3 | ... |
+|------|------|------|-----|
+| ...  | ...  | ...  | ... |
 
 ### Montants Récapitulatifs
-[Tous les totaux : HT/TVA/TTC, bases par taux, Net à payer, etc.]
+[Tous les totaux : HT, TVA, TTC, Net à payer, etc.]
+[Garder la forme originale : tableau→tableau, liste→liste]
 
 ### Informations de Paiement
 - Modalités : ...
 - Montant payé : ...
 - IBAN/BIC : ...
-- Détails transaction carte bancaire : ... [si présent]
+[Toutes infos de paiement et coordonnées bancaires]
 
 ### Mentions Légales et Notes Complémentaires
-[Capital, RCS, SIRET, NAF, TVA intracommunautaire, conditions, agréments, etc.]
+[Capital, RCS, SIRET, NAF, TVA, conditions générales, etc.]
+[Toute info non classée ailleurs]
 
-➡️ **Sortie : Markdown uniquement, sans commentaire.**"""
+---
+
+## SORTIE
+Markdown uniquement, sans commentaire. Commencez directement par "## Informations Émetteur (Fournisseur)".
+"""
 
 def calculate_backoff_delay(attempt: int) -> int:
     """Backoff exponentiel"""
