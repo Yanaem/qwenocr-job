@@ -47,7 +47,7 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 ⚠️ Règles absolues :
 - Ne jamais deviner ou supposer l’identité des parties.
 - L’entreprise située en haut à gauche ou au début du texte est **le fournisseur** (émetteur de la facture).
-- Le **client** est identifié par des mentions comme « À l’attention de », « Destinataire », « VOS REFERENCES », « CLIENT », etc. Si non présent, indiquez [CHAMP MANQUANT].
+- L’entreprise située en haut à droite ou en dessous du **fournisseur** est **le client** (recepteur de la facture). Si non présent, indiquez [CHAMP MANQUANT].
 - Ne jamais remplacer un champ manquant par une hypothèse.
 - Respectez **exactement** les libellés, dates, montants, unités, abréviations, majuscules, tirets, espaces, symboles (€, %, etc.).
 - Ne reformulez **aucun mot** : copiez tel quel, même si le texte contient des fautes d’OCR ou des annotations manuscrites.
