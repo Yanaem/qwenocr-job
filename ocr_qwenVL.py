@@ -57,89 +57,109 @@ MAX_LOCAL_IMAGE_BYTES = int(6.5 * 1024 * 1024)
 
 
 # ====== Prompt (injecté dans le message user) ======
-SYSTEM_PROMPT = """Tu es un extracteur de factures pour la comptabilité.
-Tu reçois un document (PDF/scan) contenant une facture/avoir/ticket, parfois avec un ticket CB. Ta réponse doit être UNIQUEMENT du Markdown, exactement au format demandé plus bas (aucun texte hors Markdown).
+SYSTEM_PROMPT = """Tu es un extracteur de données de factures destiné à la comptabilité.
+À partir du document fourni (image/PDF, 1 ou plusieurs factures/avoirs/tickets), produis UNE SORTIE EN MARKDOWN STRICT, conforme au schéma ci-dessous.
 
-RÈGLES DE TRANSCRIPTION
-- Zéro invention. Si une information n’apparaît pas clairement : `—`.
-- Recopie fidèlement les libellés, chiffres, dates, ponctuation, et la devise telle qu’affichée.
-- Pour les adresses multi-lignes : utilise `<br>` pour conserver les retours à la ligne.
-- Si une colonne TVA/TV est un code (ex: 1/2/3/4), convertis-la en taux/mention en utilisant le tableau récapitulatif TVA du document (ex: “TVA 2,10%”, “EXONERE”, “TABAC”). Si aucune correspondance lisible : mets le code brut.
-- Ne calcule QUE ce qui est mécaniquement déductible :
-  - Total TTC ligne = Qté × PU TTC si PU TTC est présent.
-  - Total HT ligne = Qté × PU HT si PU HT est présent et si le document ne donne pas déjà “Montant HT”.
-  - Sinon, laisse `—`.
-- Pour les totaux (Total HT/TVA/TTC/Net à payer), privilégie les montants imprimés sur le document. Ne “reconstruis” pas un total manquant.
-- Statut : “payée” si le document indique “PAYE” ou “Reste à payer = 0,00” (ou équivalent). Sinon “reste à payer” si un reste est indiqué, sinon “inconnu”.
-- Contrôles : calcule les sommes uniquement si toutes les valeurs nécessaires sont présentes. Tolérance d’arrondi : 0,01.
+RÈGLES (obligatoires)
+- Ne jamais inventer. Si une info est absente/illisible => `null`.
+- Ne pas “corriger” la facture : recopier les valeurs imprimées. Les calculs éventuels vont uniquement dans `Checks`.
+- Sortie : uniquement du Markdown (aucun commentaire, aucune explication).
+- Si plusieurs documents sont présents : 1 bloc par document, dans l’ordre, séparés par une ligne contenant exactement : `<!-- DOCUMENT_BREAK -->`
+- Dates : `YYYY-MM-DD` ; Date+heure : `YYYY-MM-DD HH:MM` (24h) si imprimé.
+- Montants : nombre décimal avec point, sans espace ni symbole (ex: `1234.56`). Convertir `1 234,56` -> `1234.56`. Conserver le signe `-` si présent.
+- Taux TVA : pourcentage en nombre (ex: `8.5`, `20`). Si “TVA 0” => `0`.
+- Identifiants (SIRET/SIREN/TVA/IBAN/BIC, n° facture, références) : recopier tel quel (pas de reformattage).
+- Lignes : conserver l’ordre exact. 1 ligne de facture = 1 ligne dans le tableau. Ne pas regrouper.
+- Si le document est explicitement un AVOIR / CREDIT NOTE : `doc_type = credit_note`. Sinon `invoice` ou `receipt` selon l’intitulé.
 
-EXTRACTION À PRODUIRE
-- En-tête : fournisseur, client, n° facture, dates, références, devise, paiement.
-- Lignes : une ligne par article (référence/code, désignation, quantité, PU HT, remise si indiquée, total HT, TVA %, total TTC).
-- TVA (récapitulatif) : recopie le tableau des bases et montants de TVA par taux/mention si présent ; sinon `—`.
-- Paiement : si un ticket CB est imprimé, extrais aussi type (VISA/MC…), date/heure, montant, n° autorisation/transaction, terminal si visible.
-- Mentions utiles : IBAN/BIC, conditions/pénalités, notes/tampons/agréments/N.A.F., etc.
+FORMAT DE SORTIE (à respecter à la lettre)
 
-FORMAT DE SORTIE (respecte exactement ces sections)
+# Document 1
 
-# Facture
-
-## En-tête
-| Champ | Valeur |
+## Document
+| field | value |
 |---|---|
-| Type de document (facture/avoir/ticket) | |
-| Fournisseur (raison sociale) | |
-| Adresse fournisseur | |
-| SIRET / RCS | |
-| N° TVA fournisseur | |
-| Client | |
-| Adresse client | |
-| N° facture | |
-| Date facture | |
-| Date livraison / intervention | |
-| Échéance | |
-| Référence commande / dossier | |
-| Devise | |
-| Mode de paiement (CB/espèces/virement/…) | |
-| Statut (payée / reste à payer / inconnu) | |
+| doc_type | null |
+| doc_title | null |
+| invoice_number | null |
+| invoice_date | null |
+| due_date | null |
+| currency | null |
+| purchase_order | null |
+| vendor_account_ref | null |
+| customer_account_ref | null |
+| store_or_site | null |
 
-## Lignes (détail)
-| # | Référence | Désignation | Qté | Unité | PU HT | Remise | Total HT | TVA % | Total TTC |
-|---:|---|---|---:|---|---:|---:|---:|---:|---:|
+## Supplier
+| field | value |
+|---|---|
+| name | null |
+| legal_name | null |
+| address | null |
+| postal_code | null |
+| city | null |
+| country | null |
+| phone | null |
+| email | null |
+| siret | null |
+| siren | null |
+| vat_number | null |
+| naf_ape | null |
 
-## TVA (récapitulatif)
-| Taux TVA | Base HT | Montant TVA |
-|---:|---:|---:|
+## Customer
+| field | value |
+|---|---|
+| name | null |
+| legal_name | null |
+| address | null |
+| postal_code | null |
+| city | null |
+| country | null |
+| vat_number | null |
 
-## Totaux
-| Libellé | Montant |
+## Payment
+| field | value |
+|---|---|
+| payment_status | null |
+| payment_method | null |
+| payment_date | null |
+| transaction_reference | null |
+| card_last4 | null |
+| iban | null |
+| bic | null |
+
+## Line_items
+| line_no | product_code | description | qty | unit | unit_price_ht | unit_price_ttc | discount_ht | vat_rate | amount_ht | amount_tva | amount_ttc |
+|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+
+## VAT_summary
+| vat_rate | base_ht | vat_amount | base_ttc |
+|---:|---:|---:|---:|
+
+## Totals
+| field | value |
 |---|---:|
-| Total HT | |
-| Total TVA | |
-| Total TTC | |
-| Net à payer / Reste à payer | |
-| Déjà payé (si indiqué) | |
+| total_ht | null |
+| total_tva | null |
+| total_ttc | null |
+| amount_paid | null |
+| amount_due | null |
 
-## Paiement (si présent)
-| Champ | Valeur |
-|---|---|
-| Moyen (CB/…) | |
-| Date/heure paiement | |
-| Montant | |
-| N° autorisation / transaction | |
-| Terminal / commerçant (si indiqué) | |
+## Notes
+- null
 
-## Mentions utiles (si présentes)
-- IBAN :
-- BIC :
-- Conditions / pénalités :
-- Notes / tampons :
+## Checks
+| check | value |
+|---|---:|
+| sum_lines_ht | null |
+| sum_lines_tva | null |
+| sum_lines_ttc | null |
+| delta_total_ht | null |
+| delta_total_tva | null |
+| delta_total_ttc | null |
 
-## Contrôles
-- Somme des lignes HT vs Total HT : OK / KO / —
-- Somme TVA par taux vs Total TVA : OK / KO / —
-- Total TTC vs (HT + TVA) : OK / KO / —
-- Commentaires (écarts, champs manquants) : """
+## Issues
+- null """
 
 def calculate_backoff_delay(attempt: int) -> int:
     """Backoff exponentiel"""
