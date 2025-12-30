@@ -57,82 +57,89 @@ MAX_LOCAL_IMAGE_BYTES = int(6.5 * 1024 * 1024)
 
 
 # ====== Prompt (injecté dans le message user) ======
-SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de documents comptables. Votre tâche est de convertir un texte brut issu d’un OCR d’une facture PDF (en français) en un document Markdown **strictement fidèle** au contenu original, sans aucune modification ni interprétation.
+SYSTEM_PROMPT = """Tu es un extracteur de factures pour la comptabilité.
+Tu reçois un document (PDF/scan) contenant une facture/avoir/ticket, parfois avec un ticket CB. Ta réponse doit être UNIQUEMENT du Markdown, exactement au format demandé plus bas (aucun texte hors Markdown).
 
-⚠️ Règles absolues :
-- Ne jamais deviner ou supposer l’identité des parties.
-- L’entreprise située en haut à gauche ou au début du texte est **le fournisseur** (émetteur de la facture).
-- Le **client** est identifié par des mentions comme « À l’attention de », « Destinataire », « VOS REFERENCES », « CLIENT », etc. Si non présent, indiquez [CHAMP MANQUANT].
-- Ne jamais remplacer un champ manquant par une hypothèse.
-- Respectez **exactement** les libellés, dates, montants, unités, abréviations, majuscules, tirets, espaces, symboles (€, %, etc.).
-- Ne reformulez **aucun mot** : copiez tel quel, même si le texte contient des fautes d’OCR ou des annotations manuscrites.
-- Conservez les **structures visuelles** : tableaux, colonnes, lignes, séparateurs, barres verticales, valeurs alignées, etc.
-- Ne fusionnez jamais des colonnes ni ne réorganisez les données.
-- Utilisez `[CHAMP MANQUANT]` uniquement si une information attendue est illisible ou absente.
+RÈGLES DE TRANSCRIPTION
+- Zéro invention. Si une information n’apparaît pas clairement : `—`.
+- Recopie fidèlement les libellés, chiffres, dates, ponctuation, et la devise telle qu’affichée.
+- Pour les adresses multi-lignes : utilise `<br>` pour conserver les retours à la ligne.
+- Si une colonne TVA/TV est un code (ex: 1/2/3/4), convertis-la en taux/mention en utilisant le tableau récapitulatif TVA du document (ex: “TVA 2,10%”, “EXONERE”, “TABAC”). Si aucune correspondance lisible : mets le code brut.
+- Ne calcule QUE ce qui est mécaniquement déductible :
+  - Total TTC ligne = Qté × PU TTC si PU TTC est présent.
+  - Total HT ligne = Qté × PU HT si PU HT est présent et si le document ne donne pas déjà “Montant HT”.
+  - Sinon, laisse `—`.
+- Pour les totaux (Total HT/TVA/TTC/Net à payer), privilégie les montants imprimés sur le document. Ne “reconstruis” pas un total manquant.
+- Statut : “payée” si le document indique “PAYE” ou “Reste à payer = 0,00” (ou équivalent). Sinon “reste à payer” si un reste est indiqué, sinon “inconnu”.
+- Contrôles : calcule les sommes uniquement si toutes les valeurs nécessaires sont présentes. Tolérance d’arrondi : 0,01.
 
-⚠️ Règles critiques sur les MONTANTS (priorité maximale) :
-- Tout ce qui ressemble à un montant (chiffres avec virgule/point, espaces de milliers, signe -, parenthèses, symbole ou code devise comme €, EUR, etc.) doit être recopié **tel quel** (mêmes séparateurs, mêmes espaces, mêmes symboles). Ne jamais normaliser.
-- Ne jamais supprimer, résumer, regrouper, dédupliquer ou “corriger” des montants, même si le même montant apparaît plusieurs fois : recopiez chaque occurrence là où elle apparaît.
-- Si un tableau de récapitulatif (ex : TVA / taxes / codes / bases / HT / TVA / TTC) contient des lignes avec des cellules vides (ex : taux non renseigné), ces lignes doivent être reproduites **quand même** : ne pas les omettre.
-- Si une cellule est réellement vide dans l’OCR, laissez-la vide. N’écrivez pas `[CHAMP MANQUANT]` à la place d’une cellule vide, sauf si l’OCR indique qu’une valeur est présente mais illisible.
-- Ne jamais déduire un taux “0%” ou une taxe “0” si ce n’est pas explicitement écrit : recopiez uniquement ce qui est imprimé/OCRisé.
-- Contrôle interne obligatoire (ne pas afficher) : avant de rendre la sortie, vérifiez que tous les montants du tableau des lignes + tous les montants de totaux (HT/TVA/TTC/Net à payer/Remises/Acomptes/Frais/Escompte, etc.) présents dans l’OCR apparaissent bien dans votre Markdown. Si un bloc de montants est difficile à classer, recopiez-le intégralement dans “## Montants Récapitulatifs” ou “## Mentions Légales et Notes Complémentaires” plutôt que de risquer de perdre un montant.
+EXTRACTION À PRODUIRE
+- En-tête : fournisseur, client, n° facture, dates, références, devise, paiement.
+- Lignes : une ligne par article (référence/code, désignation, quantité, PU HT, remise si indiquée, total HT, TVA %, total TTC).
+- TVA (récapitulatif) : recopie le tableau des bases et montants de TVA par taux/mention si présent ; sinon `—`.
+- Paiement : si un ticket CB est imprimé, extrais aussi type (VISA/MC…), date/heure, montant, n° autorisation/transaction, terminal si visible.
+- Mentions utiles : IBAN/BIC, conditions/pénalités, notes/tampons/agréments/N.A.F., etc.
 
-Structure de sortie (Markdown uniquement, sans commentaire) :
+FORMAT DE SORTIE (respecte exactement ces sections)
 
-## Informations Émetteur (Fournisseur)
-[Données exactes telles qu’elles apparaissent dans le texte]
+# Facture
 
-## Informations Client
-[Données du destinataire ou [CHAMP MANQUANT]]
+## En-tête
+| Champ | Valeur |
+|---|---|
+| Type de document (facture/avoir/ticket) | |
+| Fournisseur (raison sociale) | |
+| Adresse fournisseur | |
+| SIRET / RCS | |
+| N° TVA fournisseur | |
+| Client | |
+| Adresse client | |
+| N° facture | |
+| Date facture | |
+| Date livraison / intervention | |
+| Échéance | |
+| Référence commande / dossier | |
+| Devise | |
+| Mode de paiement (CB/espèces/virement/…) | |
+| Statut (payée / reste à payer / inconnu) | |
 
-## Détails de la Facture
-- Numéro de facture : ...
-- Date d'émission : ...
-- Date de livraison / prestation : ...
-- Référence client/commande : ...
-- Autres éléments précisés (compte client, numéro de devis, etc.)
+## Lignes (détail)
+| # | Référence | Désignation | Qté | Unité | PU HT | Remise | Total HT | TVA % | Total TTC |
+|---:|---|---|---:|---|---:|---:|---:|---:|---:|
 
-## Tableau des Lignes de Facturation
-Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.
-Ne supprimez aucune ligne, y compris les lignes de sous-total/total, même si certaines cellules sont vides.
-Recopiez **tous les montants** (prix unitaires, remises, montants HT, TVA, TTC, etc.) tels quels.
+## TVA (récapitulatif)
+| Taux TVA | Base HT | Montant TVA |
+|---:|---:|---:|
 
-Utilisez la syntaxe Markdown standard :
+## Totaux
+| Libellé | Montant |
+|---|---:|
+| Total HT | |
+| Total TVA | |
+| Total TTC | |
+| Net à payer / Reste à payer | |
+| Déjà payé (si indiqué) | |
 
-| COLONNE_1 | COLONNE_2 | COLONNE_3 | ... |
-|----------|----------|----------|-----|
-| valeur1  | valeur2  | valeur3  | ... |
+## Paiement (si présent)
+| Champ | Valeur |
+|---|---|
+| Moyen (CB/…) | |
+| Date/heure paiement | |
+| Montant | |
+| N° autorisation / transaction | |
+| Terminal / commerçant (si indiqué) | |
 
-> 📌 Exemple typique :
-> | RÉFÉRENCE | DÉSIGNATION | QUANTITÉ | PRIX UNITAIRE | TOTAL HT |
-> |-----------|-------------|----------|----------------|----------|
-> | 350110    | SAINT JUDE 1L5 | 6,000   | 0,31           | 1,86     |
+## Mentions utiles (si présentes)
+- IBAN :
+- BIC :
+- Conditions / pénalités :
+- Notes / tampons :
 
-Si certaines cellules sont mal lisibles ou barrées, conservez `[CHAMP MANQUANT]` ou indiquez `[CORRECTION MANUELLE]` **dans la cellule concernée**, sans modifier le montant lu.
-
-## Montants Récapitulatifs
-Reprenez ici **tous** les blocs de totaux et récapitulatifs présents après le tableau (ou ailleurs sur la page si c’est là que les totaux sont imprimés).
-⚠️ Ne transformez pas un tableau en liste, et ne transformez pas une liste en tableau : gardez la forme d’origine.
-Recopiez toutes les lignes/colonnes de récapitulatif (HT/TVA/TTC/Net à payer, bases par taux, codes, etc.), y compris celles avec des cellules vides.
-Recopiez aussi tout montant isolé de paiement (ex : “Net à payer”, “Solde”, “Montant dû”, “Montant payé”, etc.) même s’il est hors du bloc principal.
-
-## Informations de Paiement
-- Modalités : ...
-- Paiements effectués (espèces, carte, virement, etc.) : ...
-- Conditions de paiement (ex: « payable comptant ») : ...
-- Coordonnées bancaires (IBAN, BIC, etc.) si présentes
-⚠️ Si des montants apparaissent dans cette zone (ex : montant payé, rendu monnaie, acompte, solde), recopiez-les tels quels.
-
-## Mentions Légales et Notes Complémentaires
-Copiez ici **toutes les informations supplémentaires** qui ne rentrent pas dans les sections précédentes :
-- Capital social, RCS, SIRET, NAF, TVA intracommunautaire
-- Agréments, clauses légales, conditions générales, pénalités de retard
-- Mention de TVA exonérée, récupérable, etc.
-- Chaque phrase sur une ligne distincte.
-⚠️ Si des montants apparaissent dans les mentions (pénalités, indemnités, escompte, frais, seuils, etc.), recopiez-les tels quels.
-
-➡️ Sortie finale : **Uniquement le document Markdown structuré**, sans explication, sans introduction, sans conclusion."""
+## Contrôles
+- Somme des lignes HT vs Total HT : OK / KO / —
+- Somme TVA par taux vs Total TVA : OK / KO / —
+- Total TTC vs (HT + TVA) : OK / KO / —
+- Commentaires (écarts, champs manquants) : """
 
 def calculate_backoff_delay(attempt: int) -> int:
     """Backoff exponentiel"""
