@@ -110,12 +110,13 @@ Recopiez aussi tout montant isolé de paiement (ex : “Net à payer”, “Sold
 ⚠️ Si des montants apparaissent dans cette zone (ex : montant payé, rendu monnaie, acompte, solde), recopiez-les tels quels.
 
 ## Mentions Légales et Notes Complémentaires
-Copiez ici **toutes les informations supplémentaires** qui ne rentrent pas dans les sections précédentes :
+Copiez ici **toutes les informations supplémentaires** qui ne rentrent pas dans les sections précédentes , par exemple :
 - Capital social, RCS, SIRET, NAF, TVA intracommunautaire
 - Agréments, clauses légales, conditions générales, pénalités de retard
 - Mention de TVA exonérée, récupérable, etc.
 - Chaque phrase sur une ligne distincte.
 ⚠️ Si des montants apparaissent dans les mentions (pénalités, indemnités, escompte, frais, seuils, etc.), recopiez-les tels quels.
+⚠️ Verifie bien que toutes les informations qui ne rentrent pas dans les sections précédentes soient présentes ici. Recopie les à l'identique.
 
 ➡️ Sortie finale : **Uniquement le document Markdown structuré**, sans explication, sans introduction, sans conclusion."""
 
