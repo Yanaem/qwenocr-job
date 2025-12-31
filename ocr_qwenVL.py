@@ -72,9 +72,11 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 [Données du destinataire ou [CHAMP MANQUANT]]
 
 ## Détails de la Facture
-Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.
+Reproduisez fidèlement le ou les tableau(x) original/aux avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.
 Ne supprimez aucune ligne, y compris les lignes de sous-total/total, même si certaines cellules sont vides.
+Geographiquement, ces informations se trouvent juste après les informations **Emetteur** et **Client**.
 Les détails à trouver sont : Numéro de facture , date d'émission, date de livraison/prestation, reférence client/commande ,  Autres éléments précisés (compte client, numéro de devis, etc.)
+Priorité maximale : trouver **Numéro/N° de facture** , **Date de facture**
 
 ## Tableau des Lignes de Facturation
 Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.
