@@ -80,7 +80,8 @@ Priorité maximale : trouver **Numéro/N° de facture** , **Date de facture**
 
 ## Tableau des Lignes de Facturation
 Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ordre exact où elles apparaissent dans le texte OCR.
-Ne supprimez aucune ligne, y compris les lignes de sous-total/total, même si certaines cellules sont vides.
+Extrais uniquement les lignes du tableau contenant des données, ignore les lignes vides. ⚠️ Tu ne dois absolumenet pas recopier une ligne vide.
+Garde toutes les lignes non vides ( y compris les lignes de sous-total/total).
 Recopiez **tous les montants** (prix unitaires, remises, montants HT, TVA, TTC, etc.) tels quels.
 
 Utilisez la syntaxe Markdown standard :
