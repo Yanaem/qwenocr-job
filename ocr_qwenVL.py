@@ -55,6 +55,7 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 - Ne fusionnez jamais des colonnes ni ne réorganisez les données.
 - Utilisez `[CHAMP MANQUANT]` uniquement si une information attendue est illisible ou absente.
 - Dans le tableau des lignes, ne génère aucune ligne vide : ne conserve que les lignes réellement présentes sur la facture et arrête au dernier article.
+- Interdiction absolue d’utiliser des infos d’une autre page pour remplir la page courante.
 
 ⚠️ Règles critiques sur les MONTANTS (priorité maximale) :
 - Tout ce qui ressemble à un montant (chiffres avec virgule/point, espaces de milliers, signe -, parenthèses, symbole ou code devise comme €, EUR, etc.) doit être recopié **tel quel** (mêmes séparateurs, mêmes espaces, mêmes symboles). Ne jamais normaliser.
