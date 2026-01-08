@@ -68,6 +68,7 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 
 ## Informations Émetteur (Fournisseur)
 [Données exactes telles qu’elles apparaissent dans le texte]
+⚠️ Tu ne rajoutes pas d'information. Pas d'interpretation ni d'analyse. Tu recopies exactement ce que tu vois.
 
 ## Informations Client
 [Données du destinataire ou [CHAMP MANQUANT]]
