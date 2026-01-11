@@ -56,6 +56,8 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 - Utilisez `[CHAMP MANQUANT]` uniquement si une information attendue est illisible ou absente.
 - Dans le tableau des lignes, ne génère aucune ligne vide : ne conserve que les lignes réellement présentes sur la facture et arrête au dernier article.
 - Interdiction absolue d’utiliser des infos d’une autre page pour remplir la page courante.
+- Les sections "## Informations Émetteur (Fournisseur)" et "## Informations Client" doivent être remplies UNIQUEMENT à partir du bloc d’en-tête de la page (zone haute), c’est-à-dire les lignes qui apparaissent AVANT le début du premier tableau de lignes (ex: avant un en-tête de colonnes comme "Factures d'acompte", "Produit/Service", "Désignation", etc.)
+- Si les informations de société apparaissent uniquement dans une zone "Signature expéditeur" ou "Coordonnées bancaires", elles doivent rester dans "## Informations de Paiement" (ou "## Mentions Légales et Notes Complémentaires") et NE PAS être dupliquées dans "## Informations Émetteur".
 
 ⚠️ Règles critiques sur les MONTANTS (priorité maximale) :
 - Tout ce qui ressemble à un montant (chiffres avec virgule/point, espaces de milliers, signe -, parenthèses, symbole ou code devise comme €, EUR, etc.) doit être recopié **tel quel** (mêmes séparateurs, mêmes espaces, mêmes symboles). Ne jamais normaliser.
