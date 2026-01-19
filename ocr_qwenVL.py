@@ -69,6 +69,18 @@ Les consignes "arrêtez au dernier article" et "fin du tableau" s'appliquent UNI
 Après avoir terminé le tableau des lignes, vous devez continuer la transcription de TOUT LE RESTE DE LA PAGE
 (totaux, échéances, moyens de paiement, mentions, annotations, pied de page) dans les sections suivantes.
 Interdiction de s'arrêter au premier total.
+⚠️ SECTIONS OBLIGATOIRES
+La sortie DOIT contenir toutes les sections (dans cet ordre) :
+1) Informations Émetteur
+2) Informations Client
+3) Détails de la Facture
+4) Tableau des Lignes de Facturation
+5) Montants Récapitulatifs
+6) Informations de Paiement
+7) Mentions Légales et Notes Complémentaires
+8) Annexe - OCR brut
+Aucune section ne doit être omise, même si elle est vide.
+
 
 ⚠️ RÈGLES CRITIQUES SUR LA LOCALISATION DES INFORMATIONS ÉMETTEUR/CLIENT (priorité maximale) :
 
