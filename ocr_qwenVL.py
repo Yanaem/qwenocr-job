@@ -58,7 +58,12 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 - Interdiction absolue d'utiliser des infos d'une autre page pour remplir la page courante.
 - Aucune ligne non vide du texte OCR ne doit être perdue.
 - Si une ligne ne rentre pas clairement dans une section, elle doit être recopiée dans "## Annexe - OCR brut" (verbatim).
-- En cas de doute, il vaut mieux DUPLIQUER une ligne que la perdre.
+- En cas de doute sur l’endroit où placer une ligne, recopiez-la dans "## Mentions Légales et Notes Complémentaires" ou dans "## Annexe - OCR brut".
+⚠️ Ne jamais créer de lignes vides dans un tableau pour “ne pas perdre” une ligne.
+- Interdiction de "remplir" un tableau Markdown pour reproduire la hauteur/espacement du PDF.
+- Interdiction d’émettre UNE SEULE ligne de tableau où toutes les cellules sont vides (espaces) ou ne contiennent que des séparateurs (|, -, ., :, _).
+- Toute ligne vide / tout séparateur visuel (traits, pointillés) doit être conservé uniquement dans "## Annexe - OCR brut", jamais sous forme de lignes vides dans un tableau.
+- Contrôle final obligatoire (interne, ne pas afficher) : supprimer toute ligne de tableau dont toutes les cellules sont vides.
 
 ⚠️ RÈGLES CRITIQUES SUR LA LOCALISATION DES INFORMATIONS ÉMETTEUR/CLIENT (priorité maximale) :
 
@@ -130,6 +135,10 @@ Reproduisez fidèlement le tableau original avec toutes ses colonnes, dans l'ord
 Extrais uniquement les lignes du tableau contenant des données, ignore les lignes vides. ⚠️ Tu ne dois absolument pas recopier une ligne vide.
 Garde toutes les lignes non vides (y compris les lignes de sous-total/total).
 Recopiez **tous les montants** (prix unitaires, remises, montants HT, TVA, TTC, etc.) tels quels.
+- Début du tableau = la ligne d’en-tête (Poste/Catég/Désignation/TVA/P.U. HT/Qté/Cond/Total HT).
+- Fin du tableau = dès la première occurrence de lignes de totaux/fin (ex : "Conditions de règlement", "Total HT", "Total TTC", "Payé", "Reste à payer", etc.). Ne rien ajouter après.
+- Si un sous-tableau existe dans la zone des lignes (ex : "Detail du Poste X"), le reproduire comme un tableau Markdown séparé (avec son propre en-tête), juste après le tableau principal, et surtout PAS comme des lignes vides du tableau principal.
+- Si une désignation tient sur plusieurs lignes, utilisez "<br>" à l’intérieur de la cellule "Désignation" (ne pas créer une ligne de tableau supplémentaire vide).
 
 Utilisez la syntaxe Markdown standard :
 
