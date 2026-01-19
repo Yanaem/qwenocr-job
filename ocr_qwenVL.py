@@ -64,6 +64,11 @@ SYSTEM_PROMPT = """Vous êtes un assistant spécialisé dans le traitement de do
 - Interdiction d’émettre UNE SEULE ligne de tableau où toutes les cellules sont vides (espaces) ou ne contiennent que des séparateurs (|, -, ., :, _).
 - Toute ligne vide / tout séparateur visuel (traits, pointillés) doit être conservé uniquement dans "## Annexe - OCR brut", jamais sous forme de lignes vides dans un tableau.
 - Contrôle final obligatoire (interne, ne pas afficher) : supprimer toute ligne de tableau dont toutes les cellules sont vides.
+⚠️ RÈGLE ANTI-COUPURE (priorité maximale)
+Les consignes "arrêtez au dernier article" et "fin du tableau" s'appliquent UNIQUEMENT AU TABLEAU DES LIGNES.
+Après avoir terminé le tableau des lignes, vous devez continuer la transcription de TOUT LE RESTE DE LA PAGE
+(totaux, échéances, moyens de paiement, mentions, annotations, pied de page) dans les sections suivantes.
+Interdiction de s'arrêter au premier total.
 
 ⚠️ RÈGLES CRITIQUES SUR LA LOCALISATION DES INFORMATIONS ÉMETTEUR/CLIENT (priorité maximale) :
 
