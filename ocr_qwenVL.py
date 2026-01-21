@@ -4,8 +4,9 @@
 """
 ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
 
-Fonctions attendues (d'après logs) :
+Fonctions/constantes attendues (d'après logs) :
 - MODEL (str)
+- INTER_REQUEST_DELAY (float)
 - get_pdf_info(pdf_path) -> dict {page_count,...}
 - load_progress(pdf_path) -> Dict[str, Dict]
 - save_progress(pdf_path, completed_pages) -> None
@@ -51,6 +52,9 @@ API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 MODEL_OCR = "qwen-vl-max"
 MODEL_MD = "qwen-vl-max"
 MODEL = MODEL_OCR  # attendu par le runner
+
+# Attendu par qwenocr_runner.py (pause entre pages/requêtes)
+INTER_REQUEST_DELAY = 1.0  # secondes (0.0 si tu veux aucune pause)
 
 RENDER_DPI = 300
 
@@ -111,7 +115,25 @@ Après le tableau, continuez la transcription du reste de la page (totaux, éch�
 Structure de sortie (Markdown uniquement, sans commentaire) :
 
 ## Informations Émetteur (Fournisseur)
-...
+[Données exactes présentes dans la zone d'en-tête uniquement (avant le tableau des lignes de facturation)]
+
+## Informations Client
+[Données du destinataire présentes dans la zone d'en-tête uniquement ou [CHAMP MANQUANT]]
+
+## Détails de la Facture
+[Informations de facturation en en-tête : numéro, dates, références, objet, etc.]
+
+## Tableau des Lignes de Facturation
+[Reproduisez le tableau original avec ses colonnes, sans lignes vides.]
+
+## Montants Récapitulatifs
+[Reprenez tous les blocs de totaux et récapitulatifs présents sur la page. Gardez la forme d'origine.]
+
+## Informations de Paiement
+[Modalités, échéances, paiements, etc.]
+
+## Mentions Légales et Notes Complémentaires
+[Toute information supplémentaire / mentions / pied de page / annotations non classées ailleurs.]
 
 ➡️ Sortie finale : uniquement le document Markdown structuré, sans explication.
 """
@@ -122,21 +144,15 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 # =====================
 
 def _progress_path(pdf_path: str) -> str:
-    # même logique que dans ton ancien script: <pdf>.progress.json
     return str(Path(pdf_path).with_suffix(".progress.json"))
 
 def load_progress(pdf_path: str) -> Dict[str, Dict]:
-    """
-    Attendu par qwenocr_runner.py
-    Doit renvoyer un dict: { "1": {...}, "2": {...}, ... } ou {} si rien.
-    """
     p = _progress_path(pdf_path)
     if not os.path.exists(p):
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # runner semble attendre directement un dict de pages
         if isinstance(data, dict) and "pages" in data and isinstance(data["pages"], dict):
             return data["pages"]
         if isinstance(data, dict):
@@ -146,10 +162,6 @@ def load_progress(pdf_path: str) -> Dict[str, Dict]:
         return {}
 
 def save_progress(pdf_path: str, completed_pages: Dict[str, Dict]) -> None:
-    """
-    Attendu par qwenocr_runner.py
-    On stocke {"pages": completed_pages} pour être robuste.
-    """
     p = _progress_path(pdf_path)
     tmp = p + ".tmp"
     payload = {"pages": completed_pages}
@@ -158,9 +170,6 @@ def save_progress(pdf_path: str, completed_pages: Dict[str, Dict]) -> None:
     os.replace(tmp, p)
 
 def clear_progress(pdf_path: str) -> None:
-    """
-    Attendu (souvent) par le runner : supprime le cache de reprise.
-    """
     p = _progress_path(pdf_path)
     try:
         if os.path.exists(p):
@@ -370,7 +379,7 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
 def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict]:
     """
     Retourne (markdown_page, stats) comme attendu.
-    Le runner gère lui-même le cache via load_progress/save_progress.
+    Le runner gère le cache via load_progress/save_progress/clear_progress.
     """
     page_num = int(page_num)
 
@@ -402,6 +411,7 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
 
 __all__ = [
     "MODEL",
+    "INTER_REQUEST_DELAY",
     "MODEL_OCR",
     "MODEL_MD",
     "get_pdf_info",
