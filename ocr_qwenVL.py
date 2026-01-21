@@ -2,48 +2,46 @@
 # -*- coding: utf-8 -*-
 
 """
-ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
+ocr_qwenVL.py — Module compatible avec qwenocr_runner.py SANS modifier le runner.
 
-Expose (d'après tes logs) :
+API attendue (d'après tes logs) :
 - MODEL (str)
 - INTER_REQUEST_DELAY (float)
-- get_pdf_info(pdf_path) -> dict {page_count,...}
+- get_pdf_info(pdf_path) -> dict {page_count, file_size_mb, ...}
 - load_progress(pdf_path) -> Dict[str, Dict]
 - save_progress(pdf_path, completed_pages) -> None
 - clear_progress(pdf_path) -> None
-- process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown, stats)
+- process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown_page, stats)
 - calculate_costs(stats_list) -> dict
 
 Implémentation :
-- 2 étapes : OCR brut (image->texte) puis Markdown (texte->md)
-- Annexe OCR brut ajoutée dans le markdown (ajout code, 0 token).
-
-Correctifs ajoutés par rapport à ta version :
-- Logs explicites sur chaque étape (rendu image / OCR / MD) + logs sur retries/backoff
-  -> évite les "silences" qui masquent les 429/backoff/timeout.
-- Backoff 429 borné (et option fail-fast) pour éviter de dormir 60s en silence dans un job
-  qui peut être tué par timeout de plateforme.
-- Rendu PDF plus économe en mémoire (paths_only + fichier temporaire) + DPI par défaut 200.
-  -> réduit les kills "sans traceback" causés par poppler/PIL.
-- Tous les paramètres sont surchargables via variables d'environnement (facile sans toucher le code).
+- 2 étapes (fidélité) :
+  1) OCR brut (image -> texte brut)
+  2) Markdown (texte brut -> markdown structuré)
+- Ajout d'une annexe "OCR brut" dans le markdown (côté code, 0 token).
+- Rend la conversion PDF->PNG plus "low memory" via paths_only=True.
+- Logs explicites + backoff court (évite les sleeps 60s silencieux).
 """
 
+from __future__ import annotations
+
 import base64
+import gc
+import json
 import os
 import re
-import time
-import json
 import tempfile
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Dict, List, Tuple
 
 import requests
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 
-# PDF reader (pour page_count)
+# --- Lecture PDF (optionnelle, fallback) ---
 PdfReader = None
 try:
-    from pypdf import PdfReader as _PdfReader  # type: ignore
+    from pypdf import PdfReader as _PdfReader
     PdfReader = _PdfReader
 except Exception:
     try:
@@ -54,73 +52,36 @@ except Exception:
 
 
 # =====================
-# Helpers ENV
-# =====================
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v.strip().lower() not in ("0", "false", "no", "off")
-
-
-# =====================
 # Configuration
 # =====================
 
 API_URL = os.getenv("QWEN_API_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 
 MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-max")
-MODEL_MD  = os.getenv("QWEN_MODEL_MD",  "qwen-vl-max")
+MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen-vl-max")
 
-# Attendu par le runner
+# Le runner affiche ocr.MODEL
 MODEL = MODEL_OCR
 
-# Attendu par qwenocr_runner.py (pause entre pages/requêtes)
-INTER_REQUEST_DELAY = _env_float("INTER_REQUEST_DELAY", 0.0)
+# Pause entre pages (le runner l'utilise)
+INTER_REQUEST_DELAY = float(os.getenv("INTER_REQUEST_DELAY", "1.0"))
 
-# Le DPI 300 est coûteux. 200 suffit souvent pour factures.
-RENDER_DPI = _env_int("RENDER_DPI", 200)
+# Valeurs “sûres” pour Cloud Run (réduisent CPU/RAM vs 300 DPI)
+RENDER_DPI = int(os.getenv("RENDER_DPI", "200"))
 
-# Tokens : 20000 peut être inutilement lent. Ajustable via ENV.
-MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 12000)
-MAX_TOKENS_MD  = _env_int("MAX_TOKENS_MD",  12000)
+# Tokens : adapte si tu constates des troncatures
+MAX_TOKENS_OCR = int(os.getenv("MAX_TOKENS_OCR", "12000"))
+MAX_TOKENS_MD = int(os.getenv("MAX_TOKENS_MD", "12000"))
 
-TEMPERATURE = _env_float("TEMPERATURE", 0.0)
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 
-# Timeout d'appel : si ta plateforme tue tôt, mieux vaut échouer proprement que "geler" 600s.
-REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 120)
+# Timeouts & retries (éviter de se faire tuer pendant des longs sleeps)
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+CONNECT_TIMEOUT_SECONDS = int(os.getenv("CONNECT_TIMEOUT_SECONDS", "10"))
 
-MAX_RETRIES = _env_int("MAX_RETRIES", 3)
-BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)
-BACKOFF_MAX  = _env_int("BACKOFF_MAX", 30)
-
-# Gestion rate limit : bornes courtes par défaut
-FAIL_FAST_ON_429   = _env_bool("FAIL_FAST_ON_429", True)
-MIN_WAIT_ON_429    = _env_int("MIN_WAIT_ON_429", 10)
-MIN_WAIT_OVERLOADED = _env_int("MIN_WAIT_OVERLOADED", 5)
-MAX_WAIT_ANY       = _env_int("MAX_WAIT_ANY", 15)
-
-# Verbose logs
-VERBOSE = _env_bool("VERBOSE", True)
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2.0"))
+BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", "15.0"))  # volontairement bas
 
 
 # =====================
@@ -195,7 +156,7 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 
 
 # =====================
-# Progress cache (attendu par le runner)
+# Progress (attendu par le runner)
 # =====================
 
 def _progress_path(pdf_path: str) -> str:
@@ -234,19 +195,32 @@ def clear_progress(pdf_path: str) -> None:
 
 
 # =====================
-# get_pdf_info (attendu par le runner)
+# PDF info (attendu par le runner)
 # =====================
 
 def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
     pdf_path = str(pdf_path)
     file_size = os.path.getsize(pdf_path)
 
-    if PdfReader is None:
-        raise RuntimeError("pypdf/PyPDF2 indisponible : impossible de compter les pages. Ajoute pypdf au requirements.")
+    page_count = None
 
-    with open(pdf_path, "rb") as f:
-        reader = PdfReader(f)
-        page_count = len(reader.pages)
+    # 1) pypdf / PyPDF2 si dispo
+    if PdfReader is not None:
+        with open(pdf_path, "rb") as f:
+            reader = PdfReader(f)
+            page_count = len(reader.pages)
+
+    # 2) fallback poppler (pdfinfo)
+    if page_count is None:
+        try:
+            info = pdfinfo_from_path(pdf_path)
+            # pdf2image renvoie souvent "Pages"
+            page_count = int(info.get("Pages"))  # type: ignore[arg-type]
+        except Exception:
+            page_count = None
+
+    if page_count is None:
+        raise RuntimeError("Impossible de déterminer le nombre de pages (ni pypdf/pyPDF2 ni pdfinfo).")
 
     return {
         "page_count": int(page_count),
@@ -256,54 +230,17 @@ def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
 
 
 # =====================
-# Helpers API
+# Helpers (texte / markdown)
 # =====================
 
-def _calculate_backoff_delay(attempt: int) -> int:
-    # attempt commence à 1
-    delay = BACKOFF_BASE ** attempt
-    return int(min(delay, BACKOFF_MAX))
-
-def _log(msg: str) -> None:
-    if VERBOSE:
-        print(msg, flush=True)
-
-def _handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool, int]:
-    """
-    Renvoie (should_retry, wait_seconds).
-    IMPORTANT: on évite les sleeps longs et silencieux (429) qui font tuer le job par timeout plateforme.
-    """
-    err = str(error).lower()
-
-    non_retryable = ["invalid api key", "authentication failed", "permission denied"]
-    if any(x in err for x in non_retryable):
-        return False, 0
-
-    # Rate limit: soit fail-fast, soit wait court
-    if "429" in err or "rate limit" in err:
-        if FAIL_FAST_ON_429:
-            return False, 0
-        wait_time = max(_calculate_backoff_delay(attempt), MIN_WAIT_ON_429)
-        return True, int(min(wait_time, MAX_WAIT_ANY))
-
-    if attempt >= MAX_RETRIES:
-        return False, 0
-
-    wait_time = _calculate_backoff_delay(attempt)
-
-    if "overloaded" in err:
-        wait_time = max(wait_time, MIN_WAIT_OVERLOADED)
-
-    return True, int(min(wait_time, MAX_WAIT_ANY))
-
-def _extract_text_from_response_content(content) -> str:
+def _extract_text_from_response_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts: List[str] = []
         for part in content:
             if isinstance(part, dict) and part.get("text"):
-                parts.append(part["text"])
+                parts.append(str(part["text"]))
         return "\n\n".join(parts)
     return str(content)
 
@@ -314,168 +251,196 @@ def _strip_triple_backticks(text: str) -> str:
         t = re.sub(r"\n?```$", "", t)
     return t.strip("\n")
 
-def _remove_empty_md_table_rows(md: str) -> str:
-    out: List[str] = []
-    for line in md.splitlines():
-        if re.match(r'^\|.*\|\s*$', line):
-            cells = [c.strip() for c in line.strip().strip('|').split('|')]
-            # ligne séparatrice
-            if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
-                out.append(line)
-                continue
-            # ligne entièrement vide
-            if all(c == "" for c in cells):
-                continue
-        out.append(line)
-    return "\n".join(out)
-
 def _strip_existing_ocr_appendix(md: str) -> str:
     m = re.search(r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$", md, flags=re.IGNORECASE | re.MULTILINE)
     if not m:
         return md.strip()
     return md[:m.start()].rstrip()
 
+def _remove_empty_md_table_rows(md: str) -> str:
+    out: List[str] = []
+    for line in md.splitlines():
+        if re.match(r'^\|.*\|\s*$', line):
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            # garder le séparateur Markdown --- / :---:
+            if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
+                out.append(line)
+                continue
+            # supprimer ligne de tableau totalement vide
+            if all(c == "" for c in cells):
+                continue
+        out.append(line)
+    return "\n".join(out)
+
 
 # =====================
-# Rendering PDF -> image base64 (mémoire réduite)
+# Rendu PDF -> PNG base64 (low memory)
 # =====================
 
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
     """
-    Rend une seule page PDF en PNG, puis base64.
-    Utilise paths_only + fichier temporaire pour limiter la RAM.
+    Utilise paths_only=True pour éviter de garder une grosse image PIL en RAM.
     """
-    # pdf2image attend des pages 1-indexées
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            paths = convert_from_path(
-                pdf_path,
-                dpi=dpi,
-                first_page=page_num,
-                last_page=page_num,
-                fmt="png",
-                output_folder=tmpdir,
-                paths_only=True,      # clé pour éviter de garder une image PIL en mémoire
-                thread_count=1
-            )
-            if not paths:
-                raise ValueError(f"Aucune image générée pour la page {page_num}")
-            png_path = paths[0]
-            with open(png_path, "rb") as f:
-                b = f.read()
-        except TypeError:
-            # fallback si pdf2image trop ancien (pas de paths_only)
-            images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
-            if not images:
-                raise ValueError(f"Aucune image générée pour la page {page_num}")
-            img = images[0]
-            # sauvegarde temporaire
-            png_path = os.path.join(tmpdir, f"page_{page_num}.png")
-            img.save(png_path, format="PNG")
-            with open(png_path, "rb") as f:
-                b = f.read()
+        # thread_count=1 pour limiter RAM/CPU
+        paths = convert_from_path(
+            pdf_path,
+            dpi=dpi,
+            first_page=page_num,
+            last_page=page_num,
+            fmt="png",
+            output_folder=tmpdir,
+            paths_only=True,
+            thread_count=1,
+        )
+        if not paths:
+            raise ValueError(f"Aucune image générée pour la page {page_num}")
+        png_path = paths[0]
+        with open(png_path, "rb") as f:
+            b = f.read()
 
     b64 = base64.b64encode(b).decode("utf-8")
-    return b64, len(b) / 1024
+    return b64, (len(b) / 1024.0)
 
 
 # =====================
-# Calls Qwen
+# Appels API Qwen
 # =====================
 
-def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, context: str) -> Tuple[str, Dict]:
+def _backoff(attempt: int) -> float:
+    # backoff exponentiel plafonné (bas volontairement)
+    delay = min((BACKOFF_BASE ** attempt), BACKOFF_MAX)
+    return float(delay)
+
+def _compute_retry_delay(http_status: int | None, err_msg: str, attempt: int) -> Tuple[bool, float]:
+    """
+    Retour (retry?, delay_seconds)
+    Objectif : éviter de rester silencieux 60s (kill Cloud Run), mais garder un retry court.
+    """
+    if attempt >= MAX_RETRIES:
+        return False, 0.0
+
+    msg = (err_msg or "").lower()
+
+    # erreurs non récupérables
+    non_retryable = ["invalid api key", "authentication failed", "permission denied"]
+    if any(x in msg for x in non_retryable):
+        return False, 0.0
+
+    # rate limit -> retry court + log (au lieu de 60s)
+    if http_status == 429 or "rate limit" in msg:
+        return True, min(10.0 * attempt, 15.0)
+
+    # surcharge -> retry court
+    if "overloaded" in msg:
+        return True, min(5.0 * attempt, 10.0)
+
+    # par défaut -> backoff plafonné
+    return True, _backoff(attempt)
+
+def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tokens: int, context: str) -> Tuple[str, Dict[str, int]]:
     url = f"{API_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {"model": model, "max_tokens": max_tokens, "temperature": TEMPERATURE, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
-        t0 = time.time()
         try:
-            _log(f"🌐 {context}: appel API (model={model}) attempt {attempt}/{MAX_RETRIES}")
-            r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+            r = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=(CONNECT_TIMEOUT_SECONDS, REQUEST_TIMEOUT_SECONDS),
+            )
 
-            dt = time.time() - t0
             if r.status_code == 200:
                 js = r.json()
-                usage = js.get("usage", {})
-                input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
-                output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+                usage = js.get("usage", {}) or {}
+                input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+                output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
 
-                choices = js.get("choices", [])
-                content = choices[0].get("message", {}).get("content", "") if choices else ""
+                choices = js.get("choices", []) or []
+                content = ""
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "")
+
                 text = _extract_text_from_response_content(content).strip()
-
                 stats = {
-                    "input_tokens": int(input_tokens),
-                    "output_tokens": int(output_tokens),
-                    "total_tokens": int(input_tokens + output_tokens),
-                    "elapsed_s": round(dt, 3),
-                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
                 }
-                _log(f"✅ {context}: OK en {stats['elapsed_s']}s (tokens in={stats['input_tokens']} out={stats['output_tokens']})")
                 return text, stats
 
-            # Non-200
+            # non-200
             try:
                 err_json = r.json()
+                err_msg = json.dumps(err_json, ensure_ascii=False)[:500]
             except Exception:
-                err_json = r.text[:500]
+                err_msg = (r.text or "")[:500]
 
-            msg = f"HTTP {r.status_code}: {str(err_json)[:500]}"
-            should_retry, wait_time = _handle_api_error(Exception(msg), attempt, context)
-            _log(f"⚠️ {context}: {msg}")
+            retry, delay = _compute_retry_delay(r.status_code, err_msg, attempt)
+            print(f"⚠️ {context}: HTTP {r.status_code} -> retry={retry} dans {delay:.1f}s | {err_msg[:200]}", flush=True)
+            if not retry:
+                raise RuntimeError(f"{context}: HTTP {r.status_code} {err_msg}")
 
-            if not should_retry:
-                raise Exception(msg)
-
-            _log(f"⏳ {context}: retry dans {wait_time}s")
-            time.sleep(wait_time)
+            time.sleep(delay)
 
         except requests.exceptions.Timeout as e:
-            should_retry, wait_time = _handle_api_error(e, attempt, f"{context} timeout")
-            _log(f"⚠️ {context}: timeout après {REQUEST_TIMEOUT}s (attempt {attempt}/{MAX_RETRIES})")
-            if not should_retry:
+            retry, delay = _compute_retry_delay(None, str(e), attempt)
+            print(f"⚠️ {context}: timeout -> retry={retry} dans {delay:.1f}s | {e}", flush=True)
+            if not retry:
                 raise
-            _log(f"⏳ {context}: retry dans {wait_time}s")
-            time.sleep(wait_time)
+            time.sleep(delay)
 
         except requests.exceptions.RequestException as e:
-            should_retry, wait_time = _handle_api_error(e, attempt, f"{context} réseau")
-            _log(f"⚠️ {context}: erreur réseau: {repr(e)}")
-            if not should_retry:
+            retry, delay = _compute_retry_delay(None, str(e), attempt)
+            print(f"⚠️ {context}: réseau -> retry={retry} dans {delay:.1f}s | {e}", flush=True)
+            if not retry:
                 raise
-            _log(f"⏳ {context}: retry dans {wait_time}s")
-            time.sleep(wait_time)
+            time.sleep(delay)
 
-    raise Exception(f"Échec {context} après {MAX_RETRIES} tentatives")
+    raise RuntimeError(f"Échec {context} après {MAX_RETRIES} tentatives")
 
 
-def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict]:
-    _log(f"🖼️ Page {page_num}: rendu image (dpi={RENDER_DPI})")
-    image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num)
+# =====================
+# 2 étapes : OCR puis Markdown
+# =====================
 
-    _log(f"🖼️ Page {page_num}: image OK ({size_kb:.1f} KB) -> OCR")
+def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict[str, int]]:
+    print(f"➡️ Page {page_num}: rendu image (dpi={RENDER_DPI})", flush=True)
+    image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num, dpi=RENDER_DPI)
+    print(f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB), appel OCR", flush=True)
+
     data_url = f"data:image/png;base64,{image_b64}"
 
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": OCR_PROMPT},
-            {"type": "image_url", "image_url": {"url": data_url}},
-            {"type": "text", "text": f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut."},
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": OCR_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut."},
+            ],
+        }
+    ]
 
     text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, f"OCR page {page_num}")
-
     text = _strip_triple_backticks(text)
+
     if len(text.strip()) < 20:
-        raise Exception("OCR trop court / vide (suspect)")
+        raise RuntimeError("OCR trop court / vide (suspect)")
+
+    # libère mémoire (base64 peut être gros)
+    del image_b64
+    gc.collect()
+
+    print(f"✅ Page {page_num}: OCR OK ({stats.get('total_tokens', 0)} tokens)", flush=True)
     return text, stats
 
 
-def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict]:
-    _log(f"🧾 Page {page_num}: génération Markdown à partir OCR ({len(ocr_text)} chars)")
+def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict[str, int]]:
+    print(f"➡️ Page {page_num}: appel Markdown (depuis OCR brut)", flush=True)
+
     user_block = (
         f"Voici le texte OCR brut de la page {page_num} :\n\n"
         "```text\n"
@@ -485,39 +450,42 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
         "N'inclus PAS la section '## Annexe - OCR brut'."
     )
 
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": SYSTEM_PROMPT_MD},
-            {"type": "text", "text": user_block},
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": SYSTEM_PROMPT_MD},
+                {"type": "text", "text": user_block},
+            ],
+        }
+    ]
 
     md, stats = _call_chat(api_key, MODEL_MD, messages, MAX_TOKENS_MD, f"Markdown page {page_num}")
     md = _strip_triple_backticks(md)
     md = _strip_existing_ocr_appendix(md)
     md = _remove_empty_md_table_rows(md)
+
+    print(f"✅ Page {page_num}: Markdown OK ({stats.get('total_tokens', 0)} tokens)", flush=True)
     return md.strip(), stats
 
 
 # =====================
-# Fonction attendue: process_page_with_cache
+# Fonction attendue par le runner
 # =====================
 
-def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict]:
+def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict[str, Any]]:
     """
-    Retourne (markdown_page, stats) comme attendu.
-    Le runner gère le cache via load_progress/save_progress/clear_progress.
+    Doit retourner (markdown_page, stats) pour le runner.
     """
     page_num = int(page_num)
-    _log(f"🚧 Page {page_num}: START (is_first_page={is_first_page})")
 
     # 1) OCR brut
     ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=page_num)
 
-    # 2) Markdown structuré depuis OCR brut
+    # 2) Markdown structuré
     md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=page_num)
 
+    # 3) Assemblage (inclut OCR brut en annexe)
     page_md = (
         f"<!-- PAGE {page_num} -->\n\n"
         f"{md_core}\n\n"
@@ -533,26 +501,24 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
         "output_tokens": int(ocr_stats.get("output_tokens", 0)) + int(md_stats.get("output_tokens", 0)),
         "total_tokens": int(ocr_stats.get("total_tokens", 0)) + int(md_stats.get("total_tokens", 0)),
         "details": {"ocr": ocr_stats, "md": md_stats},
+        "models": {"ocr": MODEL_OCR, "md": MODEL_MD},
+        "render_dpi": RENDER_DPI,
     }
 
-    _log(f"🏁 Page {page_num}: DONE (tokens total={stats['total_tokens']})")
-
-    # Pause volontaire entre pages si souhaitée
-    if INTER_REQUEST_DELAY and INTER_REQUEST_DELAY > 0:
-        _log(f"⏸️ Pause {INTER_REQUEST_DELAY}s (INTER_REQUEST_DELAY)")
-        time.sleep(INTER_REQUEST_DELAY)
+    # libère mémoire
+    del ocr_text
+    gc.collect()
 
     return page_md, stats
 
 
 # =====================
-# Attendu: calculate_costs
+# Attendu par le runner : calculate_costs
 # =====================
 
-def calculate_costs(stats_list: List[Dict]) -> Dict[str, Any]:
+def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Compat runner : renvoie les clés attendues.
-    Tu ne veux pas de calcul réel -> coûts à 0.
+    Compat runner : renvoie des coûts à 0.0 mais garde les totaux tokens.
     """
     stats_list = stats_list or []
 
@@ -565,7 +531,10 @@ def calculate_costs(stats_list: List[Dict]) -> Dict[str, Any]:
             continue
         total_input += int(s.get("input_tokens", 0) or 0)
         total_output += int(s.get("output_tokens", 0) or 0)
-        total_tokens += int(s.get("total_tokens", 0) or (int(s.get("input_tokens", 0) or 0) + int(s.get("output_tokens", 0) or 0)))
+        tt = s.get("total_tokens")
+        if tt is None:
+            tt = (int(s.get("input_tokens", 0) or 0) + int(s.get("output_tokens", 0) or 0))
+        total_tokens += int(tt or 0)
 
     pages = max(len(stats_list), 1)
 
@@ -581,11 +550,84 @@ def calculate_costs(stats_list: List[Dict]) -> Dict[str, Any]:
     }
 
 
+# --- Exports ---# =====================
+# Attendu: validate_markdown_quality
+# =====================
+
+def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str, Any]:
+    """
+    Compat runner : le runner appelle cette fonction en finalisation.
+
+    Ce projet n'a pas besoin d'un vrai scoring : on renvoie une validation légère,
+    non bloquante, avec des clés redondantes (ok/is_valid/valid/passed) pour
+    maximiser la compatibilité.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if not isinstance(final_markdown, str) or final_markdown.strip() == "":
+        errors.append("Markdown final vide.")
+        pages_found: List[int] = []
+    else:
+        pages_found = []
+        for m in re.finditer(r"<!--\s*PAGE\s+(\d+)\s*-->", final_markdown):
+            try:
+                pages_found.append(int(m.group(1)))
+            except Exception:
+                continue
+
+        # Indicateurs simples
+        if page_count and len(set(pages_found)) != int(page_count):
+            warnings.append(
+                f"Pages détectées dans le Markdown: {len(set(pages_found))}, attendu: {int(page_count)}."
+            )
+
+        annexes = len(
+            re.findall(
+                r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$",
+                final_markdown,
+                flags=re.MULTILINE | re.IGNORECASE,
+            )
+        )
+        if page_count and annexes < int(page_count):
+            warnings.append(f"Annexes OCR trouvées: {annexes}, attendu au moins: {int(page_count)}.")
+
+        # Headers attendus (heuristique)
+        required_headers = [
+            "## Informations Émetteur (Fournisseur)",
+            "## Informations Client",
+            "## Détails de la Facture",
+            "## Tableau des Lignes de Facturation",
+            "## Montants Récapitulatifs",
+            "## Informations de Paiement",
+            "## Mentions Légales et Notes Complémentaires",
+        ]
+        missing = [h for h in required_headers if h not in final_markdown]
+        if missing:
+            warnings.append("En-têtes manquants (au moins une fois): " + ", ".join(missing[:5]) + ("…" if len(missing) > 5 else ""))
+
+    ok = (len(errors) == 0)
+    score = 1.0 if ok else 0.0
+
+    return {
+        "ok": ok,
+        "is_valid": ok,
+        "valid": ok,
+        "passed": ok,
+        "score": score,
+        "errors": errors,
+        "warnings": warnings,
+        "page_count": int(page_count or 0),
+        "pages_found": sorted(set(pages_found)) if isinstance(final_markdown, str) else [],
+        "summary": ("OK" if ok else "KO") + ("" if not warnings else f" (warnings={len(warnings)})"),
+    }
+
 __all__ = [
     "MODEL",
-    "INTER_REQUEST_DELAY",
     "MODEL_OCR",
     "MODEL_MD",
+    "INTER_REQUEST_DELAY",
+    "RENDER_DPI",
     "get_pdf_info",
     "load_progress",
     "save_progress",
@@ -594,5 +636,6 @@ __all__ = [
     "calculate_costs",
     "ocr_page_with_vl",
     "markdown_from_ocr",
+    "validate_markdown_quality",
 ]
 
