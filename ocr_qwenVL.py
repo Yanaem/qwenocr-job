@@ -2,27 +2,43 @@
 # -*- coding: utf-8 -*-
 
 """
-Module OCR QwenVL compatible avec qwenocr_runner.py (SANS modifier le runner).
+ocr_qwenVL.py — module compatible avec qwenocr_runner.py (sans modifier le runner)
 
-Interface attendue (comme ton script "TOPDUTOP") :
+Le runner attend au minimum :
 - MODEL (str)
+- get_pdf_info(pdf_path) -> dict avec "page_count"
 - process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown, stats)
 
-Implémentation :
-- 2 étapes pour fidélité maximale :
-  1) Vision OCR -> texte brut
-  2) Texte -> Markdown structuré
-- Le .md retourné inclut une annexe "OCR brut" (ajoutée par le code, 0 token).
+Ce module implémente 2 étapes (fidélité maximale) :
+1) OCR (vision) -> texte brut
+2) Texte brut -> Markdown structuré
++ ajoute une annexe "OCR brut" dans le markdown (ajout code, 0 token).
 """
 
 import base64
+import os
 import re
 import time
+import json
 from io import BytesIO
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple, Any
 
 import requests
-from pdf2image import convert_from_path  # nécessite poppler dans l'image
+from pdf2image import convert_from_path
+
+# PDF reader (fallbacks)
+PdfReader = None
+try:
+    from pypdf import PdfReader as _PdfReader  # pypdf
+    PdfReader = _PdfReader
+except Exception:
+    try:
+        from PyPDF2 import PdfReader as _PdfReader  # PyPDF2
+        PdfReader = _PdfReader
+    except Exception:
+        PdfReader = None
+
 
 # =====================
 # Configuration
@@ -30,22 +46,23 @@ from pdf2image import convert_from_path  # nécessite poppler dans l'image
 
 API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
-MODEL_OCR = "qwen-vl-max"   # vision (image -> OCR texte)
-MODEL_MD = "qwen-vl-max"    # texte  (OCR texte -> Markdown)
+MODEL_OCR = "qwen-vl-max"
+MODEL_MD = "qwen-vl-max"
 
 # Le runner affiche ocr.MODEL
 MODEL = MODEL_OCR
 
+RENDER_DPI = 300
+
 MAX_TOKENS_OCR = 20000
 MAX_TOKENS_MD = 20000
-
 TEMPERATURE = 0.0
+
 REQUEST_TIMEOUT = 600
 MAX_RETRIES = 5
 BACKOFF_BASE = 2
 BACKOFF_MAX = 120
 
-RENDER_DPI = 300
 
 # =====================
 # Prompts
@@ -119,16 +136,49 @@ Structure de sortie (Markdown uniquement, sans commentaire) :
 
 
 # =====================
-# Helpers
+# Runner compatibility: get_pdf_info
 # =====================
 
-def calculate_backoff_delay(attempt: int) -> int:
+def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
+    """
+    Fonction attendue par qwenocr_runner.py.
+    Doit au minimum renvoyer {"page_count": <int>, ...}
+    """
+    pdf_path = str(pdf_path)
+    file_size = os.path.getsize(pdf_path)
+
+    page_count = None
+
+    # 1) pypdf / PyPDF2 si dispo
+    if PdfReader is not None:
+        with open(pdf_path, "rb") as f:
+            reader = PdfReader(f)
+            page_count = len(reader.pages)
+
+    # 2) fallback: pdf2image peut lever si poppler absent; ici on évite une conversion complète.
+    if page_count is None:
+        # fallback ultra basique: tenter de convertir la 1ère page pour vérifier, puis compter via loop (coûteux)
+        # => on préfère échouer clairement plutôt que faire exploser les coûts CPU
+        raise RuntimeError("Impossible de déterminer le nombre de pages (PdfReader indisponible). Installe pypdf/PyPDF2.")
+
+    return {
+        "page_count": int(page_count),
+        "file_size_bytes": int(file_size),
+        "file_size_mb": file_size / (1024 * 1024),
+    }
+
+
+# =====================
+# Helpers API
+# =====================
+
+def _calculate_backoff_delay(attempt: int) -> int:
     return min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
 
-
-def handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool, int]:
+def _handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool, int]:
     err = str(error).lower()
 
+    # erreurs non récupérables
     non_retryable = ["invalid api key", "authentication failed", "permission denied"]
     if any(x in err for x in non_retryable):
         return False, 0
@@ -136,7 +186,7 @@ def handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool
     if attempt >= MAX_RETRIES:
         return False, 0
 
-    wait_time = calculate_backoff_delay(attempt)
+    wait_time = _calculate_backoff_delay(attempt)
 
     if "429" in err or "rate limit" in err:
         wait_time = max(wait_time, 60)
@@ -145,130 +195,127 @@ def handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool
 
     return True, wait_time
 
-
-def extract_text_from_response_content(content) -> str:
+def _extract_text_from_response_content(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts: List[str] = []
         for part in content:
-            if isinstance(part, dict):
-                txt = part.get("text")
-                if txt:
-                    parts.append(txt)
+            if isinstance(part, dict) and part.get("text"):
+                parts.append(part["text"])
         return "\n\n".join(parts)
     return str(content)
 
-
-def strip_triple_backticks(text: str) -> str:
+def _strip_triple_backticks(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
         t = re.sub(r"\n?```$", "", t)
     return t.strip("\n")
 
-
-def remove_empty_md_table_rows(md: str) -> str:
+def _remove_empty_md_table_rows(md: str) -> str:
     out: List[str] = []
     for line in md.splitlines():
         if re.match(r'^\|.*\|\s*$', line):
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            # garder séparateur d'en-tête
             if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
                 out.append(line)
                 continue
+            # supprimer ligne vide totale
             if all(c == "" for c in cells):
                 continue
         out.append(line)
     return "\n".join(out)
 
-
-def strip_existing_ocr_appendix(md: str) -> str:
+def _strip_existing_ocr_appendix(md: str) -> str:
     m = re.search(r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$", md, flags=re.IGNORECASE | re.MULTILINE)
     if not m:
         return md.strip()
     return md[:m.start()].rstrip()
 
 
+# =====================
+# Rendering (PDF -> PNG base64)
+# =====================
+
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
-    images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
+    images = convert_from_path(
+        pdf_path,
+        dpi=dpi,
+        first_page=page_num,
+        last_page=page_num
+    )
     if not images:
         raise ValueError(f"Aucune image générée pour la page {page_num}")
 
-    image = images[0]
+    img = images[0]
     buf = BytesIO()
-    image.save(buf, format="PNG")
+    img.save(buf, format="PNG")
     buf.seek(0)
-    image_bytes = buf.read()
+    b = buf.read()
 
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    size_kb = len(image_bytes) / 1024
-    return image_b64, size_kb
+    b64 = base64.b64encode(b).decode("utf-8")
+    size_kb = len(b) / 1024
+    return b64, size_kb
 
 
-def call_chat_completions(
-    api_key: str,
-    model: str,
-    messages: List[Dict],
-    max_tokens: int,
-    context: str,
-    temperature: float = TEMPERATURE,
-) -> Tuple[str, Dict]:
+# =====================
+# Qwen calls
+# =====================
+
+def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, context: str) -> Tuple[str, Dict]:
     url = f"{API_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"model": model, "max_tokens": max_tokens, "temperature": temperature, "messages": messages}
+    body = {"model": model, "max_tokens": max_tokens, "temperature": TEMPERATURE, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-
             if r.status_code == 200:
                 js = r.json()
                 usage = js.get("usage", {})
-                input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-                output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+                input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+                output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
 
                 choices = js.get("choices", [])
                 content = ""
                 if choices:
                     content = choices[0].get("message", {}).get("content", "")
 
-                text = extract_text_from_response_content(content).strip()
+                text = _extract_text_from_response_content(content).strip()
                 stats = {
-                    "input_tokens": int(input_tokens or 0),
-                    "output_tokens": int(output_tokens or 0),
-                    "total_tokens": int((input_tokens or 0) + (output_tokens or 0)),
+                    "input_tokens": int(input_tokens),
+                    "output_tokens": int(output_tokens),
+                    "total_tokens": int(input_tokens + output_tokens),
                 }
                 return text, stats
 
-            # Erreur HTTP -> retry selon règles
+            # erreur http => retry ou fail
             try:
                 err_json = r.json()
             except Exception:
                 err_json = r.text[:300]
-            error_msg = f"HTTP {r.status_code}: {str(err_json)[:300]}"
-            should_retry, wait_time = handle_api_error(Exception(error_msg), attempt, context)
+            msg = f"HTTP {r.status_code}: {str(err_json)[:300]}"
+            should_retry, wait_time = _handle_api_error(Exception(msg), attempt, context)
             if not should_retry:
-                raise Exception(error_msg)
+                raise Exception(msg)
             time.sleep(wait_time)
 
         except requests.exceptions.Timeout as e:
-            should_retry, wait_time = handle_api_error(e, attempt, f"{context} timeout")
+            should_retry, wait_time = _handle_api_error(e, attempt, f"{context} timeout")
             if not should_retry:
                 raise
             time.sleep(wait_time)
 
         except requests.exceptions.RequestException as e:
-            should_retry, wait_time = handle_api_error(e, attempt, f"{context} réseau")
+            should_retry, wait_time = _handle_api_error(e, attempt, f"{context} réseau")
             if not should_retry:
                 raise
             time.sleep(wait_time)
 
     raise Exception(f"Échec {context} après {MAX_RETRIES} tentatives")
 
-
-# =====================
-# 2 étapes : OCR puis Markdown
-# =====================
 
 def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict]:
     image_b64, _ = render_single_page_to_base64(pdf_path, page_num)
@@ -285,22 +332,16 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
         }
     ]
 
-    text, stats = call_chat_completions(
-        api_key=api_key,
-        model=MODEL_OCR,
-        messages=messages,
-        max_tokens=MAX_TOKENS_OCR,
-        context=f"OCR page {page_num}",
-    )
+    text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, f"OCR page {page_num}")
+    text = _strip_triple_backticks(text)
 
-    text = strip_triple_backticks(text)
     if len(text.strip()) < 20:
         raise Exception("OCR trop court / vide (suspect)")
     return text, stats
 
 
 def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict]:
-    user_ocr_block = (
+    user_block = (
         f"Voici le texte OCR brut de la page {page_num} :\n\n"
         "```text\n"
         f"{ocr_text}\n"
@@ -310,25 +351,24 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
     )
 
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": SYSTEM_PROMPT_MD}, {"type": "text", "text": user_ocr_block}]}
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": SYSTEM_PROMPT_MD},
+                {"type": "text", "text": user_block},
+            ],
+        }
     ]
 
-    md, stats = call_chat_completions(
-        api_key=api_key,
-        model=MODEL_MD,
-        messages=messages,
-        max_tokens=MAX_TOKENS_MD,
-        context=f"Markdown page {page_num}",
-    )
-
-    md = strip_triple_backticks(md)
-    md = strip_existing_ocr_appendix(md)
-    md = remove_empty_md_table_rows(md)
+    md, stats = _call_chat(api_key, MODEL_MD, messages, MAX_TOKENS_MD, f"Markdown page {page_num}")
+    md = _strip_triple_backticks(md)
+    md = _strip_existing_ocr_appendix(md)
+    md = _remove_empty_md_table_rows(md)
     return md.strip(), stats
 
 
 # =====================
-# Fonction attendue par le runner
+# Runner compatibility: process_page_with_cache
 # =====================
 
 def process_page_with_cache(
@@ -338,21 +378,18 @@ def process_page_with_cache(
     is_first_page: bool = False
 ) -> Tuple[str, Dict]:
     """
-    Fonction attendue par qwenocr_runner.py (interface TOPDUTOP).
-
-    Retour:
-      - markdown (str) : inclut marqueur <!-- PAGE n -->, Markdown structuré, annexe OCR brut, puis '---'
-      - stats (dict)   : tokens agrégés des 2 appels (OCR + MD) + détail
+    Signature et retour attendus par le runner (style TOPDUTOP):
+      -> (markdown_page, stats)
     """
     # 1) OCR brut
-    ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=page_num)
+    ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=int(page_num))
 
-    # 2) Markdown structuré à partir de l'OCR brut
-    md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=page_num)
+    # 2) Markdown structuré à partir du texte brut
+    md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=int(page_num))
 
-    # 3) Assemblage page (avec annexe OCR)
+    # 3) Assemblage final pour la page
     page_md = (
-        f"<!-- PAGE {page_num} -->\n\n"
+        f"<!-- PAGE {int(page_num)} -->\n\n"
         f"{md_core}\n\n"
         "## Annexe - OCR brut\n"
         "```text\n"
@@ -365,10 +402,7 @@ def process_page_with_cache(
         "input_tokens": int(ocr_stats.get("input_tokens", 0)) + int(md_stats.get("input_tokens", 0)),
         "output_tokens": int(ocr_stats.get("output_tokens", 0)) + int(md_stats.get("output_tokens", 0)),
         "total_tokens": int(ocr_stats.get("total_tokens", 0)) + int(md_stats.get("total_tokens", 0)),
-        "details": {
-            "ocr": ocr_stats,
-            "md": md_stats,
-        },
+        "details": {"ocr": ocr_stats, "md": md_stats},
     }
 
     return page_md, stats
@@ -378,6 +412,7 @@ __all__ = [
     "MODEL",
     "MODEL_OCR",
     "MODEL_MD",
+    "get_pdf_info",
     "process_page_with_cache",
     "ocr_page_with_vl",
     "markdown_from_ocr",
