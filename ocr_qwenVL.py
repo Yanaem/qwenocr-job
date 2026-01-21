@@ -48,6 +48,8 @@ API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 MODEL_OCR = "qwen-vl-max"   # vision (image -> OCR texte)
 MODEL_MD = "qwen-vl-max"    # texte (OCR texte -> Markdown)
 
+MODEL = MODEL_OCR
+
 # Tokens
 MAX_TOKENS_OCR = 20000
 MAX_TOKENS_MD = 20000
