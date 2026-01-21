@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-ocr_qwenVL.py — module compatible avec qwenocr_runner.py (sans modifier le runner)
+ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
 
-Le runner attend au minimum :
+Fonctions attendues (d'après logs) :
 - MODEL (str)
-- get_pdf_info(pdf_path) -> dict avec "page_count"
+- get_pdf_info(pdf_path) -> dict {page_count,...}
+- load_progress(pdf_path) -> Dict[str, Dict]
+- save_progress(pdf_path, completed_pages) -> None
+- clear_progress(pdf_path) -> None
 - process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown, stats)
 
-Ce module implémente 2 étapes (fidélité maximale) :
-1) OCR (vision) -> texte brut
-2) Texte brut -> Markdown structuré
-+ ajoute une annexe "OCR brut" dans le markdown (ajout code, 0 token).
+Implémentation fidèle :
+- 2 étapes : OCR brut (image->texte) puis Markdown (texte->md)
+- Annexe OCR brut ajoutée dans le markdown (ajout code, 0 token).
 """
 
 import base64
@@ -27,14 +29,14 @@ from typing import Dict, List, Tuple, Any
 import requests
 from pdf2image import convert_from_path
 
-# PDF reader (fallbacks)
+# PDF reader (pour page_count)
 PdfReader = None
 try:
-    from pypdf import PdfReader as _PdfReader  # pypdf
+    from pypdf import PdfReader as _PdfReader
     PdfReader = _PdfReader
 except Exception:
     try:
-        from PyPDF2 import PdfReader as _PdfReader  # PyPDF2
+        from PyPDF2 import PdfReader as _PdfReader
         PdfReader = _PdfReader
     except Exception:
         PdfReader = None
@@ -48,9 +50,7 @@ API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 MODEL_OCR = "qwen-vl-max"
 MODEL_MD = "qwen-vl-max"
-
-# Le runner affiche ocr.MODEL
-MODEL = MODEL_OCR
+MODEL = MODEL_OCR  # attendu par le runner
 
 RENDER_DPI = 300
 
@@ -111,55 +111,78 @@ Après le tableau, continuez la transcription du reste de la page (totaux, éch�
 Structure de sortie (Markdown uniquement, sans commentaire) :
 
 ## Informations Émetteur (Fournisseur)
-[Données exactes présentes dans la zone d'en-tête uniquement (avant le tableau des lignes de facturation)]
-
-## Informations Client
-[Données du destinataire présentes dans la zone d'en-tête uniquement ou [CHAMP MANQUANT]]
-
-## Détails de la Facture
-[Informations de facturation en en-tête : numéro, dates, références, objet, etc.]
-
-## Tableau des Lignes de Facturation
-[Reproduisez le tableau original avec ses colonnes, sans lignes vides.]
-
-## Montants Récapitulatifs
-[Reprenez tous les blocs de totaux et récapitulatifs présents sur la page. Gardez la forme d'origine.]
-
-## Informations de Paiement
-[Modalités, échéances, paiements, etc.]
-
-## Mentions Légales et Notes Complémentaires
-[Toute information supplémentaire / mentions / pied de page / annotations non classées ailleurs.]
+...
 
 ➡️ Sortie finale : uniquement le document Markdown structuré, sans explication.
 """
 
 
 # =====================
-# Runner compatibility: get_pdf_info
+# Progress cache (attendu par le runner)
+# =====================
+
+def _progress_path(pdf_path: str) -> str:
+    # même logique que dans ton ancien script: <pdf>.progress.json
+    return str(Path(pdf_path).with_suffix(".progress.json"))
+
+def load_progress(pdf_path: str) -> Dict[str, Dict]:
+    """
+    Attendu par qwenocr_runner.py
+    Doit renvoyer un dict: { "1": {...}, "2": {...}, ... } ou {} si rien.
+    """
+    p = _progress_path(pdf_path)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # runner semble attendre directement un dict de pages
+        if isinstance(data, dict) and "pages" in data and isinstance(data["pages"], dict):
+            return data["pages"]
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
+def save_progress(pdf_path: str, completed_pages: Dict[str, Dict]) -> None:
+    """
+    Attendu par qwenocr_runner.py
+    On stocke {"pages": completed_pages} pour être robuste.
+    """
+    p = _progress_path(pdf_path)
+    tmp = p + ".tmp"
+    payload = {"pages": completed_pages}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+def clear_progress(pdf_path: str) -> None:
+    """
+    Attendu (souvent) par le runner : supprime le cache de reprise.
+    """
+    p = _progress_path(pdf_path)
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+# =====================
+# get_pdf_info (attendu par le runner)
 # =====================
 
 def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
-    """
-    Fonction attendue par qwenocr_runner.py.
-    Doit au minimum renvoyer {"page_count": <int>, ...}
-    """
     pdf_path = str(pdf_path)
     file_size = os.path.getsize(pdf_path)
 
-    page_count = None
+    if PdfReader is None:
+        raise RuntimeError("pypdf/PyPDF2 indisponible : impossible de compter les pages. Ajoute pypdf au requirements.")
 
-    # 1) pypdf / PyPDF2 si dispo
-    if PdfReader is not None:
-        with open(pdf_path, "rb") as f:
-            reader = PdfReader(f)
-            page_count = len(reader.pages)
-
-    # 2) fallback: pdf2image peut lever si poppler absent; ici on évite une conversion complète.
-    if page_count is None:
-        # fallback ultra basique: tenter de convertir la 1ère page pour vérifier, puis compter via loop (coûteux)
-        # => on préfère échouer clairement plutôt que faire exploser les coûts CPU
-        raise RuntimeError("Impossible de déterminer le nombre de pages (PdfReader indisponible). Installe pypdf/PyPDF2.")
+    with open(pdf_path, "rb") as f:
+        reader = PdfReader(f)
+        page_count = len(reader.pages)
 
     return {
         "page_count": int(page_count),
@@ -177,22 +200,16 @@ def _calculate_backoff_delay(attempt: int) -> int:
 
 def _handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool, int]:
     err = str(error).lower()
-
-    # erreurs non récupérables
     non_retryable = ["invalid api key", "authentication failed", "permission denied"]
     if any(x in err for x in non_retryable):
         return False, 0
-
     if attempt >= MAX_RETRIES:
         return False, 0
-
     wait_time = _calculate_backoff_delay(attempt)
-
     if "429" in err or "rate limit" in err:
         wait_time = max(wait_time, 60)
     elif "overloaded" in err:
         wait_time = max(wait_time, 30)
-
     return True, wait_time
 
 def _extract_text_from_response_content(content) -> str:
@@ -218,11 +235,9 @@ def _remove_empty_md_table_rows(md: str) -> str:
     for line in md.splitlines():
         if re.match(r'^\|.*\|\s*$', line):
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
-            # garder séparateur d'en-tête
             if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
                 out.append(line)
                 continue
-            # supprimer ligne vide totale
             if all(c == "" for c in cells):
                 continue
         out.append(line)
@@ -236,32 +251,24 @@ def _strip_existing_ocr_appendix(md: str) -> str:
 
 
 # =====================
-# Rendering (PDF -> PNG base64)
+# Rendering PDF -> image base64
 # =====================
 
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
-    images = convert_from_path(
-        pdf_path,
-        dpi=dpi,
-        first_page=page_num,
-        last_page=page_num
-    )
+    images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
     if not images:
         raise ValueError(f"Aucune image générée pour la page {page_num}")
-
     img = images[0]
     buf = BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     b = buf.read()
-
     b64 = base64.b64encode(b).decode("utf-8")
-    size_kb = len(b) / 1024
-    return b64, size_kb
+    return b64, len(b) / 1024
 
 
 # =====================
-# Qwen calls
+# Calls Qwen
 # =====================
 
 def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, context: str) -> Tuple[str, Dict]:
@@ -277,12 +284,8 @@ def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, 
                 usage = js.get("usage", {})
                 input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
                 output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
-
                 choices = js.get("choices", [])
-                content = ""
-                if choices:
-                    content = choices[0].get("message", {}).get("content", "")
-
+                content = choices[0].get("message", {}).get("content", "") if choices else ""
                 text = _extract_text_from_response_content(content).strip()
                 stats = {
                     "input_tokens": int(input_tokens),
@@ -291,7 +294,6 @@ def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, 
                 }
                 return text, stats
 
-            # erreur http => retry ou fail
             try:
                 err_json = r.json()
             except Exception:
@@ -307,7 +309,6 @@ def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, 
             if not should_retry:
                 raise
             time.sleep(wait_time)
-
         except requests.exceptions.RequestException as e:
             should_retry, wait_time = _handle_api_error(e, attempt, f"{context} réseau")
             if not should_retry:
@@ -321,20 +322,17 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
     image_b64, _ = render_single_page_to_base64(pdf_path, page_num)
     data_url = f"data:image/png;base64,{image_b64}"
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": OCR_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
-                {"type": "text", "text": f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut."},
-            ],
-        }
-    ]
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": OCR_PROMPT},
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut."},
+        ],
+    }]
 
     text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, f"OCR page {page_num}")
     text = _strip_triple_backticks(text)
-
     if len(text.strip()) < 20:
         raise Exception("OCR trop court / vide (suspect)")
     return text, stats
@@ -350,15 +348,13 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
         "N'inclus PAS la section '## Annexe - OCR brut'."
     )
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": SYSTEM_PROMPT_MD},
-                {"type": "text", "text": user_block},
-            ],
-        }
-    ]
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": SYSTEM_PROMPT_MD},
+            {"type": "text", "text": user_block},
+        ],
+    }]
 
     md, stats = _call_chat(api_key, MODEL_MD, messages, MAX_TOKENS_MD, f"Markdown page {page_num}")
     md = _strip_triple_backticks(md)
@@ -368,28 +364,24 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
 
 
 # =====================
-# Runner compatibility: process_page_with_cache
+# Fonction attendue: process_page_with_cache
 # =====================
 
-def process_page_with_cache(
-    pdf_path: str,
-    page_num: int,
-    api_key: str,
-    is_first_page: bool = False
-) -> Tuple[str, Dict]:
+def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict]:
     """
-    Signature et retour attendus par le runner (style TOPDUTOP):
-      -> (markdown_page, stats)
+    Retourne (markdown_page, stats) comme attendu.
+    Le runner gère lui-même le cache via load_progress/save_progress.
     """
+    page_num = int(page_num)
+
     # 1) OCR brut
-    ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=int(page_num))
+    ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=page_num)
 
-    # 2) Markdown structuré à partir du texte brut
-    md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=int(page_num))
+    # 2) Markdown structuré depuis OCR brut
+    md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=page_num)
 
-    # 3) Assemblage final pour la page
     page_md = (
-        f"<!-- PAGE {int(page_num)} -->\n\n"
+        f"<!-- PAGE {page_num} -->\n\n"
         f"{md_core}\n\n"
         "## Annexe - OCR brut\n"
         "```text\n"
@@ -413,6 +405,9 @@ __all__ = [
     "MODEL_OCR",
     "MODEL_MD",
     "get_pdf_info",
+    "load_progress",
+    "save_progress",
+    "clear_progress",
     "process_page_with_cache",
     "ocr_page_with_vl",
     "markdown_from_ocr",
