@@ -12,6 +12,7 @@ Fonctions/constantes attendues (d'après logs) :
 - save_progress(pdf_path, completed_pages) -> None
 - clear_progress(pdf_path) -> None
 - process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown, stats)
+- calculate_costs(stats_list) -> dict
 
 Implémentation fidèle :
 - 2 étapes : OCR brut (image->texte) puis Markdown (texte->md)
@@ -409,6 +410,42 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
     return page_md, stats
 
 
+# =====================
+# Attendu: calculate_costs
+# =====================
+
+def calculate_costs(stats_list: List[Dict]) -> Dict[str, Any]:
+    """
+    Compat runner : le runner appelle cette fonction en finalisation.
+    Tu ne veux pas de calcul de coûts -> on renvoie 0.0 partout, mais on fournit les clés.
+    """
+    stats_list = stats_list or []
+
+    total_input = 0
+    total_output = 0
+    total_tokens = 0
+
+    for s in stats_list:
+        if not isinstance(s, dict):
+            continue
+        total_input += int(s.get("input_tokens", 0) or 0)
+        total_output += int(s.get("output_tokens", 0) or 0)
+        total_tokens += int(s.get("total_tokens", 0) or (int(s.get("input_tokens", 0) or 0) + int(s.get("output_tokens", 0) or 0)))
+
+    pages = max(len(stats_list), 1)
+
+    return {
+        "total_input": total_input,
+        "total_output": total_output,
+        "total_tokens": total_tokens,
+        "cost_input": 0.0,
+        "cost_output": 0.0,
+        "cost_total": 0.0,
+        "cost_per_page": 0.0,
+        "pages": pages,
+    }
+
+
 __all__ = [
     "MODEL",
     "INTER_REQUEST_DELAY",
@@ -419,6 +456,7 @@ __all__ = [
     "save_progress",
     "clear_progress",
     "process_page_with_cache",
+    "calculate_costs",
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
