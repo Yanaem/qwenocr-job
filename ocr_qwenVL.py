@@ -4,7 +4,7 @@
 """
 ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
 
-Fonctions/constantes attendues (d'après logs) :
+Expose (d'après tes logs) :
 - MODEL (str)
 - INTER_REQUEST_DELAY (float)
 - get_pdf_info(pdf_path) -> dict {page_count,...}
@@ -14,9 +14,18 @@ Fonctions/constantes attendues (d'après logs) :
 - process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown, stats)
 - calculate_costs(stats_list) -> dict
 
-Implémentation fidèle :
+Implémentation :
 - 2 étapes : OCR brut (image->texte) puis Markdown (texte->md)
 - Annexe OCR brut ajoutée dans le markdown (ajout code, 0 token).
+
+Correctifs ajoutés par rapport à ta version :
+- Logs explicites sur chaque étape (rendu image / OCR / MD) + logs sur retries/backoff
+  -> évite les "silences" qui masquent les 429/backoff/timeout.
+- Backoff 429 borné (et option fail-fast) pour éviter de dormir 60s en silence dans un job
+  qui peut être tué par timeout de plateforme.
+- Rendu PDF plus économe en mémoire (paths_only + fichier temporaire) + DPI par défaut 200.
+  -> réduit les kills "sans traceback" causés par poppler/PIL.
+- Tous les paramètres sont surchargables via variables d'environnement (facile sans toucher le code).
 """
 
 import base64
@@ -24,9 +33,9 @@ import os
 import re
 import time
 import json
-from io import BytesIO
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import requests
 from pdf2image import convert_from_path
@@ -34,39 +43,84 @@ from pdf2image import convert_from_path
 # PDF reader (pour page_count)
 PdfReader = None
 try:
-    from pypdf import PdfReader as _PdfReader
+    from pypdf import PdfReader as _PdfReader  # type: ignore
     PdfReader = _PdfReader
 except Exception:
     try:
-        from PyPDF2 import PdfReader as _PdfReader
+        from PyPDF2 import PdfReader as _PdfReader  # type: ignore
         PdfReader = _PdfReader
     except Exception:
         PdfReader = None
 
 
 # =====================
+# Helpers ENV
+# =====================
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off")
+
+
+# =====================
 # Configuration
 # =====================
 
-API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+API_URL = os.getenv("QWEN_API_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 
-MODEL_OCR = "qwen-vl-max"
-MODEL_MD = "qwen-vl-max"
-MODEL = MODEL_OCR  # attendu par le runner
+MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-max")
+MODEL_MD  = os.getenv("QWEN_MODEL_MD",  "qwen-vl-max")
+
+# Attendu par le runner
+MODEL = MODEL_OCR
 
 # Attendu par qwenocr_runner.py (pause entre pages/requêtes)
-INTER_REQUEST_DELAY = 1.0  # secondes (0.0 si tu veux aucune pause)
+INTER_REQUEST_DELAY = _env_float("INTER_REQUEST_DELAY", 0.0)
 
-RENDER_DPI = 300
+# Le DPI 300 est coûteux. 200 suffit souvent pour factures.
+RENDER_DPI = _env_int("RENDER_DPI", 200)
 
-MAX_TOKENS_OCR = 20000
-MAX_TOKENS_MD = 20000
-TEMPERATURE = 0.0
+# Tokens : 20000 peut être inutilement lent. Ajustable via ENV.
+MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 12000)
+MAX_TOKENS_MD  = _env_int("MAX_TOKENS_MD",  12000)
 
-REQUEST_TIMEOUT = 600
-MAX_RETRIES = 5
-BACKOFF_BASE = 2
-BACKOFF_MAX = 120
+TEMPERATURE = _env_float("TEMPERATURE", 0.0)
+
+# Timeout d'appel : si ta plateforme tue tôt, mieux vaut échouer proprement que "geler" 600s.
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 120)
+
+MAX_RETRIES = _env_int("MAX_RETRIES", 3)
+BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)
+BACKOFF_MAX  = _env_int("BACKOFF_MAX", 30)
+
+# Gestion rate limit : bornes courtes par défaut
+FAIL_FAST_ON_429   = _env_bool("FAIL_FAST_ON_429", True)
+MIN_WAIT_ON_429    = _env_int("MIN_WAIT_ON_429", 10)
+MIN_WAIT_OVERLOADED = _env_int("MIN_WAIT_OVERLOADED", 5)
+MAX_WAIT_ANY       = _env_int("MAX_WAIT_ANY", 15)
+
+# Verbose logs
+VERBOSE = _env_bool("VERBOSE", True)
 
 
 # =====================
@@ -206,21 +260,41 @@ def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
 # =====================
 
 def _calculate_backoff_delay(attempt: int) -> int:
-    return min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
+    # attempt commence à 1
+    delay = BACKOFF_BASE ** attempt
+    return int(min(delay, BACKOFF_MAX))
+
+def _log(msg: str) -> None:
+    if VERBOSE:
+        print(msg, flush=True)
 
 def _handle_api_error(error: Exception, attempt: int, context: str) -> Tuple[bool, int]:
+    """
+    Renvoie (should_retry, wait_seconds).
+    IMPORTANT: on évite les sleeps longs et silencieux (429) qui font tuer le job par timeout plateforme.
+    """
     err = str(error).lower()
+
     non_retryable = ["invalid api key", "authentication failed", "permission denied"]
     if any(x in err for x in non_retryable):
         return False, 0
+
+    # Rate limit: soit fail-fast, soit wait court
+    if "429" in err or "rate limit" in err:
+        if FAIL_FAST_ON_429:
+            return False, 0
+        wait_time = max(_calculate_backoff_delay(attempt), MIN_WAIT_ON_429)
+        return True, int(min(wait_time, MAX_WAIT_ANY))
+
     if attempt >= MAX_RETRIES:
         return False, 0
+
     wait_time = _calculate_backoff_delay(attempt)
-    if "429" in err or "rate limit" in err:
-        wait_time = max(wait_time, 60)
-    elif "overloaded" in err:
-        wait_time = max(wait_time, 30)
-    return True, wait_time
+
+    if "overloaded" in err:
+        wait_time = max(wait_time, MIN_WAIT_OVERLOADED)
+
+    return True, int(min(wait_time, MAX_WAIT_ANY))
 
 def _extract_text_from_response_content(content) -> str:
     if isinstance(content, str):
@@ -245,9 +319,11 @@ def _remove_empty_md_table_rows(md: str) -> str:
     for line in md.splitlines():
         if re.match(r'^\|.*\|\s*$', line):
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            # ligne séparatrice
             if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
                 out.append(line)
                 continue
+            # ligne entièrement vide
             if all(c == "" for c in cells):
                 continue
         out.append(line)
@@ -261,18 +337,44 @@ def _strip_existing_ocr_appendix(md: str) -> str:
 
 
 # =====================
-# Rendering PDF -> image base64
+# Rendering PDF -> image base64 (mémoire réduite)
 # =====================
 
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
-    images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
-    if not images:
-        raise ValueError(f"Aucune image générée pour la page {page_num}")
-    img = images[0]
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    b = buf.read()
+    """
+    Rend une seule page PDF en PNG, puis base64.
+    Utilise paths_only + fichier temporaire pour limiter la RAM.
+    """
+    # pdf2image attend des pages 1-indexées
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            paths = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                first_page=page_num,
+                last_page=page_num,
+                fmt="png",
+                output_folder=tmpdir,
+                paths_only=True,      # clé pour éviter de garder une image PIL en mémoire
+                thread_count=1
+            )
+            if not paths:
+                raise ValueError(f"Aucune image générée pour la page {page_num}")
+            png_path = paths[0]
+            with open(png_path, "rb") as f:
+                b = f.read()
+        except TypeError:
+            # fallback si pdf2image trop ancien (pas de paths_only)
+            images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
+            if not images:
+                raise ValueError(f"Aucune image générée pour la page {page_num}")
+            img = images[0]
+            # sauvegarde temporaire
+            png_path = os.path.join(tmpdir, f"page_{page_num}.png")
+            img.save(png_path, format="PNG")
+            with open(png_path, "rb") as f:
+                b = f.read()
+
     b64 = base64.b64encode(b).decode("utf-8")
     return b64, len(b) / 1024
 
@@ -287,49 +389,72 @@ def _call_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int, 
     body = {"model": model, "max_tokens": max_tokens, "temperature": TEMPERATURE, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.time()
         try:
+            _log(f"🌐 {context}: appel API (model={model}) attempt {attempt}/{MAX_RETRIES}")
             r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+
+            dt = time.time() - t0
             if r.status_code == 200:
                 js = r.json()
                 usage = js.get("usage", {})
                 input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
                 output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+
                 choices = js.get("choices", [])
                 content = choices[0].get("message", {}).get("content", "") if choices else ""
                 text = _extract_text_from_response_content(content).strip()
+
                 stats = {
                     "input_tokens": int(input_tokens),
                     "output_tokens": int(output_tokens),
                     "total_tokens": int(input_tokens + output_tokens),
+                    "elapsed_s": round(dt, 3),
+                    "model": model,
                 }
+                _log(f"✅ {context}: OK en {stats['elapsed_s']}s (tokens in={stats['input_tokens']} out={stats['output_tokens']})")
                 return text, stats
 
+            # Non-200
             try:
                 err_json = r.json()
             except Exception:
-                err_json = r.text[:300]
-            msg = f"HTTP {r.status_code}: {str(err_json)[:300]}"
+                err_json = r.text[:500]
+
+            msg = f"HTTP {r.status_code}: {str(err_json)[:500]}"
             should_retry, wait_time = _handle_api_error(Exception(msg), attempt, context)
+            _log(f"⚠️ {context}: {msg}")
+
             if not should_retry:
                 raise Exception(msg)
+
+            _log(f"⏳ {context}: retry dans {wait_time}s")
             time.sleep(wait_time)
 
         except requests.exceptions.Timeout as e:
             should_retry, wait_time = _handle_api_error(e, attempt, f"{context} timeout")
+            _log(f"⚠️ {context}: timeout après {REQUEST_TIMEOUT}s (attempt {attempt}/{MAX_RETRIES})")
             if not should_retry:
                 raise
+            _log(f"⏳ {context}: retry dans {wait_time}s")
             time.sleep(wait_time)
+
         except requests.exceptions.RequestException as e:
             should_retry, wait_time = _handle_api_error(e, attempt, f"{context} réseau")
+            _log(f"⚠️ {context}: erreur réseau: {repr(e)}")
             if not should_retry:
                 raise
+            _log(f"⏳ {context}: retry dans {wait_time}s")
             time.sleep(wait_time)
 
     raise Exception(f"Échec {context} après {MAX_RETRIES} tentatives")
 
 
 def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict]:
-    image_b64, _ = render_single_page_to_base64(pdf_path, page_num)
+    _log(f"🖼️ Page {page_num}: rendu image (dpi={RENDER_DPI})")
+    image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num)
+
+    _log(f"🖼️ Page {page_num}: image OK ({size_kb:.1f} KB) -> OCR")
     data_url = f"data:image/png;base64,{image_b64}"
 
     messages = [{
@@ -342,6 +467,7 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
     }]
 
     text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, f"OCR page {page_num}")
+
     text = _strip_triple_backticks(text)
     if len(text.strip()) < 20:
         raise Exception("OCR trop court / vide (suspect)")
@@ -349,6 +475,7 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
 
 
 def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict]:
+    _log(f"🧾 Page {page_num}: génération Markdown à partir OCR ({len(ocr_text)} chars)")
     user_block = (
         f"Voici le texte OCR brut de la page {page_num} :\n\n"
         "```text\n"
@@ -383,6 +510,7 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
     Le runner gère le cache via load_progress/save_progress/clear_progress.
     """
     page_num = int(page_num)
+    _log(f"🚧 Page {page_num}: START (is_first_page={is_first_page})")
 
     # 1) OCR brut
     ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=page_num)
@@ -407,6 +535,13 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
         "details": {"ocr": ocr_stats, "md": md_stats},
     }
 
+    _log(f"🏁 Page {page_num}: DONE (tokens total={stats['total_tokens']})")
+
+    # Pause volontaire entre pages si souhaitée
+    if INTER_REQUEST_DELAY and INTER_REQUEST_DELAY > 0:
+        _log(f"⏸️ Pause {INTER_REQUEST_DELAY}s (INTER_REQUEST_DELAY)")
+        time.sleep(INTER_REQUEST_DELAY)
+
     return page_md, stats
 
 
@@ -416,8 +551,8 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
 
 def calculate_costs(stats_list: List[Dict]) -> Dict[str, Any]:
     """
-    Compat runner : le runner appelle cette fonction en finalisation.
-    Tu ne veux pas de calcul de coûts -> on renvoie 0.0 partout, mais on fournit les clés.
+    Compat runner : renvoie les clés attendues.
+    Tu ne veux pas de calcul réel -> coûts à 0.
     """
     stats_list = stats_list or []
 
@@ -460,3 +595,4 @@ __all__ = [
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
+
