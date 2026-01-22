@@ -2,25 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-ocr_qwenVL.py — Module compatible avec qwenocr_runner.py SANS modifier le runner.
+ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
 
-API attendue (d'après tes logs) :
+Expose (d'après tes logs) :
 - MODEL (str)
 - INTER_REQUEST_DELAY (float)
-- get_pdf_info(pdf_path) -> dict {page_count, file_size_mb, ...}
+- get_pdf_info(pdf_path) -> dict {page_count,...}
 - load_progress(pdf_path) -> Dict[str, Dict]
 - save_progress(pdf_path, completed_pages) -> None
 - clear_progress(pdf_path) -> None
-- process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown_page, stats)
+- process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) -> (markdown_page, stats_payload)
 - calculate_costs(stats_list) -> dict
+- validate_markdown_quality(final_markdown, page_count) -> dict
 
 Implémentation :
 - 2 étapes (fidélité) :
   1) OCR brut (image -> texte brut)
   2) Markdown (texte brut -> markdown structuré)
 - Ajout d'une annexe "OCR brut" dans le markdown (côté code, 0 token).
-- Rend la conversion PDF->PNG plus "low memory" via paths_only=True.
-- Logs explicites + backoff court (évite les sleeps 60s silencieux).
+
+Robustesse Cloud Run :
+- Conversion PDF->PNG low-memory (pdf2image paths_only + fichier temp)
+- DPI par défaut 200 (configurable)
+- Backoff court + logs (évite les sleeps 60s silencieux)
+- Payload stats retourne à la fois des clés "flat" et une sous-clé "stats" pour compat runner
+  (évite KeyError 'stats').
 """
 
 from __future__ import annotations
@@ -38,10 +44,10 @@ from typing import Any, Dict, List, Tuple
 import requests
 from pdf2image import convert_from_path, pdfinfo_from_path
 
-# --- Lecture PDF (optionnelle, fallback) ---
+# --- Lecture PDF (optionnelle) ---
 PdfReader = None
 try:
-    from pypdf import PdfReader as _PdfReader
+    from pypdf import PdfReader as _PdfReader  # type: ignore
     PdfReader = _PdfReader
 except Exception:
     try:
@@ -49,6 +55,35 @@ except Exception:
         PdfReader = _PdfReader
     except Exception:
         PdfReader = None
+
+
+# =====================
+# Helpers ENV
+# =====================
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off")
 
 
 # =====================
@@ -60,28 +95,38 @@ API_URL = os.getenv("QWEN_API_URL", "https://dashscope-intl.aliyuncs.com/compati
 MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-max")
 MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen-vl-max")
 
-# Le runner affiche ocr.MODEL
+# Attendu par le runner
 MODEL = MODEL_OCR
 
 # Pause entre pages (le runner l'utilise)
-INTER_REQUEST_DELAY = float(os.getenv("INTER_REQUEST_DELAY", "1.0"))
+INTER_REQUEST_DELAY = _env_float("INTER_REQUEST_DELAY", 1.0)
 
-# Valeurs “sûres” pour Cloud Run (réduisent CPU/RAM vs 300 DPI)
-RENDER_DPI = int(os.getenv("RENDER_DPI", "200"))
+# DPI : 300 est plus lourd. 200 suffit souvent.
+RENDER_DPI = _env_int("RENDER_DPI", 200)
 
-# Tokens : adapte si tu constates des troncatures
-MAX_TOKENS_OCR = int(os.getenv("MAX_TOKENS_OCR", "12000"))
-MAX_TOKENS_MD = int(os.getenv("MAX_TOKENS_MD", "12000"))
+MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 12000)
+MAX_TOKENS_MD = _env_int("MAX_TOKENS_MD", 12000)
 
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
+TEMPERATURE = _env_float("TEMPERATURE", 0.0)
 
-# Timeouts & retries (éviter de se faire tuer pendant des longs sleeps)
-REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
-CONNECT_TIMEOUT_SECONDS = int(os.getenv("CONNECT_TIMEOUT_SECONDS", "10"))
+# Timeouts/retries
+REQUEST_TIMEOUT_SECONDS = _env_int("REQUEST_TIMEOUT_SECONDS", 120)
+CONNECT_TIMEOUT_SECONDS = _env_int("CONNECT_TIMEOUT_SECONDS", 10)
 
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2.0"))
-BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", "15.0"))  # volontairement bas
+MAX_RETRIES = _env_int("MAX_RETRIES", 3)
+BACKOFF_BASE = _env_float("BACKOFF_BASE", 2.0)
+BACKOFF_MAX = _env_float("BACKOFF_MAX", 15.0)  # volontairement bas
+
+# Logs
+VERBOSE = _env_bool("VERBOSE", True)
+
+# Rate-limit behavior
+FAIL_FAST_ON_429 = _env_bool("FAIL_FAST_ON_429", False)  # False = retry court; True = fail vite
+
+
+def _log(msg: str) -> None:
+    if VERBOSE:
+        print(msg, flush=True)
 
 
 # =====================
@@ -204,23 +249,25 @@ def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
 
     page_count = None
 
-    # 1) pypdf / PyPDF2 si dispo
+    # 1) pypdf/PyPDF2
     if PdfReader is not None:
-        with open(pdf_path, "rb") as f:
-            reader = PdfReader(f)
-            page_count = len(reader.pages)
+        try:
+            with open(pdf_path, "rb") as f:
+                reader = PdfReader(f)
+                page_count = len(reader.pages)
+        except Exception:
+            page_count = None
 
-    # 2) fallback poppler (pdfinfo)
+    # 2) poppler pdfinfo
     if page_count is None:
         try:
             info = pdfinfo_from_path(pdf_path)
-            # pdf2image renvoie souvent "Pages"
-            page_count = int(info.get("Pages"))  # type: ignore[arg-type]
+            page_count = int(info.get("Pages"))
         except Exception:
             page_count = None
 
     if page_count is None:
-        raise RuntimeError("Impossible de déterminer le nombre de pages (ni pypdf/pyPDF2 ni pdfinfo).")
+        raise RuntimeError("Impossible de déterminer le nombre de pages (pypdf/PyPDF2 + pdfinfo indisponibles).")
 
     return {
         "page_count": int(page_count),
@@ -262,11 +309,11 @@ def _remove_empty_md_table_rows(md: str) -> str:
     for line in md.splitlines():
         if re.match(r'^\|.*\|\s*$', line):
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
-            # garder le séparateur Markdown --- / :---:
+            # garder séparateur
             if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
                 out.append(line)
                 continue
-            # supprimer ligne de tableau totalement vide
+            # supprimer ligne vide
             if all(c == "" for c in cells):
                 continue
         out.append(line)
@@ -279,10 +326,9 @@ def _remove_empty_md_table_rows(md: str) -> str:
 
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
     """
-    Utilise paths_only=True pour éviter de garder une grosse image PIL en RAM.
+    Utilise paths_only=True pour réduire la RAM.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        # thread_count=1 pour limiter RAM/CPU
         paths = convert_from_path(
             pdf_path,
             dpi=dpi,
@@ -308,34 +354,30 @@ def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER
 # =====================
 
 def _backoff(attempt: int) -> float:
-    # backoff exponentiel plafonné (bas volontairement)
     delay = min((BACKOFF_BASE ** attempt), BACKOFF_MAX)
     return float(delay)
 
 def _compute_retry_delay(http_status: int | None, err_msg: str, attempt: int) -> Tuple[bool, float]:
     """
-    Retour (retry?, delay_seconds)
-    Objectif : éviter de rester silencieux 60s (kill Cloud Run), mais garder un retry court.
+    Renvoie (retry?, delay_sec). Backoff court pour éviter les kills de job.
     """
     if attempt >= MAX_RETRIES:
         return False, 0.0
 
     msg = (err_msg or "").lower()
 
-    # erreurs non récupérables
     non_retryable = ["invalid api key", "authentication failed", "permission denied"]
     if any(x in msg for x in non_retryable):
         return False, 0.0
 
-    # rate limit -> retry court + log (au lieu de 60s)
     if http_status == 429 or "rate limit" in msg:
+        if FAIL_FAST_ON_429:
+            return False, 0.0
         return True, min(10.0 * attempt, 15.0)
 
-    # surcharge -> retry court
     if "overloaded" in msg:
         return True, min(5.0 * attempt, 10.0)
 
-    # par défaut -> backoff plafonné
     return True, _backoff(attempt)
 
 def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tokens: int, context: str) -> Tuple[str, Dict[str, int]]:
@@ -344,6 +386,7 @@ def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tok
     body = {"model": model, "max_tokens": max_tokens, "temperature": TEMPERATURE, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.time()
         try:
             r = requests.post(
                 url,
@@ -355,6 +398,7 @@ def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tok
             if r.status_code == 200:
                 js = r.json()
                 usage = js.get("usage", {}) or {}
+
                 input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
                 output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
 
@@ -369,17 +413,19 @@ def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tok
                     "output_tokens": output_tokens,
                     "total_tokens": input_tokens + output_tokens,
                 }
+
+                _log(f"✅ {context}: OK en {time.time()-t0:.2f}s (in={input_tokens} out={output_tokens})")
                 return text, stats
 
             # non-200
             try:
                 err_json = r.json()
-                err_msg = json.dumps(err_json, ensure_ascii=False)[:500]
+                err_msg = json.dumps(err_json, ensure_ascii=False)[:800]
             except Exception:
-                err_msg = (r.text or "")[:500]
+                err_msg = (r.text or "")[:800]
 
             retry, delay = _compute_retry_delay(r.status_code, err_msg, attempt)
-            print(f"⚠️ {context}: HTTP {r.status_code} -> retry={retry} dans {delay:.1f}s | {err_msg[:200]}", flush=True)
+            _log(f"⚠️ {context}: HTTP {r.status_code} retry={retry} dans {delay:.1f}s | {err_msg[:200]}")
             if not retry:
                 raise RuntimeError(f"{context}: HTTP {r.status_code} {err_msg}")
 
@@ -387,14 +433,14 @@ def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tok
 
         except requests.exceptions.Timeout as e:
             retry, delay = _compute_retry_delay(None, str(e), attempt)
-            print(f"⚠️ {context}: timeout -> retry={retry} dans {delay:.1f}s | {e}", flush=True)
+            _log(f"⚠️ {context}: timeout retry={retry} dans {delay:.1f}s | {e}")
             if not retry:
                 raise
             time.sleep(delay)
 
         except requests.exceptions.RequestException as e:
             retry, delay = _compute_retry_delay(None, str(e), attempt)
-            print(f"⚠️ {context}: réseau -> retry={retry} dans {delay:.1f}s | {e}", flush=True)
+            _log(f"⚠️ {context}: réseau retry={retry} dans {delay:.1f}s | {e}")
             if not retry:
                 raise
             time.sleep(delay)
@@ -407,9 +453,9 @@ def _call_chat(api_key: str, model: str, messages: List[Dict[str, Any]], max_tok
 # =====================
 
 def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict[str, int]]:
-    print(f"➡️ Page {page_num}: rendu image (dpi={RENDER_DPI})", flush=True)
+    _log(f"➡️ Page {page_num}: rendu image (dpi={RENDER_DPI})")
     image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num, dpi=RENDER_DPI)
-    print(f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB), appel OCR", flush=True)
+    _log(f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB), appel OCR")
 
     data_url = f"data:image/png;base64,{image_b64}"
 
@@ -430,16 +476,16 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
     if len(text.strip()) < 20:
         raise RuntimeError("OCR trop court / vide (suspect)")
 
-    # libère mémoire (base64 peut être gros)
+    # libère mémoire
     del image_b64
     gc.collect()
 
-    print(f"✅ Page {page_num}: OCR OK ({stats.get('total_tokens', 0)} tokens)", flush=True)
+    _log(f"✅ Page {page_num}: OCR OK ({stats.get('total_tokens', 0)} tokens)")
     return text, stats
 
 
 def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict[str, int]]:
-    print(f"➡️ Page {page_num}: appel Markdown (depuis OCR brut)", flush=True)
+    _log(f"➡️ Page {page_num}: appel Markdown (depuis OCR brut)")
 
     user_block = (
         f"Voici le texte OCR brut de la page {page_num} :\n\n"
@@ -465,7 +511,7 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
     md = _strip_existing_ocr_appendix(md)
     md = _remove_empty_md_table_rows(md)
 
-    print(f"✅ Page {page_num}: Markdown OK ({stats.get('total_tokens', 0)} tokens)", flush=True)
+    _log(f"✅ Page {page_num}: Markdown OK ({stats.get('total_tokens', 0)} tokens)")
     return md.strip(), stats
 
 
@@ -475,7 +521,11 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
 
 def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict[str, Any]]:
     """
-    Doit retourner (markdown_page, stats) pour le runner.
+    Doit retourner (markdown_page, stats_payload).
+    stats_payload contient volontairement :
+      - des champs flat (input_tokens/output_tokens/total_tokens)
+      - ET une sous-clé "stats" qui répète ces champs
+    -> ça évite les KeyError 'stats' côté runner si le runner attend payload['stats'].
     """
     page_num = int(page_num)
 
@@ -496,29 +546,44 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
         "---"
     )
 
-    stats = {
-        "input_tokens": int(ocr_stats.get("input_tokens", 0)) + int(md_stats.get("input_tokens", 0)),
-        "output_tokens": int(ocr_stats.get("output_tokens", 0)) + int(md_stats.get("output_tokens", 0)),
-        "total_tokens": int(ocr_stats.get("total_tokens", 0)) + int(md_stats.get("total_tokens", 0)),
+    input_tokens = int(ocr_stats.get("input_tokens", 0)) + int(md_stats.get("input_tokens", 0))
+    output_tokens = int(ocr_stats.get("output_tokens", 0)) + int(md_stats.get("output_tokens", 0))
+    total_tokens = int(ocr_stats.get("total_tokens", 0)) + int(md_stats.get("total_tokens", 0))
+
+    stats_core = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
         "details": {"ocr": ocr_stats, "md": md_stats},
         "models": {"ocr": MODEL_OCR, "md": MODEL_MD},
         "render_dpi": RENDER_DPI,
     }
 
+    # payload "compat": keys flat + nested 'stats'
+    stats_payload: Dict[str, Any] = dict(stats_core)
+    stats_payload["stats"] = dict(stats_core)  # <-- clé attendue par certains runners
+
     # libère mémoire
     del ocr_text
     gc.collect()
 
-    return page_md, stats
+    # Pause optionnelle (si tu veux 0, mets INTER_REQUEST_DELAY=0)
+    if INTER_REQUEST_DELAY and INTER_REQUEST_DELAY > 0:
+        time.sleep(INTER_REQUEST_DELAY)
+
+    return page_md, stats_payload
 
 
 # =====================
-# Attendu par le runner : calculate_costs
+# Attendu: calculate_costs
 # =====================
 
 def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Compat runner : renvoie des coûts à 0.0 mais garde les totaux tokens.
+    Supporte deux formats :
+      - dict flat avec input_tokens/output_tokens/total_tokens
+      - dict wrapper avec une sous-clé 'stats' contenant ces champs
     """
     stats_list = stats_list or []
 
@@ -529,11 +594,12 @@ def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     for s in stats_list:
         if not isinstance(s, dict):
             continue
-        total_input += int(s.get("input_tokens", 0) or 0)
-        total_output += int(s.get("output_tokens", 0) or 0)
-        tt = s.get("total_tokens")
+        core = s.get("stats") if isinstance(s.get("stats"), dict) else s
+        total_input += int(core.get("input_tokens", 0) or 0)
+        total_output += int(core.get("output_tokens", 0) or 0)
+        tt = core.get("total_tokens")
         if tt is None:
-            tt = (int(s.get("input_tokens", 0) or 0) + int(s.get("output_tokens", 0) or 0))
+            tt = (int(core.get("input_tokens", 0) or 0) + int(core.get("output_tokens", 0) or 0))
         total_tokens += int(tt or 0)
 
     pages = max(len(stats_list), 1)
@@ -547,20 +613,23 @@ def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cost_total": 0.0,
         "cost_per_page": 0.0,
         "pages": pages,
+        "stats": {  # compat éventuelle
+            "total_input": total_input,
+            "total_output": total_output,
+            "total_tokens": total_tokens,
+            "pages": pages,
+        },
     }
 
 
-# --- Exports ---# =====================
+# =====================
 # Attendu: validate_markdown_quality
 # =====================
 
 def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str, Any]:
     """
-    Compat runner : le runner appelle cette fonction en finalisation.
-
-    Ce projet n'a pas besoin d'un vrai scoring : on renvoie une validation légère,
-    non bloquante, avec des clés redondantes (ok/is_valid/valid/passed) pour
-    maximiser la compatibilité.
+    Compat runner : validation légère, non bloquante.
+    Renvoie un dict avec plusieurs clés compatibles, et inclut une sous-clé 'stats'.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -576,11 +645,12 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
             except Exception:
                 continue
 
-        # Indicateurs simples
-        if page_count and len(set(pages_found)) != int(page_count):
-            warnings.append(
-                f"Pages détectées dans le Markdown: {len(set(pages_found))}, attendu: {int(page_count)}."
-            )
+        # Vérifs simples
+        expected = int(page_count or 0)
+        got_pages = len(set(pages_found))
+
+        if expected and got_pages != expected:
+            warnings.append(f"Pages détectées: {got_pages}, attendu: {expected}.")
 
         annexes = len(
             re.findall(
@@ -589,25 +659,19 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
                 flags=re.MULTILINE | re.IGNORECASE,
             )
         )
-        if page_count and annexes < int(page_count):
-            warnings.append(f"Annexes OCR trouvées: {annexes}, attendu au moins: {int(page_count)}.")
-
-        # Headers attendus (heuristique)
-        required_headers = [
-            "## Informations Émetteur (Fournisseur)",
-            "## Informations Client",
-            "## Détails de la Facture",
-            "## Tableau des Lignes de Facturation",
-            "## Montants Récapitulatifs",
-            "## Informations de Paiement",
-            "## Mentions Légales et Notes Complémentaires",
-        ]
-        missing = [h for h in required_headers if h not in final_markdown]
-        if missing:
-            warnings.append("En-têtes manquants (au moins une fois): " + ", ".join(missing[:5]) + ("…" if len(missing) > 5 else ""))
+        if expected and annexes < expected:
+            warnings.append(f"Annexes OCR: {annexes}, attendu >= {expected}.")
 
     ok = (len(errors) == 0)
     score = 1.0 if ok else 0.0
+
+    stats = {
+        "page_count": int(page_count or 0),
+        "pages_found": sorted(set(pages_found)) if isinstance(final_markdown, str) else [],
+        "warnings_count": len(warnings),
+        "errors_count": len(errors),
+        "score": score,
+    }
 
     return {
         "ok": ok,
@@ -617,10 +681,10 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
         "score": score,
         "errors": errors,
         "warnings": warnings,
-        "page_count": int(page_count or 0),
-        "pages_found": sorted(set(pages_found)) if isinstance(final_markdown, str) else [],
+        "stats": stats,  # <-- clé que certains runners attendent
         "summary": ("OK" if ok else "KO") + ("" if not warnings else f" (warnings={len(warnings)})"),
     }
+
 
 __all__ = [
     "MODEL",
@@ -634,8 +698,8 @@ __all__ = [
     "clear_progress",
     "process_page_with_cache",
     "calculate_costs",
+    "validate_markdown_quality",
     "ocr_page_with_vl",
     "markdown_from_ocr",
-    "validate_markdown_quality",
 ]
 
