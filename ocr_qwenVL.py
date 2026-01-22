@@ -7,6 +7,7 @@ ocr_qwenVL.py — module compatible qwenocr_runner.py (sans modifier le runner)
 Expose (d'après tes logs) :
 - MODEL (str)
 - INTER_REQUEST_DELAY (float)
+- STOP_ON_CRITICAL (bool)  <-- attendu par le runner en cas d'erreur page
 - get_pdf_info(pdf_path) -> dict {page_count,...}
 - load_progress(pdf_path) -> Dict[str, Dict]
 - save_progress(pdf_path, completed_pages) -> None
@@ -19,14 +20,14 @@ Implémentation :
 - 2 étapes (fidélité) :
   1) OCR brut (image -> texte brut)
   2) Markdown (texte brut -> markdown structuré)
-- Ajout d'une annexe "OCR brut" dans le markdown (côté code, 0 token).
+- Annexe OCR brut ajoutée dans le markdown (côté code, 0 token).
 
-Robustesse Cloud Run :
-- Conversion PDF->PNG low-memory (pdf2image paths_only + fichier temp)
-- DPI par défaut 200 (configurable)
-- Backoff court + logs (évite les sleeps 60s silencieux)
-- Payload stats retourne à la fois des clés "flat" et une sous-clé "stats" pour compat runner
-  (évite KeyError 'stats').
+Robustesse :
+- DPI par défaut = 300 (configurable via env RENDER_DPI)
+- Conversion PDF->PNG low-memory (pdf2image paths_only + fichiers temporaires)
+- Retry court + logs en cas de 429/overloaded
+- Retry spécifique si OCR "trop court" (réessaye l'OCR 2 fois par défaut)
+- Payload stats contient des clés "flat" + sous-clé "stats" (compat runner)
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 from pdf2image import convert_from_path, pdfinfo_from_path
@@ -95,33 +96,42 @@ API_URL = os.getenv("QWEN_API_URL", "https://dashscope-intl.aliyuncs.com/compati
 MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-max")
 MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen-vl-max")
 
-# Attendu par le runner
+# Attendu par le runner (affiché au démarrage)
 MODEL = MODEL_OCR
 
-# Pause entre pages (le runner l'utilise)
+# Attendu par le runner : pause entre pages
 INTER_REQUEST_DELAY = _env_float("INTER_REQUEST_DELAY", 1.0)
 
-# DPI : 300 est plus lourd. 200 suffit souvent.
-RENDER_DPI = _env_int("RENDER_DPI", 200)
+# Attendu par le runner : stop ou non sur erreur page "critique"
+# Recommandation : True pour ne pas générer de Markdown incomplet sans le savoir.
+STOP_ON_CRITICAL = _env_bool("STOP_ON_CRITICAL", True)
+
+# Qualité demandée : 300 DPI (configurable)
+RENDER_DPI = _env_int("RENDER_DPI", 300)
 
 MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 12000)
 MAX_TOKENS_MD = _env_int("MAX_TOKENS_MD", 12000)
 
 TEMPERATURE = _env_float("TEMPERATURE", 0.0)
 
-# Timeouts/retries
-REQUEST_TIMEOUT_SECONDS = _env_int("REQUEST_TIMEOUT_SECONDS", 120)
+# Timeouts/retries réseau
+REQUEST_TIMEOUT_SECONDS = _env_int("REQUEST_TIMEOUT_SECONDS", 180)
 CONNECT_TIMEOUT_SECONDS = _env_int("CONNECT_TIMEOUT_SECONDS", 10)
 
 MAX_RETRIES = _env_int("MAX_RETRIES", 3)
 BACKOFF_BASE = _env_float("BACKOFF_BASE", 2.0)
-BACKOFF_MAX = _env_float("BACKOFF_MAX", 15.0)  # volontairement bas
+BACKOFF_MAX = _env_float("BACKOFF_MAX", 20.0)  # volontairement bas
 
 # Logs
 VERBOSE = _env_bool("VERBOSE", True)
 
 # Rate-limit behavior
 FAIL_FAST_ON_429 = _env_bool("FAIL_FAST_ON_429", False)  # False = retry court; True = fail vite
+
+# OCR "trop court" : retries spécifiques (utile si le modèle renvoie parfois 1-2 mots)
+OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 40)
+OCR_EMPTY_RETRIES = _env_int("OCR_EMPTY_RETRIES", 2)          # nombre de retries supplémentaires
+OCR_EMPTY_RETRY_SLEEP = _env_float("OCR_EMPTY_RETRY_SLEEP", 1.5)
 
 
 def _log(msg: str) -> None:
@@ -144,6 +154,7 @@ Regles :
 - Preserve les sauts de ligne.
 - Inclus aussi : totaux, echeances, mentions legales, pied de page, texte vertical, annotations manuscrites.
 - Si une portion est vraiment illisible : ecris [ILLISIBLE] a l'endroit correspondant.
+- Si la page est réellement vide : réponds exactement "[PAGE VIDE]".
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
@@ -247,7 +258,7 @@ def get_pdf_info(pdf_path: str) -> Dict[str, Any]:
     pdf_path = str(pdf_path)
     file_size = os.path.getsize(pdf_path)
 
-    page_count = None
+    page_count: Optional[int] = None
 
     # 1) pypdf/PyPDF2
     if PdfReader is not None:
@@ -326,24 +337,41 @@ def _remove_empty_md_table_rows(md: str) -> str:
 
 def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
     """
-    Utilise paths_only=True pour réduire la RAM.
+    Utilise paths_only=True pour réduire la RAM (important à 300 dpi).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        paths = convert_from_path(
-            pdf_path,
-            dpi=dpi,
-            first_page=page_num,
-            last_page=page_num,
-            fmt="png",
-            output_folder=tmpdir,
-            paths_only=True,
-            thread_count=1,
-        )
-        if not paths:
-            raise ValueError(f"Aucune image générée pour la page {page_num}")
-        png_path = paths[0]
-        with open(png_path, "rb") as f:
-            b = f.read()
+        try:
+            paths = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                first_page=page_num,
+                last_page=page_num,
+                fmt="png",
+                output_folder=tmpdir,
+                paths_only=True,
+                thread_count=1,
+            )
+            if not paths:
+                raise ValueError(f"Aucune image générée pour la page {page_num}")
+            png_path = paths[0]
+            with open(png_path, "rb") as f:
+                b = f.read()
+        except TypeError:
+            # Fallback si pdf2image trop ancien (pas de paths_only)
+            images = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                first_page=page_num,
+                last_page=page_num,
+                fmt="png",
+                output_folder=tmpdir,
+            )
+            if not images:
+                raise ValueError(f"Aucune image générée pour la page {page_num}")
+            png_path = os.path.join(tmpdir, f"page_{page_num}.png")
+            images[0].save(png_path, format="PNG")
+            with open(png_path, "rb") as f:
+                b = f.read()
 
     b64 = base64.b64encode(b).decode("utf-8")
     return b64, (len(b) / 1024.0)
@@ -357,7 +385,7 @@ def _backoff(attempt: int) -> float:
     delay = min((BACKOFF_BASE ** attempt), BACKOFF_MAX)
     return float(delay)
 
-def _compute_retry_delay(http_status: int | None, err_msg: str, attempt: int) -> Tuple[bool, float]:
+def _compute_retry_delay(http_status: Optional[int], err_msg: str, attempt: int) -> Tuple[bool, float]:
     """
     Renvoie (retry?, delay_sec). Backoff court pour éviter les kills de job.
     """
@@ -373,10 +401,10 @@ def _compute_retry_delay(http_status: int | None, err_msg: str, attempt: int) ->
     if http_status == 429 or "rate limit" in msg:
         if FAIL_FAST_ON_429:
             return False, 0.0
-        return True, min(10.0 * attempt, 15.0)
+        return True, min(10.0 * attempt, 20.0)
 
     if "overloaded" in msg:
-        return True, min(5.0 * attempt, 10.0)
+        return True, min(5.0 * attempt, 15.0)
 
     return True, _backoff(attempt)
 
@@ -470,18 +498,46 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
         }
     ]
 
-    text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, f"OCR page {page_num}")
-    text = _strip_triple_backticks(text)
+    # On retente si le modèle renvoie un truc anormalement court
+    last_text = ""
+    last_stats: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    if len(text.strip()) < 20:
-        raise RuntimeError("OCR trop court / vide (suspect)")
+    for k in range(0, OCR_EMPTY_RETRIES + 1):
+        label = f"OCR page {page_num}" + (f" (retry {k})" if k > 0 else "")
+        text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, label)
+        text = _strip_triple_backticks(text)
 
-    # libère mémoire
-    del image_b64
+        last_text, last_stats = text, stats
+
+        preview = text.strip().replace("\n", " ")[:120]
+        if text.strip() == "[PAGE VIDE]":
+            # Acceptable si page vraiment blanche; sinon la suite (Markdown) restera minimale.
+            _log(f"⚠️ Page {page_num}: OCR indique [PAGE VIDE].")
+            break
+
+        if len(text.strip()) >= OCR_MIN_CHARS:
+            break
+
+        _log(
+            f"⚠️ Page {page_num}: OCR trop court ({len(text.strip())} chars, out={stats.get('output_tokens', 0)} tokens). "
+            f"Preview='{preview}'"
+        )
+
+        if k < OCR_EMPTY_RETRIES:
+            time.sleep(OCR_EMPTY_RETRY_SLEEP)
+
+    # Libère mémoire (base64 peut être gros)
+    try:
+        del image_b64
+    except Exception:
+        pass
     gc.collect()
 
-    _log(f"✅ Page {page_num}: OCR OK ({stats.get('total_tokens', 0)} tokens)")
-    return text, stats
+    if len(last_text.strip()) < OCR_MIN_CHARS and last_text.strip() != "[PAGE VIDE]":
+        raise RuntimeError("OCR trop court / vide (suspect)")
+
+    _log(f"✅ Page {page_num}: OCR OK ({last_stats.get('total_tokens', 0)} tokens)")
+    return last_text, last_stats
 
 
 def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict[str, int]]:
@@ -522,10 +578,10 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
 def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict[str, Any]]:
     """
     Doit retourner (markdown_page, stats_payload).
-    stats_payload contient volontairement :
-      - des champs flat (input_tokens/output_tokens/total_tokens)
+    stats_payload contient :
+      - champs flat (input_tokens/output_tokens/total_tokens)
       - ET une sous-clé "stats" qui répète ces champs
-    -> ça évite les KeyError 'stats' côté runner si le runner attend payload['stats'].
+    -> compat avec runners qui font payload['stats'].
     """
     page_num = int(page_num)
 
@@ -559,12 +615,14 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
         "render_dpi": RENDER_DPI,
     }
 
-    # payload "compat": keys flat + nested 'stats'
     stats_payload: Dict[str, Any] = dict(stats_core)
-    stats_payload["stats"] = dict(stats_core)  # <-- clé attendue par certains runners
+    stats_payload["stats"] = dict(stats_core)
 
     # libère mémoire
-    del ocr_text
+    try:
+        del ocr_text
+    except Exception:
+        pass
     gc.collect()
 
     # Pause optionnelle (si tu veux 0, mets INTER_REQUEST_DELAY=0)
@@ -581,9 +639,9 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
 def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Compat runner : renvoie des coûts à 0.0 mais garde les totaux tokens.
-    Supporte deux formats :
-      - dict flat avec input_tokens/output_tokens/total_tokens
-      - dict wrapper avec une sous-clé 'stats' contenant ces champs
+    Supporte 2 formats :
+      - dict flat
+      - dict wrapper avec sous-clé 'stats'
     """
     stats_list = stats_list or []
 
@@ -629,7 +687,6 @@ def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str, Any]:
     """
     Compat runner : validation légère, non bloquante.
-    Renvoie un dict avec plusieurs clés compatibles, et inclut une sous-clé 'stats'.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -645,7 +702,6 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
             except Exception:
                 continue
 
-        # Vérifs simples
         expected = int(page_count or 0)
         got_pages = len(set(pages_found))
 
@@ -667,7 +723,6 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
 
     stats = {
         "page_count": int(page_count or 0),
-        "pages_found": sorted(set(pages_found)) if isinstance(final_markdown, str) else [],
         "warnings_count": len(warnings),
         "errors_count": len(errors),
         "score": score,
@@ -681,7 +736,7 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
         "score": score,
         "errors": errors,
         "warnings": warnings,
-        "stats": stats,  # <-- clé que certains runners attendent
+        "stats": stats,
         "summary": ("OK" if ok else "KO") + ("" if not warnings else f" (warnings={len(warnings)})"),
     }
 
@@ -691,6 +746,7 @@ __all__ = [
     "MODEL_OCR",
     "MODEL_MD",
     "INTER_REQUEST_DELAY",
+    "STOP_ON_CRITICAL",
     "RENDER_DPI",
     "get_pdf_info",
     "load_progress",
