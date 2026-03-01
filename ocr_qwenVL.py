@@ -150,7 +150,8 @@ Tache : transcrire TOUT le texte visible sur l'image (une page de facture).
 Regles :
 - Sortie = TEXTE BRUT uniquement. Pas de Markdown. Pas de JSON. Pas d'explication.
 - Ne corrige pas. Ne reformule pas. Ne normalise pas.
-- Respecte autant que possible l'ordre de lecture visuel (haut->bas, gauche->droite).
+- Fais l'OCR complet de TOUTES LES LIGNES STRICTEMENT. Procède à la lecture de HAUT vers le BAS , et de GAUCHE vers la DROITE.
+- Respecte IMPERATIVEMENT l'ordre de lecture visuel (haut->bas, gauche->droite).
 - Preserve les sauts de ligne.
 - Inclus aussi : totaux, echeances, mentions legales, pied de page, texte vertical, annotations manuscrites.
 - Si une portion est vraiment illisible : ecris [ILLISIBLE] a l'endroit correspondant.
