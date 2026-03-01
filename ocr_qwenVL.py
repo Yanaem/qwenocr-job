@@ -93,8 +93,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 API_URL = os.getenv("QWEN_API_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 
-MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-max")
-MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen-vl-max")
+MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen-vl-ocr")
+MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen3.5-plus")
 
 # Attendu par le runner (affiché au démarrage)
 MODEL = MODEL_OCR
