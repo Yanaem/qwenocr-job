@@ -151,19 +151,69 @@ def _log(msg: str) -> None:
 # Prompts
 # =====================
 
-OCR_PROMPT = """Tu es un moteur OCR.
+OCR_PROMPT = """Tu es un moteur OCR layout-aware spécialisé en factures.
 
-Tache : transcrire TOUT le texte visible sur l'image (une page de facture).
+Tâche : transcrire TOUT le texte visible d'une page de facture en conservant le layout utile.
 
-Regles :
-- Sortie = TEXTE BRUT uniquement. Pas de Markdown. Pas de JSON. Pas d'explication.
-- Ne corrige pas. Ne reformule pas. Ne normalise pas.
-- Fais l'OCR complet de TOUTES LES LIGNES STRICTEMENT. Procède à la lecture de HAUT vers le BAS , et de GAUCHE vers la DROITE.
-- Respecte IMPERATIVEMENT l'ordre de lecture visuel (haut->bas, gauche->droite).
-- Preserve les sauts de ligne.
-- Inclus aussi : totaux, echeances, mentions legales, pied de page, texte vertical, annotations manuscrites.
-- Si une portion est vraiment illisible : ecris [ILLISIBLE] a l'endroit correspondant.
-- Si la page est réellement vide : réponds exactement "[PAGE VIDE]".
+Sortie : texte OCR structuré uniquement. Pas de Markdown. Pas de JSON. Pas d'explication.
+
+Tokens autorisés :
+[[PAGE n]]
+[[BLOCK position]]
+[[TABLE position]]
+[[/TABLE]]
+<TAB>
+<EMPTY>
+[ILLISIBLE]
+[SANS_ENTETE_n]
+
+Positions possibles :
+top-left, top, top-right, middle-left, middle, middle-right, bottom-left, bottom, bottom-right, unknown.
+
+Règles générales :
+- Copie le texte visible tel quel : lettres, chiffres, dates, montants, virgules, points, %, €, devises, majuscules, abréviations.
+- Ne corrige pas. Ne reformule pas. Ne normalise pas. Ne calcule pas.
+- N'ajoute aucune information absente de l'image.
+- Transcris tout texte lisible : logo si texte lisible, fournisseur, client, adresses, références, tableaux, totaux, taxes, échéances, RIB/IBAN/BIC, mentions légales, pied de page, texte vertical, tampons, annotations manuscrites.
+- Ignore seulement les éléments purement graphiques sans texte lisible.
+- Si une portion est illisible : écris [ILLISIBLE] à l'endroit correspondant.
+- Si la page est vide : réponds exactement [PAGE VIDE].
+- Un même texte visible ne doit apparaître qu'une seule fois, sauf s'il est répété visuellement.
+
+Règles de lecture :
+- Lis par BLOCS VISUELS, pas par ligne horizontale globale.
+- Ordre des blocs : haut vers bas ; à hauteur proche : gauche vers droite.
+- Ne traverse jamais toute la page de gauche à droite si cela fusionne deux zones distinctes.
+- Deux blocs côte à côte doivent rester deux blocs séparés.
+- Deux tableaux côte à côte doivent rester deux [[TABLE]] séparées.
+- Deux tableaux empilés mais visuellement séparés doivent rester deux [[TABLE]] séparées.
+- Si une zone est ambiguë, transcris-la en [[BLOCK]] ligne par ligne plutôt que de fabriquer un tableau.
+
+Règles tableaux :
+- Chaque tableau visible commence par [[TABLE position]] et finit par [[/TABLE]].
+- Un tableau = une grille continue OU un seul groupe logique d'en-têtes.
+- Dans un tableau : une ligne OCR = une ligne logique du tableau.
+- Sépare les cellules par <TAB>.
+- N'utilise jamais de tableau Markdown dans l'OCR.
+- Garde les en-têtes visibles exacts.
+- Si une colonne contient des valeurs mais aucun en-tête visible, utilise [SANS_ENTETE_n].
+- Si une cellule réelle est vide, utilise <EMPTY>.
+- Ne crée pas de lignes vides pour reproduire l'espacement.
+- Ne fusionne jamais deux cellules adjacentes.
+- Ne fusionne jamais deux groupes d'en-têtes indépendants dans une même [[TABLE]].
+- Les colonnes sont lues de gauche à droite uniquement à l'intérieur du tableau courant.
+- Les lignes sont lues de haut en bas uniquement à l'intérieur du tableau courant.
+- Si un libellé d'en-tête est sur plusieurs lignes dans la même cellule, réunis-le avec un espace.
+- Si une désignation d'article revient à la ligne dans la même cellule, réunis-la avec un espace.
+- Si plusieurs montants sont alignés dans des colonnes distinctes, garde une cellule par montant.
+- Un montant situé dans un tableau ne doit jamais être déplacé dans un autre tableau.
+
+Règles spécifiques factures :
+- Le tableau des articles, les tableaux de taxes, les tableaux de totaux, les échéanciers et les blocs de paiement peuvent être séparés.
+- Ne suppose pas qu'un total, une taxe ou un net à payer appartient à un tableau voisin.
+- Un montant sous un en-tête de taxe reste dans le tableau de taxe.
+- Un montant sous un en-tête de total reste dans le tableau de total.
+- Le NET A PAYER, TOTAL A PAYER ou équivalent doit rester dans son bloc visuel d'origine.
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
