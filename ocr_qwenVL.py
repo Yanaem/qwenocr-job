@@ -161,10 +161,11 @@ Tokens autorisés :
 [[PAGE n]]
 [[BLOCK position]]
 [[/BLOCK]]
-[[TABLE position]]
+[[TABLE position cols=N]]
 [[/TABLE]]
 <TAB>
 <EMPTY>
+<BR>
 [ILLISIBLE]
 [SANS_ENTETE_n]
 
@@ -172,73 +173,82 @@ Positions :
 top-left, top, top-right, middle-left, middle, middle-right, bottom-left, bottom, bottom-right, unknown.
 
 Règles générales :
-- Commence par [[PAGE n]] si le numéro de page est connu, sinon [[PAGE 1]].
-- Copie uniquement le texte visible : lettres, chiffres, dates, montants, %, €, devises, majuscules, abréviations.
+- Commence par [[PAGE n]] si le numéro est visible, sinon [[PAGE 1]].
+- Copie uniquement le texte visible.
+- Conserve exactement lettres, chiffres, dates, montants, virgules, points, %, €, devises, majuscules, abréviations.
 - Ne corrige pas. Ne reformule pas. Ne normalise pas. Ne calcule pas.
-- Ne rajoute pas de devise, de décimale, de libellé ou de champ absent.
-- Transcris tout texte lisible : fournisseur, client, adresses, références, articles, taxes, totaux, échéances, RIB/IBAN/BIC, mentions légales, pied de page, texte vertical, tampons, annotations manuscrites, texte lisible dans un logo.
+- N'ajoute aucun libellé, montant, symbole, devise ou champ absent de l'image.
+- Transcris tout texte lisible : fournisseur, client, adresses, références, articles, taxes, totaux, échéances, banque, IBAN/BIC, conditions, mentions, pied de page, annotations, tampons, texte lisible dans logo.
 - Ne transcris pas le contenu encodé d'un QR code ou code-barres. Transcris seulement le texte imprimé lisible autour.
 - Si une portion est illisible : écris [ILLISIBLE].
 - Si la page est vide : réponds exactement [PAGE VIDE].
-- Un texte visible ne doit apparaître qu'une seule fois, sauf s'il est répété visuellement.
+- Un même texte visible ne doit apparaître qu'une seule fois, sauf s'il est répété visuellement.
 
 Lecture layout :
 - Lis par blocs visuels, pas par bande horizontale globale.
 - Ordre des blocs : haut vers bas ; à hauteur proche : gauche vers droite.
-- Deux zones côte à côte restent deux [[BLOCK]] séparés.
+- Deux zones côte à côte restent deux blocs séparés si elles n'appartiennent pas à la même grille.
 - Deux tableaux côte à côte restent deux [[TABLE]] séparés.
-- Deux tableaux empilés mais visuellement séparés restent deux [[TABLE]] séparés.
+- Deux tableaux empilés mais séparés par bordure, espace ou groupe d'en-têtes distinct restent deux [[TABLE]] séparés.
 - Ne traverse jamais toute la page de gauche à droite si cela fusionne deux zones distinctes.
 - Si une zone est ambiguë, utilise [[BLOCK]] ligne par ligne au lieu de fabriquer un tableau.
 
 Blocs :
+- Un [[BLOCK]] contient du texte non tabulaire.
 - Chaque bloc commence par [[BLOCK position]] et finit par [[/BLOCK]].
 - N'utilise jamais <TAB> dans un [[BLOCK]].
-- Si deux textes sont côte à côte sans vraie grille tabulaire, crée deux blocs séparés plutôt qu'une ligne avec <TAB>.
-- Les blocs de paiement sans bordures tabulaires doivent rester des blocs texte, pas des tableaux.
+- Si deux textes sont côte à côte mais ne forment pas une vraie grille, crée deux [[BLOCK]] séparés.
+- Les blocs de paiement, adresses ou mentions sans vraie grille doivent rester en [[BLOCK]], pas en [[TABLE]].
 
 Tableaux :
-- Chaque tableau visible commence par [[TABLE position]] et finit par [[/TABLE]].
+- Chaque tableau visible commence par [[TABLE position cols=N]] et finit par [[/TABLE]].
+- N est obligatoire et correspond au nombre réel de colonnes visuelles du tableau.
 - Utilise <TAB> uniquement dans [[TABLE]].
-- Un tableau = une grille continue OU un seul groupe logique d'en-têtes.
 - Une ligne OCR = une ligne logique du tableau.
-- Une cellule = une cellule visuelle. Ne fusionne jamais deux cellules adjacentes.
-- Garde les en-têtes visibles exacts.
-- Si une colonne a des valeurs mais aucun en-tête visible, ajoute [SANS_ENTETE_n] à l'endroit exact de cette colonne.
+- Une cellule OCR = une cellule visuelle.
+- Chaque ligne d'un tableau doit contenir exactement N cellules, donc exactement N-1 tokens <TAB>.
+- Ne fusionne jamais deux cellules adjacentes.
+- Ne divise jamais une cellule en plusieurs colonnes à cause d'espaces internes.
+- Détermine N avec toutes les colonnes réellement alignées : en-tête + lignes de données + totaux internes.
+- Ne détermine jamais N uniquement avec les libellés visibles de l'en-tête.
+- Si une colonne contient des valeurs mais aucun en-tête visible, ajoute [SANS_ENTETE_n] dans l'en-tête à la position exacte de cette colonne.
 - n recommence à 1 dans chaque tableau.
+- N'ajoute jamais une colonne vide sans nom en fin d'en-tête.
+- N'invente jamais un nom de colonne à partir du contenu des valeurs.
 - Si une cellule réelle est vide dans une ligne réelle, utilise <EMPTY>.
-- Ne crée jamais de ligne de tableau entièrement vide.
-- Ne crée jamais de ligne composée seulement de <EMPTY> et séparateurs.
-- Ne crée pas de lignes pour reproduire l'espace blanc d'un grand tableau.
-- Avant de fermer un tableau, vérifie que chaque ligne a le même nombre de cellules que l'en-tête.
-- Si les lignes ont plus de cellules que les en-têtes visibles, ajoute des colonnes [SANS_ENTETE_n] dans l'en-tête. Ne supprime aucune valeur.
+- Si un en-tête est sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
+- Si une désignation ou description continue sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
+- Si une ligne contient seulement une continuation de texte dans une colonne et aucun autre champ significatif, rattache-la à la cellule correspondante de la ligne précédente avec <BR>.
+- Si le rattachement est incertain, conserve une ligne réelle avec <EMPTY> dans les autres cellules, mais ne crée pas de ligne vide.
+- Ne crée jamais de ligne entièrement vide.
+- Ne crée jamais de ligne composée uniquement de <EMPTY>.
+- Ne crée jamais de lignes pour reproduire l'espace blanc d'un tableau haut.
+- Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK position]] séparé.
+- Si un tableau contient plusieurs groupes d'en-têtes indépendants, sépare-les en plusieurs [[TABLE]].
 - Si l'alignement ne permet pas de garantir les colonnes, ferme le tableau et transcris la zone en [[BLOCK]].
 
-Tableaux d'articles :
-- Le tableau des articles contient seulement les lignes réelles d'articles/prestations.
-- Une grande zone vide sous les articles ne doit pas produire de lignes OCR.
-- Si une ligne contient seulement une continuation de désignation, sans référence, quantité, prix ni montant, rattache ce texte à la désignation de la ligne précédente avec un espace.
-- Si ce rattachement est incertain, conserve la ligne comme ligne réelle, mais ne crée pas de cellules inventées.
-- Si une valeur isolée apparaît dans la zone basse du tableau articles sans appartenir à une ligne article, ferme le tableau et transcris cette valeur dans un [[BLOCK position]] séparé.
-- Exemple : un montant isolé "0,00" sous les articles ne doit pas devenir une ligne article vide.
-
-Factures :
-- Les tableaux d'articles, taxes, totaux, acomptes, échéances et paiement peuvent être séparés.
-- Ne suppose jamais qu'un total, une taxe ou un net à payer appartient au tableau voisin.
+Règles factures :
+- Les zones articles, taxes, remises, acomptes, totaux, échéances et paiement peuvent être des tableaux ou des blocs séparés.
+- Ne suppose jamais qu'un total, une taxe, un acompte ou un solde appartient au tableau voisin.
+- Un montant reste dans le bloc ou tableau où il est visuellement placé.
 - Un montant sous un en-tête de taxe reste dans le tableau de taxe.
 - Un montant sous un en-tête de total reste dans le tableau de total.
-- NET A PAYER, TOTAL A PAYER, SOLDE ou équivalent doit rester dans son bloc visuel d'origine.
-- Ne mélange jamais un tableau de taxes avec un tableau de totaux.
-- Ne place jamais un montant de TVA dans NET A PAYER.
-- Ne place jamais un NET A PAYER dans un tableau de TVA.
+- NET A PAYER, TOTAL A PAYER, SOLDE, AMOUNT DUE ou équivalent doit rester dans son bloc visuel d'origine.
+- Ne mélange jamais un tableau de taxes avec un tableau de totaux s'ils ont des en-têtes, bordures ou alignements distincts.
+- Ne place jamais un montant de taxe dans une colonne de total à payer.
+- Ne place jamais un total à payer dans une colonne de taxe.
 
 Contrôle final avant sortie :
 - Tous les textes visibles utiles sont présents.
-- Aucun tableau côte à côte n'a été fusionné.
-- Aucun tableau ne contient deux groupes d'en-têtes indépendants.
+- Aucun <TAB> n'apparaît hors d'un [[TABLE]].
+- Chaque [[BLOCK]] est fermé par [[/BLOCK]].
+- Chaque [[TABLE]] est fermé par [[/TABLE]].
+- Chaque [[TABLE position cols=N]] a exactement N cellules par ligne.
 - Aucun tableau ne contient de ligne vide de padding.
-- Chaque ligne de tableau a le même nombre de cellules que l'en-tête.
-- <TAB> apparaît uniquement entre cellules d'un [[TABLE]].
+- Aucun tableau ne contient deux groupes d'en-têtes indépendants.
+- Aucun tableau côte à côte n'a été fusionné.
+- Aucune colonne réelle sans en-tête n'a été supprimée.
+- Aucune colonne réelle sans en-tête n'a reçu un nom inventé : elle doit être [SANS_ENTETE_n].
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
