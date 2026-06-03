@@ -160,12 +160,21 @@ Interdiction : Markdown, JSON, explication, commentaire, bloc ```.
 
 Chaque appel traite une seule page.
 
-Tokens autorisés :
+FORMAT DES ÉLÉMENTS
+
+Chaque élément doit utiliser l'un de ces formats :
+
 [[PAGE n]]
-[[BLOCK position]]
+
+[[BLOCK id=B001 order=001 pos=top-left bbox=000,000,000,000 role_hint=unknown]]
+texte
 [[/BLOCK]]
-[[TABLE position cols=N]]
+
+[[TABLE id=T001 order=001 pos=middle bbox=000,000,000,000 role_hint=unknown cols=N]]
+cellule<TAB>cellule<TAB>cellule
 [[/TABLE]]
+
+Tokens autorisés dans le contenu :
 <TAB>
 <EMPTY>
 <BR>
@@ -178,10 +187,38 @@ middle-left, middle, middle-right,
 bottom-left, bottom, bottom-right,
 unknown.
 
-Règles générales :
+bbox :
+- Coordonnées approximatives normalisées sur 0-1000.
+- Format strict : bbox=x1,y1,x2,y2.
+- Origine : coin supérieur gauche de la page.
+- x1,y1 = coin supérieur gauche du bloc/table.
+- x2,y2 = coin inférieur droit du bloc/table.
+- Les coordonnées peuvent être approximatives, mais doivent respecter la position relative réelle.
+
+role_hint autorisés :
+supplier
+supplier_address
+customer
+billing_address
+shipping_address
+invoice_title
+invoice_details
+line_items
+tax_summary
+totals_summary
+payment
+legal_terms
+logo_marketing
+stamp_signature
+qr_barcode_text
+notes
+unknown
+
+RÈGLES GÉNÉRALES
+
 - Commence toujours par [[PAGE n]].
 - Si le numéro de page visible est connu, utilise ce numéro ; sinon utilise [[PAGE 1]].
-- Le token [[PAGE n]] ne remplace pas le texte visible "Page : n" : si ce texte est visible, transcris-le aussi dans un bloc.
+- Le token [[PAGE n]] ne remplace pas le texte visible "Page : n" : si ce texte est visible, transcris-le aussi.
 - Copie uniquement le texte visible.
 - Conserve exactement lettres, chiffres, dates, montants, séparateurs, virgules, points, %, €, devises, majuscules, abréviations.
 - Ne corrige pas.
@@ -192,16 +229,33 @@ Règles générales :
 - N'ajoute aucun libellé, montant, symbole, devise, champ ou total absent de l'image.
 - Transcris tout texte lisible : fournisseur, client, adresses, références, articles, prestations, taxes, totaux, échéances, banque, RIB, IBAN, BIC, conditions, mentions légales, pied de page, annotations, tampons, texte lisible dans logo.
 - Ne transcris pas le contenu encodé d'un QR code ou d'un code-barres.
-- Transcris seulement le texte imprimé lisible autour d'un QR code ou code-barres.
+- Transcris seulement le texte imprimé lisible autour ou dans un logo/QR/code-barres si ce texte est réellement lisible.
 - Ignore uniquement les éléments purement graphiques sans texte lisible.
 - Si une portion est illisible : écris [ILLISIBLE] à l'endroit concerné.
 - Si la page est réellement vide : réponds exactement [PAGE VIDE].
 - Un même texte visible ne doit apparaître qu'une seule fois, sauf s'il est répété visuellement.
-- Ne fusionne jamais un logo, tampon, QR code, bloc marketing ou slogan avec le bloc client, même s'ils sont proches ou dans la même zone horizontale/verticale.
-- Le bloc client doit contenir uniquement le destinataire/facturé/livré à et son adresse.
-- Tout texte isolé près du client mais sans lien explicite avec le destinataire doit rester dans un [[BLOCK]] séparé.
+- Ne déduis jamais une information à partir d'une autre page.
 
-Lecture layout :
+IDENTIFIANTS, ORDRE ET RÔLES
+
+- Chaque [[BLOCK]] a un id unique B001, B002, B003...
+- Chaque [[TABLE]] a un id unique T001, T002, T003...
+- order est global à la page et croît selon l'ordre de lecture : 001, 002, 003...
+- order s'applique aux blocs et aux tableaux ensemble.
+- pos est seulement une position approximative.
+- pos ne suffit jamais à déterminer le rôle d'un bloc.
+- Deux blocs peuvent avoir le même pos sans devoir être fusionnés.
+- role_hint doit être choisi selon le contenu visible et le layout, jamais selon la position seule.
+- Si le rôle est incertain, utilise role_hint=unknown.
+- Ne force jamais supplier ou customer par position seule.
+- Un logo, slogan, label qualité, tampon, pictogramme, QR code, bloc SAV ou marketing doit rester séparé du fournisseur et du client.
+- Un bloc client doit contenir uniquement un destinataire, facturé à, livré à, acheteur ou une adresse client identifiable.
+- Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=logo_marketing, notes ou unknown.
+- Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés avec deux bbox distinctes.
+- Si une zone contient paiement et mentions légales, crée deux blocs séparés si une bordure, un espace ou un changement de style les sépare.
+
+LECTURE LAYOUT
+
 - Lis par blocs visuels, pas par bande horizontale globale.
 - Ordre des blocs : haut vers bas.
 - À hauteur proche : gauche vers droite.
@@ -211,29 +265,33 @@ Lecture layout :
 - Deux tableaux empilés mais séparés par bordure, espace, titre ou groupe d'en-têtes distinct restent deux [[TABLE]] séparés.
 - Si une zone est ambiguë, utilise [[BLOCK]] ligne par ligne au lieu de fabriquer un tableau.
 - Un titre situé au-dessus d'un tableau doit rester dans un [[BLOCK]] séparé, sauf s'il est clairement une cellule du tableau.
-- Les marqueurs [SANS_ENTETE_n] doivent être numérotés séquentiellement dans chaque tableau, de gauche à droite, en recommençant à 1 pour chaque nouveau tableau.
 
-Blocs :
+BLOCS
+
 - Un [[BLOCK]] contient du texte non tabulaire.
-- Chaque bloc commence par [[BLOCK position]] et finit par [[/BLOCK]].
+- Chaque bloc commence par [[BLOCK ...]] et finit par [[/BLOCK]].
 - N'utilise jamais <TAB> dans un [[BLOCK]].
+- N'utilise jamais <BR> dans un [[BLOCK]].
 - Si deux textes sont côte à côte mais ne forment pas une vraie grille, crée deux [[BLOCK]] séparés.
 - Les adresses, mentions légales, notes, conditions et textes libres restent en [[BLOCK]].
 - Les blocs de paiement sans vraie grille doivent rester en [[BLOCK]], pas en [[TABLE]].
 - Dans un [[BLOCK]], conserve les retours à la ligne utiles.
-- N'utilise <BR> que dans les tableaux, jamais dans les blocs.
+- Un bloc purement marketing, slogan, SAV, label, logo textuel ou tampon ne doit pas être fusionné avec supplier ou customer.
 
-Tableaux — détection :
-- Chaque tableau visible commence par [[TABLE position cols=N]] et finit par [[/TABLE]].
+TABLEAUX — DÉTECTION
+
+- Chaque tableau visible commence par [[TABLE ... cols=N]] et finit par [[/TABLE]].
 - N est obligatoire.
 - N correspond au nombre réel de colonnes visuelles du tableau.
 - Utilise <TAB> uniquement dans [[TABLE]].
 - Un tableau = une grille continue OU un seul groupe logique d'en-têtes.
 - Ne fusionne jamais deux groupes d'en-têtes indépendants dans une même [[TABLE]].
 - Si deux zones ont des en-têtes, bordures, alignements ou espacements distincts, elles forment deux tableaux.
+- Si un tableau de taxes et un tableau de totaux sont côte à côte, ils doivent rester deux [[TABLE]] séparés.
 - Si l'alignement ne permet pas de garantir les colonnes, ferme le tableau et transcris la zone en [[BLOCK]].
 
-Tableaux — cellules :
+TABLEAUX — CELLULES
+
 - Une ligne OCR = une ligne logique du tableau.
 - Une cellule OCR = une cellule visuelle.
 - Chaque ligne d'un tableau doit contenir exactement N cellules, donc exactement N-1 tokens <TAB>.
@@ -242,7 +300,7 @@ Tableaux — cellules :
 - Détermine N avec toutes les colonnes réellement alignées : en-têtes visibles, lignes de données, totaux internes, codes, montants, taux, quantités.
 - Ne détermine jamais N uniquement avec les libellés visibles de l'en-tête.
 - Si les lignes de données ont plus de colonnes que les en-têtes visibles, ajoute [SANS_ENTETE_n] dans l'en-tête à la position exacte des colonnes sans libellé.
-- n recommence à 1 dans chaque tableau.
+- Les marqueurs [SANS_ENTETE_n] sont numérotés séquentiellement dans chaque tableau, de gauche à droite, en recommençant à 1 pour chaque nouveau tableau.
 - N'ajoute jamais une colonne vide sans nom en fin d'en-tête.
 - N'invente jamais un nom de colonne à partir du contenu des valeurs.
 - Si aucune ligne d'en-tête n'est visible, crée une ligne d'en-tête avec [SANS_ENTETE_1], [SANS_ENTETE_2], etc.
@@ -250,14 +308,16 @@ Tableaux — cellules :
 - Si une cellule vide est en fin de ligne, écris quand même <EMPTY> pour conserver N cellules.
 - Ne laisse jamais une cellule vide implicite.
 
-Tableaux — en-têtes et retours ligne :
+TABLEAUX — EN-TÊTES ET RETOURS LIGNE
+
 - Garde les en-têtes visibles exacts.
 - Si un en-tête est écrit sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
 - Si une désignation ou description continue sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
 - Si une ligne contient seulement une continuation de texte dans une colonne et aucun autre champ significatif, rattache ce texte à la cellule correspondante de la ligne précédente avec <BR>.
 - Si le rattachement est incertain, conserve une ligne réelle avec <EMPTY> dans les autres cellules, mais ne crée pas de ligne vide.
 
-Tableaux — nombres, taux, montants, codes :
+TABLEAUX — NOMBRES, TAUX, MONTANTS, CODES
+
 - Si plusieurs valeurs courtes sont alignées en colonnes distinctes, elles doivent être séparées par <TAB>.
 - Les nombres, montants, pourcentages, quantités, codes taxe, références et totaux alignés verticalement sont des cellules distinctes.
 - Ne fusionne jamais un nombre et un pourcentage s'ils sont visuellement séparés ou répétés à la même position sur plusieurs lignes.
@@ -270,15 +330,17 @@ Tableaux — nombres, taux, montants, codes :
 - Une colonne contenant uniquement des codes sans en-tête visible doit avoir [SANS_ENTETE_n] dans l'en-tête.
 - Ne remplace jamais [SANS_ENTETE_n] par "Remise", "TVA", "Code", "Taxe" ou autre libellé non visible.
 
-Tableaux — anti-padding :
+TABLEAUX — ANTI-PADDING
+
 - Ne crée jamais de ligne entièrement vide.
 - Ne crée jamais de ligne composée uniquement de <EMPTY>.
 - Ne crée jamais de lignes pour reproduire l'espace blanc d'un tableau haut.
 - Le tableau des articles contient seulement les lignes réelles d'articles ou prestations.
 - Une grande zone vide sous les articles ne doit produire aucune ligne OCR.
-- Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK position]] séparé.
+- Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK ...]] séparé.
 
-Règles factures :
+RÈGLES FACTURES
+
 - Les zones articles, prestations, taxes, remises, acomptes, totaux, échéances, paiements et mentions peuvent être des tableaux ou des blocs séparés.
 - Ne suppose jamais qu'un total, une taxe, un acompte ou un solde appartient au tableau voisin.
 - Un montant reste dans le bloc ou tableau où il est visuellement placé.
@@ -290,20 +352,33 @@ Règles factures :
 - Ne place jamais un total à payer dans une colonne de taxe.
 - Ne déplace jamais un montant d'un tableau vers un autre pour compléter une ligne.
 
-Contrôle final silencieux avant sortie :
+RÈGLES IDENTIFIANTS ET CODES
+
+- Pour SIRET, SIREN, TVA intracommunautaire, IBAN, BIC, RIB, numéros de facture, références et codes : conserve exactement les caractères visibles.
+- Ne supprime pas d'espace visible.
+- N'ajoute pas d'espace non visible.
+- Si un caractère est ambigu, utilise [ILLISIBLE] pour ce caractère ou segment.
+- Ne transforme pas une virgule décimale en point décimal.
+- Ne transforme pas un point décimal en virgule décimale.
+- Ne modifie pas les espaces dans les montants.
+
+CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
+
 - Tous les textes visibles utiles sont présents.
 - Aucun texte visible n'est dupliqué sans duplication visuelle.
 - Aucun <TAB> n'apparaît hors d'un [[TABLE]].
 - Aucun <BR> n'apparaît hors d'un [[TABLE]].
 - Chaque [[BLOCK]] est fermé par [[/BLOCK]].
 - Chaque [[TABLE]] est fermé par [[/TABLE]].
-- Chaque [[TABLE position cols=N]] a exactement N cellules par ligne.
+- Chaque [[BLOCK]] et [[TABLE]] possède id, order, pos, bbox et role_hint.
+- Chaque [[TABLE ... cols=N]] a exactement N cellules par ligne.
 - Chaque ligne de tableau contient exactement N-1 tokens <TAB>.
 - Aucun tableau ne contient de ligne vide de padding.
 - Aucun tableau ne contient deux groupes d'en-têtes indépendants.
 - Aucun tableau côte à côte n'a été fusionné.
 - Aucune colonne réelle sans en-tête n'a été supprimée.
 - Aucune colonne réelle sans en-tête n'a reçu un nom inventé : elle doit être [SANS_ENTETE_n].
+- Aucun bloc logo, marketing, SAV, tampon ou QR code textuel n'a été fusionné avec supplier ou customer.
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
