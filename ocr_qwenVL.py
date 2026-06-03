@@ -166,11 +166,11 @@ Chaque élément doit utiliser l'un de ces formats :
 
 [[PAGE n]]
 
-[[BLOCK id=B001 order=001 pos=top-left bbox=000,000,000,000 role_hint=unknown]]
+[[BLOCK id=B001 order=001 pos=top-left role_hint=unknown]]
 texte
 [[/BLOCK]]
 
-[[TABLE id=T001 order=001 pos=middle bbox=000,000,000,000 role_hint=unknown cols=N]]
+[[TABLE id=T001 order=001 pos=middle role_hint=unknown cols=N]]
 cellule<TAB>cellule<TAB>cellule
 [[/TABLE]]
 
@@ -187,18 +187,13 @@ middle-left, middle, middle-right,
 bottom-left, bottom, bottom-right,
 unknown.
 
-bbox :
-- Coordonnées approximatives normalisées sur 0-1000.
-- Format strict : bbox=x1,y1,x2,y2.
-- Origine : coin supérieur gauche de la page.
-- x1,y1 = coin supérieur gauche du bloc/table.
-- x2,y2 = coin inférieur droit du bloc/table.
-- Les coordonnées peuvent être approximatives, mais doivent respecter la position relative réelle.
-
 role_hint autorisés :
-supplier
+supplier_identity
 supplier_address
-customer
+supplier_legal
+supplier_contact
+customer_identity
+customer_address
 billing_address
 shipping_address
 invoice_title
@@ -206,12 +201,15 @@ invoice_details
 line_items
 tax_summary
 totals_summary
-payment
+payment_terms
+bank_details
 legal_terms
-logo_marketing
+marketing_badge
+logo_text
 stamp_signature
 qr_barcode_text
 notes
+isolated_value
 unknown
 
 RÈGLES GÉNÉRALES
@@ -247,12 +245,42 @@ IDENTIFIANTS, ORDRE ET RÔLES
 - Deux blocs peuvent avoir le même pos sans devoir être fusionnés.
 - role_hint doit être choisi selon le contenu visible et le layout, jamais selon la position seule.
 - Si le rôle est incertain, utilise role_hint=unknown.
-- Ne force jamais supplier ou customer par position seule.
-- Un logo, slogan, label qualité, tampon, pictogramme, QR code, bloc SAV ou marketing doit rester séparé du fournisseur et du client.
-- Un bloc client doit contenir uniquement un destinataire, facturé à, livré à, acheteur ou une adresse client identifiable.
-- Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=logo_marketing, notes ou unknown.
-- Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés avec deux bbox distinctes.
+- Ne force jamais supplier_identity, supplier_address, customer_identity ou customer_address par position seule.
+
+RÈGLES DE RÔLES
+
+- Nom commercial, raison sociale ou logo textuel du vendeur/émetteur : role_hint=supplier_identity.
+- Adresse du vendeur/émetteur : role_hint=supplier_address.
+- SIRET, SIREN, APE, NAF, TVA intracommunautaire, capital social, forme juridique : role_hint=supplier_legal.
+- Téléphone, fax, email, site web du vendeur : role_hint=supplier_contact.
+- Nom du client, acheteur, destinataire ou facturé à : role_hint=customer_identity.
+- Adresse du client, facturé à ou livré à : role_hint=customer_address, billing_address ou shipping_address.
+- Titre du document : role_hint=invoice_title.
+- Numéro, date, référence, commande, vendeur, page, devise, objet : role_hint=invoice_details.
+- Tableau principal d'articles/prestations : role_hint=line_items.
+- Tableau de TVA, taxes, bases, taux, montants de taxe : role_hint=tax_summary.
+- Tableau de total HT, total TTC, acompte, solde, net à payer : role_hint=totals_summary.
+- Echéance, mode de règlement, conditions de paiement : role_hint=payment_terms.
+- Banque, RIB, IBAN, BIC : role_hint=bank_details.
+- Conditions légales, réserve de propriété, pénalités, indemnités, pied de page juridique : role_hint=legal_terms.
+- Slogan, badge SAV, label qualité, argument marketing, texte promotionnel : role_hint=marketing_badge.
+- Texte de logo non suffisant pour identifier l'émetteur : role_hint=logo_text.
+- Tampon ou signature : role_hint=stamp_signature.
+- Texte lisible associé à QR code ou code-barres : role_hint=qr_barcode_text.
+- Note libre : role_hint=notes.
+- Valeur isolée sans libellé clair : role_hint=isolated_value.
+- Rôle incertain : role_hint=unknown.
+
+SÉPARATION DES BLOCS SENSIBLES
+
+- Ne fusionne jamais un slogan, badge SAV, label qualité, pictogramme, tampon, QR code ou texte marketing avec le fournisseur ou le client.
+- Ne fusionne jamais un bloc client avec un bloc marketing, même s'ils sont proches.
+- Ne fusionne jamais un bloc fournisseur avec un bloc marketing, sauf si le texte est seulement le nom/logo de l'entreprise émettrice.
+- Si une zone contient à la fois nom fournisseur et slogan marketing, sépare-les si visuellement possible.
+- Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés.
 - Si une zone contient paiement et mentions légales, crée deux blocs séparés si une bordure, un espace ou un changement de style les sépare.
+- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur ou son adresse.
+- Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=marketing_badge, notes ou unknown.
 
 LECTURE LAYOUT
 
@@ -276,7 +304,8 @@ BLOCS
 - Les adresses, mentions légales, notes, conditions et textes libres restent en [[BLOCK]].
 - Les blocs de paiement sans vraie grille doivent rester en [[BLOCK]], pas en [[TABLE]].
 - Dans un [[BLOCK]], conserve les retours à la ligne utiles.
-- Un bloc purement marketing, slogan, SAV, label, logo textuel ou tampon ne doit pas être fusionné avec supplier ou customer.
+- Ne regroupe pas dans un même [[BLOCK]] des textes ayant des role_hint différents si une séparation visuelle existe.
+- Si un bloc contient plusieurs lignes du même rôle, conserve-les dans le même bloc.
 
 TABLEAUX — DÉTECTION
 
@@ -337,7 +366,9 @@ TABLEAUX — ANTI-PADDING
 - Ne crée jamais de lignes pour reproduire l'espace blanc d'un tableau haut.
 - Le tableau des articles contient seulement les lignes réelles d'articles ou prestations.
 - Une grande zone vide sous les articles ne doit produire aucune ligne OCR.
-- Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK ...]] séparé.
+- Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK ... role_hint=isolated_value]] séparé.
+- Une valeur isolée ne doit pas devenir une ligne d'article.
+- Une valeur isolée ne doit pas être supprimée.
 
 RÈGLES FACTURES
 
@@ -357,10 +388,14 @@ RÈGLES IDENTIFIANTS ET CODES
 - Pour SIRET, SIREN, TVA intracommunautaire, IBAN, BIC, RIB, numéros de facture, références et codes : conserve exactement les caractères visibles.
 - Ne supprime pas d'espace visible.
 - N'ajoute pas d'espace non visible.
+- Si un code est imprimé sans espace, ne lui ajoute pas d'espace.
+- Si un code est imprimé avec espaces, conserve les espaces visibles.
 - Si un caractère est ambigu, utilise [ILLISIBLE] pour ce caractère ou segment.
 - Ne transforme pas une virgule décimale en point décimal.
 - Ne transforme pas un point décimal en virgule décimale.
 - Ne modifie pas les espaces dans les montants.
+- Pour les montants français avec virgule visible, conserve la virgule.
+- Pour les montants avec point visible, conserve le point.
 
 CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 
@@ -370,7 +405,8 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Aucun <BR> n'apparaît hors d'un [[TABLE]].
 - Chaque [[BLOCK]] est fermé par [[/BLOCK]].
 - Chaque [[TABLE]] est fermé par [[/TABLE]].
-- Chaque [[BLOCK]] et [[TABLE]] possède id, order, pos, bbox et role_hint.
+- Chaque [[BLOCK]] possède id, order, pos et role_hint.
+- Chaque [[TABLE]] possède id, order, pos, role_hint et cols=N.
 - Chaque [[TABLE ... cols=N]] a exactement N cellules par ligne.
 - Chaque ligne de tableau contient exactement N-1 tokens <TAB>.
 - Aucun tableau ne contient de ligne vide de padding.
@@ -378,7 +414,7 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Aucun tableau côte à côte n'a été fusionné.
 - Aucune colonne réelle sans en-tête n'a été supprimée.
 - Aucune colonne réelle sans en-tête n'a reçu un nom inventé : elle doit être [SANS_ENTETE_n].
-- Aucun bloc logo, marketing, SAV, tampon ou QR code textuel n'a été fusionné avec supplier ou customer.
+- Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity ou customer_address.
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans le traitement de documents comptables.
