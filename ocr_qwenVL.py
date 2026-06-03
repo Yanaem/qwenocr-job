@@ -211,6 +211,7 @@ Lecture layout :
 - Deux tableaux empilés mais séparés par bordure, espace, titre ou groupe d'en-têtes distinct restent deux [[TABLE]] séparés.
 - Si une zone est ambiguë, utilise [[BLOCK]] ligne par ligne au lieu de fabriquer un tableau.
 - Un titre situé au-dessus d'un tableau doit rester dans un [[BLOCK]] séparé, sauf s'il est clairement une cellule du tableau.
+- Les marqueurs [SANS_ENTETE_n] doivent être numérotés séquentiellement dans chaque tableau, de gauche à droite, en recommençant à 1 pour chaque nouveau tableau.
 
 Blocs :
 - Un [[BLOCK]] contient du texte non tabulaire.
