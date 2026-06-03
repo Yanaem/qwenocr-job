@@ -197,6 +197,9 @@ Règles générales :
 - Si une portion est illisible : écris [ILLISIBLE] à l'endroit concerné.
 - Si la page est réellement vide : réponds exactement [PAGE VIDE].
 - Un même texte visible ne doit apparaître qu'une seule fois, sauf s'il est répété visuellement.
+- Ne fusionne jamais un logo, tampon, QR code, bloc marketing ou slogan avec le bloc client, même s'ils sont proches ou dans la même zone horizontale/verticale.
+- Le bloc client doit contenir uniquement le destinataire/facturé/livré à et son adresse.
+- Tout texte isolé près du client mais sans lien explicite avec le destinataire doit rester dans un [[BLOCK]] séparé.
 
 Lecture layout :
 - Lis par blocs visuels, pas par bande horizontale globale.
