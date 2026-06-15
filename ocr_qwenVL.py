@@ -759,7 +759,7 @@ Applique ces règles uniquement aux tables role_hint=line_items.
 
 FORMAT DES TABLEAUX MARKDOWN
 
-- Échappe les caractères "|" présents dans les cellules en "\|".
+- Échappe les caractères "|" présents dans les cellules en "\\|".
 - Utilise un séparateur Markdown simple :
 |---|---|
 - N'ajoute pas d'alignement avec ":".
@@ -982,6 +982,276 @@ def _remove_empty_md_table_rows(md: str) -> str:
             if all(c == "" for c in cells):
                 continue
         out.append(line)
+    return "\n".join(out)
+
+
+def _normalize_sans_entete_tokens(text: str) -> str:
+    """
+    Normalise les erreurs de forme du modèle : <SANS_ENTETE_1>
+    devient [SANS_ENTETE_1]. Applicable OCR + Markdown.
+    """
+    if not text:
+        return text
+    return re.sub(r"<SANS_ENTETE_(\d+)>", r"[SANS_ENTETE_\1]", text)
+
+
+def _normalize_markdown_tokens(md: str) -> str:
+    """
+    Nettoyage défensif du Markdown final produit par le modèle.
+    Ne s'applique pas à l'annexe OCR ajoutée ensuite par le code.
+    """
+    if not md:
+        return md
+    md = _normalize_sans_entete_tokens(md)
+    md = md.replace("<BR>", "<br>")
+    md = md.replace("<EMPTY>", "")
+    md = md.replace("<TAB>", "    ")
+    return md
+
+
+def _is_md_table_row(line: str) -> bool:
+    return bool(re.match(r"^\|.*\|\s*$", line or ""))
+
+
+def _is_md_separator_row(line: str) -> bool:
+    return bool(re.match(r"^\|[\s:\-|]+\|\s*$", line or ""))
+
+
+def _split_md_cells(line: str) -> List[str]:
+    """
+    Découpe une ligne de tableau Markdown en respectant les pipes échappés.
+    """
+    raw = (line or "").strip()
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|"):
+        raw = raw[:-1]
+
+    cells: List[str] = []
+    buf: List[str] = []
+    escaped = False
+
+    for ch in raw:
+        if escaped:
+            # On garde l'échappement pour ne pas modifier la valeur visible.
+            buf.append("\\" + ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+
+    if escaped:
+        buf.append("\\")
+
+    cells.append("".join(buf).strip())
+    return cells
+
+
+def _build_md_row(cells: List[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _build_md_separator(n: int) -> str:
+    return "| " + " | ".join(["---"] * max(n, 1)) + " |"
+
+
+def _remove_header_only_md_tables(md: str) -> str:
+    """
+    Convertit les tableaux Markdown composés uniquement d'un en-tête
+    et d'un séparateur en texte simple. Cela corrige notamment les blocs
+    paiement/détails qu'un modèle transforme parfois en table vide.
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        if (
+            i + 1 < len(lines)
+            and _is_md_table_row(lines[i])
+            and _is_md_separator_row(lines[i + 1])
+        ):
+            j = i + 2
+            data_rows: List[str] = []
+
+            while j < len(lines) and _is_md_table_row(lines[j]):
+                data_rows.append(lines[j])
+                j += 1
+
+            if not data_rows:
+                cells = [c for c in _split_md_cells(lines[i]) if c]
+                if cells:
+                    out.append(" | ".join(cells))
+                i = j
+                continue
+
+        out.append(lines[i])
+        i += 1
+
+    return "\n".join(out)
+
+
+def _drop_empty_unnamed_columns(md: str) -> str:
+    """
+    Supprime les colonnes [SANS_ENTETE_n] ou en-tête vide si elles sont
+    entièrement vides dans les lignes de données.
+    Si un en-tête vide contient des valeurs, il est renommé [SANS_ENTETE_n].
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        if (
+            i + 1 < len(lines)
+            and _is_md_table_row(lines[i])
+            and _is_md_separator_row(lines[i + 1])
+        ):
+            header = _split_md_cells(lines[i])
+            j = i + 2
+            rows: List[List[str]] = []
+
+            while j < len(lines) and _is_md_table_row(lines[j]):
+                row = _split_md_cells(lines[j])
+                if len(row) < len(header):
+                    row += [""] * (len(header) - len(row))
+                rows.append(row[:len(header)])
+                j += 1
+
+            if not rows:
+                out.append(lines[i])
+                out.append(lines[i + 1])
+                i = j
+                continue
+
+            keep_indexes: List[int] = []
+            for idx, h in enumerate(header):
+                h_clean = h.strip()
+                is_sans = bool(re.fullmatch(r"\[SANS_ENTETE_\d+\]", h_clean))
+                is_blank_header = (h_clean == "")
+                values = [
+                    (row[idx].strip() if idx < len(row) else "")
+                    for row in rows
+                ]
+
+                if (is_sans or is_blank_header) and all(v == "" for v in values):
+                    continue
+
+                keep_indexes.append(idx)
+
+            new_header = [header[idx] for idx in keep_indexes]
+            new_rows = [[row[idx] for idx in keep_indexes] for row in rows]
+
+            # Renommer les en-têtes vides conservés, puis renuméroter les [SANS_ENTETE_n].
+            counter = 1
+            for k, h in enumerate(new_header):
+                if h.strip() == "" or re.fullmatch(r"\[SANS_ENTETE_\d+\]", h.strip()):
+                    new_header[k] = f"[SANS_ENTETE_{counter}]"
+                    counter += 1
+
+            if len(keep_indexes) != len(header) or new_header != header:
+                out.append(_build_md_row(new_header))
+                out.append(_build_md_separator(len(new_header)))
+                for row in new_rows:
+                    out.append(_build_md_row(row))
+                i = j
+                continue
+
+        out.append(lines[i])
+        i += 1
+
+    return "\n".join(out)
+
+
+def _looks_like_number_or_amount(value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    return bool(re.fullmatch(
+        r"[-+−]?\(?\d[\d\s.,']*\)?\s*(?:€|EUR|USD|CHF|GBP|£|\$)?",
+        v,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _looks_like_percent(value: str) -> bool:
+    v = (value or "").strip()
+    return bool(re.fullmatch(r"[-+−]?\d+(?:[,.]\d+)?\s*%", v))
+
+
+def _fix_percent_header_position_in_tables(md: str) -> str:
+    """
+    Corrige uniquement les en-têtes dans le cas :
+    Px unitaire | Px unitaire remisé | [SANS_ENTETE_1]
+    alors que les données montrent : nombre | pourcentage | nombre.
+
+    Les données ne sont jamais déplacées.
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        if (
+            i + 1 < len(lines)
+            and _is_md_table_row(lines[i])
+            and _is_md_separator_row(lines[i + 1])
+        ):
+            header = _split_md_cells(lines[i])
+            j = i + 2
+            rows: List[List[str]] = []
+
+            while j < len(lines) and _is_md_table_row(lines[j]):
+                row = _split_md_cells(lines[j])
+                if len(row) < len(header):
+                    row += [""] * (len(header) - len(row))
+                rows.append(row[:len(header)])
+                j += 1
+
+            changed = False
+            for idx in range(0, max(len(header) - 2, 0)):
+                h0 = header[idx].lower()
+                h1 = header[idx + 1].lower()
+                h2 = header[idx + 2].strip()
+
+                is_bad_header_order = (
+                    "unitaire" in h0
+                    and "remis" in h1
+                    and re.fullmatch(r"\[SANS_ENTETE_\d+\]", h2)
+                )
+                if not is_bad_header_order:
+                    continue
+
+                evidence = 0
+                for row in rows:
+                    if (
+                        _looks_like_number_or_amount(row[idx])
+                        and _looks_like_percent(row[idx + 1])
+                        and _looks_like_number_or_amount(row[idx + 2])
+                    ):
+                        evidence += 1
+
+                if evidence >= 1:
+                    header[idx + 1], header[idx + 2] = header[idx + 2], header[idx + 1]
+                    changed = True
+
+            if changed:
+                out.append(_build_md_row(header))
+                out.append(_build_md_separator(len(header)))
+                for row in rows:
+                    out.append(_build_md_row(row))
+                i = j
+                continue
+
+        out.append(lines[i])
+        i += 1
+
     return "\n".join(out)
 
 
@@ -1212,6 +1482,7 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
         label = f"OCR page {page_num}" + (f" (retry {k})" if k > 0 else "")
         text, stats = _call_chat(api_key, MODEL_OCR, messages, MAX_TOKENS_OCR, label, enable_thinking=ENABLE_THINKING_OCR)
         text = _strip_triple_backticks(text)
+        text = _normalize_sans_entete_tokens(text)
 
         last_text, last_stats = text, stats
 
@@ -1271,7 +1542,13 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
     md, stats = _call_chat(api_key, MODEL_MD, messages, MAX_TOKENS_MD, f"Markdown page {page_num}", enable_thinking=ENABLE_THINKING_MD)
     md = _strip_triple_backticks(md)
     md = _strip_existing_ocr_appendix(md)
+    md = _normalize_markdown_tokens(md)
     md = _remove_empty_md_table_rows(md)
+    md = _remove_header_only_md_tables(md)
+    md = _fix_percent_header_position_in_tables(md)
+    md = _drop_empty_unnamed_columns(md)
+    md = _remove_empty_md_table_rows(md)
+    md = _normalize_markdown_tokens(md)
 
     _log(f"✅ Page {page_num}: Markdown OK ({stats.get('total_tokens', 0)} tokens)")
     return md.strip(), stats
@@ -1464,4 +1741,5 @@ __all__ = [
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
+
 
