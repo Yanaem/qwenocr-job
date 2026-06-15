@@ -211,6 +211,7 @@ supplier_contact
 customer_identity
 customer_address
 customer_contact
+customer_legal
 billing_address
 shipping_address
 invoice_title
@@ -292,6 +293,7 @@ RÈGLES DE RÔLES
 - Nom du client, acheteur, destinataire ou facturé à : role_hint=customer_identity.
 - Adresse du client, facturé à ou livré à : role_hint=customer_address, billing_address ou shipping_address.
 - Contact client, email client, téléphone client, personne de contact client : role_hint=customer_contact.
+- SIRET, TVA intra, identifiant fiscal ou information légale du client : role_hint=customer_legal.
 - Titre du document : FACTURE, AVOIR, NOTE DE CRÉDIT, PROFORMA, REÇU, etc. : role_hint=invoice_title.
 - Numéro, date, référence, commande, vendeur, page imprimée, devise, objet, code client, statut de paiement isolé : role_hint=invoice_details.
 - Statut de paiement dans la zone des totaux : role_hint=totals_summary.
@@ -319,7 +321,7 @@ SÉPARATION DES BLOCS
 - Si une zone contient à la fois nom fournisseur et slogan marketing, sépare-les si visuellement possible.
 - Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés.
 - Si une zone contient paiement et mentions légales, crée deux blocs séparés si une bordure, un espace ou un changement de style les sépare.
-- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur, contact client ou adresse client.
+- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur, contact client, information légale client ou adresse client.
 - Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=marketing_badge, notes ou unknown.
 
 LECTURE LAYOUT
@@ -402,6 +404,9 @@ TABLEAUX — NOMBRES, TAUX, MONTANTS, CODES
 - Ne fusionne jamais un nombre et un pourcentage s'ils sont visuellement séparés ou répétés à la même position sur plusieurs lignes.
 - Ne fusionne jamais un montant et un code taxe s'ils sont visuellement séparés ou répétés à la même position sur plusieurs lignes.
 - Conserve le signe et les parenthèses des montants négatifs dans la cellule : -12,50 ou (12,50).
+- Si une colonne sans en-tête contient des pourcentages répétés et qu'elle est visuellement située entre deux colonnes de nombres, prix ou montants, place [SANS_ENTETE_n] exactement à cette position.
+- Ne place jamais [SANS_ENTETE_n] après la deuxième colonne numérique si les valeurs suivent l'ordre nombre/prix -> pourcentage -> nombre/prix.
+- Exemple : si "7,430", "0%" et "7,430" sont trois valeurs alignées, l'en-tête doit être "Prix" <TAB> [SANS_ENTETE_1] <TAB> "Prix remisé" si seul le pourcentage n'a pas d'en-tête visible.
 - Exemple : si "12,50", "0%" et "12,50" sont trois valeurs alignées en colonnes, transcris : 12,50<TAB>0%<TAB>12,50
 - Exemple : si "100,00", "20%" et "120,00" sont trois valeurs alignées en colonnes, transcris : 100,00<TAB>20%<TAB>120,00
 - Exemple : si "-15,00", "20%" et "-18,00" sont trois valeurs alignées, transcris : -15,00<TAB>20%<TAB>-18,00
@@ -480,6 +485,7 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Aucune colonne [SANS_ENTETE_n] entièrement vide n'a été créée.
 - Aucune colonne réelle sans en-tête n'a été supprimée.
 - Aucune colonne réelle sans en-tête n'a reçu un nom inventé.
+- Les colonnes de pourcentages sans en-tête sont placées à leur position visuelle exacte.
 - Les notes et pieds de tableau articles ne sont pas dans le tableau line_items.
 - Les lignes de continuation d'articles ont été rattachées à l'article précédent quand c'était visuellement justifié.
 - Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity ou customer_address.
@@ -507,6 +513,7 @@ Tokens possibles dans le contenu :
 <BR>
 [ILLISIBLE]
 [SANS_ENTETE_n]
+<SANS_ENTETE_n>
 
 PRIORITÉ DES RÈGLES
 
@@ -534,7 +541,9 @@ RÈGLES ABSOLUES
 - Ne recopie jamais l'OCR brut complet.
 - Ne crée jamais de section "Annexe - OCR brut".
 - Supprime les tokens techniques [[...]], [[/BLOCK]], [[/TABLE]], id, order, pos, bbox, role_hint, cols=N du rendu final.
-- Conserve [ILLISIBLE] et [SANS_ENTETE_n] exactement.
+- Conserve [ILLISIBLE] exactement.
+- Convertis <SANS_ENTETE_n> en [SANS_ENTETE_n].
+- Conserve [SANS_ENTETE_n] exactement après normalisation.
 - Convertis <EMPTY> en cellule vide dans un tableau Markdown.
 - Convertis <BR> en <br> dans les cellules Markdown.
 - Si <BR> apparaît hors tableau, remplace-le par un retour à la ligne simple.
@@ -592,6 +601,7 @@ Vers "Informations Client" :
 - customer_identity
 - customer_address
 - customer_contact
+- customer_legal
 - billing_address
 - shipping_address
 - customer
@@ -616,11 +626,12 @@ Vers "Informations de Paiement" :
 - payment_terms
 - bank_details
 - payment
+- unknown si le contenu contient clairement "Echéance", "Montant", "Conditions de Règlement", "Mode de règlement", "Règlement", "Acompte", "CB", "Virement" ou une date d'échéance
 
 Vers "Mentions Légales et Notes Complémentaires" :
 - legal_terms
 - marketing_badge
-- logo_text
+- logo_text si le bloc ne permet pas d'identifier l'émetteur
 - stamp_signature
 - qr_barcode_text
 - notes
@@ -628,7 +639,7 @@ Vers "Mentions Légales et Notes Complémentaires" :
 
 RÈGLES DE CLASSEMENT
 
-- Ne place dans "Informations Client" que le destinataire, facturé à, livré à, acheteur, contact client ou son adresse.
+- Ne place dans "Informations Client" que le destinataire, facturé à, livré à, acheteur, contact client, information légale client ou son adresse.
 - Ne place jamais un slogan, badge SAV, label qualité, tampon, QR code, texte marketing ou logo secondaire dans "Informations Client".
 - Ne place dans "Informations Émetteur" que l'identité, l'adresse, les coordonnées ou les mentions juridiques du fournisseur.
 - Ne place jamais un badge SAV, slogan, label qualité, pictogramme, QR code ou texte promotionnel dans "Informations Émetteur".
@@ -637,6 +648,7 @@ RÈGLES DE CLASSEMENT
 - logo_text va dans "Mentions Légales et Notes Complémentaires" s'il ne permet pas d'identifier l'émetteur.
 - Un bloc unknown proche du client ne devient pas client par proximité.
 - Un bloc unknown proche du fournisseur ne devient pas fournisseur par proximité.
+- Un bloc unknown contenant "Echéance", "Conditions de Règlement", "Mode de règlement", "Règlement", "Acompte", "CB" ou "Virement" va dans "Informations de Paiement".
 - Un texte isolé d'en-tête sans libellé clair va dans "Détails de la Facture" ou dans "Mentions Légales et Notes Complémentaires", jamais dans le client par défaut.
 - Ne déplace jamais une valeur d'un tableau vers un autre tableau.
 - Ne fusionne jamais deux sections parce qu'elles sont proches visuellement.
@@ -716,6 +728,16 @@ TABLEAUX — COLONNES [SANS_ENTETE_n] VIDES
 - Après suppression d'une colonne [SANS_ENTETE_n] vide, renumérote les colonnes [SANS_ENTETE_n] restantes de gauche à droite.
 - Ne supprime jamais une colonne nommée normalement, même si elle contient des cellules vides.
 
+TABLEAUX — POSITION DES COLONNES DE POURCENTAGE
+
+Applique ces règles uniquement aux tableaux où les valeurs montrent un motif nombre/prix -> pourcentage -> nombre/prix.
+
+- Si les données suivent le motif nombre/prix -> pourcentage -> nombre/prix, mais que l'en-tête [SANS_ENTETE_n] est placé après la deuxième colonne numérique, corrige uniquement l'ordre des en-têtes sans déplacer les valeurs.
+- Exemple mauvais : Px unitaire | Px unitaire remisé | [SANS_ENTETE_1] avec des valeurs 0,870 | 0% | 0,870.
+- Exemple corrigé : Px unitaire | [SANS_ENTETE_1] | Px unitaire remisé.
+- Ne modifie jamais les cellules de données pour cette correction ; seul l'ordre des en-têtes est corrigé.
+- Ne crée pas un libellé "Remise" si ce mot n'est pas visible.
+
 TABLEAUX — RÉPARATION DES LIGNES ARTICLES
 
 Applique ces règles uniquement aux tables role_hint=line_items.
@@ -777,6 +799,7 @@ Avant de répondre, vérifie :
 - Il n'y a pas de section "Annexe - OCR brut".
 - Aucun token [[...]], [[/BLOCK]], [[/TABLE]], <TAB>, <EMPTY>, bbox ne reste dans le Markdown.
 - Aucun token <BR> ne reste ; il doit être converti en <br>.
+- Aucun token <SANS_ENTETE_n> ne reste ; il doit être converti en [SANS_ENTETE_n].
 - Aucun [CHAMP MANQUANT] n'a été créé.
 - Les montants, signes, parenthèses comptables, devises et taux sont conservés à l'identique.
 - Tous les [[TABLE]] OCR sont rendus comme des tableaux séparés, sauf les tables à une seule ligne qui sont rendues en texte simple.
@@ -786,8 +809,9 @@ Avant de répondre, vérifie :
 - Aucun tableau Markdown ne contient seulement un en-tête sans ligne de données.
 - Les lignes d'unités comme EUR, €, USD, HT, TTC, % ne restent pas comme lignes d'articles.
 - Les colonnes [SANS_ENTETE_n] entièrement vides sont supprimées.
+- Les colonnes [SANS_ENTETE_n] de pourcentage sont placées au bon endroit par rapport aux données.
 - Les blocs marketing, SAV, logo secondaire, QR code, tampon et slogans ne sont ni dans Informations Client ni dans Informations Émetteur.
-- customer_contact est dans Informations Client.
+- customer_contact et customer_legal sont dans Informations Client.
 - line_items_note et line_items_footer sont autour du tableau articles, pas dedans comme lignes articles.
 - Les lignes de continuation d'articles ont été fusionnées quand elles ne contenaient ni quantité, ni prix, ni montant, ni taxe.
 - Les informations après les articles sont présentes.
