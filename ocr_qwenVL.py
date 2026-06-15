@@ -194,11 +194,14 @@ supplier_legal
 supplier_contact
 customer_identity
 customer_address
+customer_contact
 billing_address
 shipping_address
 invoice_title
 invoice_details
 line_items
+line_items_note
+line_items_footer
 tax_summary
 totals_summary
 payment_terms
@@ -225,7 +228,7 @@ RÈGLES GÉNÉRALES
 - Ne calcule pas.
 - Ne complète aucune information absente.
 - N'ajoute aucun libellé, montant, symbole, devise, champ ou total absent de l'image.
-- Transcris tout texte lisible : fournisseur, client, adresses, références, articles, prestations, taxes, totaux, échéances, banque, RIB, IBAN, BIC, conditions, mentions légales, pied de page, annotations, tampons, texte lisible dans logo.
+- Transcris tout texte lisible : fournisseur, client, contacts, adresses, références, articles, prestations, taxes, totaux, échéances, banque, RIB, IBAN, BIC, conditions, mentions légales, pied de page, annotations, tampons, texte lisible dans logo.
 - Ne transcris pas le contenu encodé d'un QR code ou d'un code-barres.
 - Transcris seulement le texte imprimé lisible autour ou dans un logo/QR/code-barres si ce texte est réellement lisible.
 - Ignore uniquement les éléments purement graphiques sans texte lisible.
@@ -250,21 +253,24 @@ IDENTIFIANTS, ORDRE ET RÔLES
 RÈGLES DE RÔLES
 
 - Nom commercial, raison sociale ou logo textuel du vendeur/émetteur : role_hint=supplier_identity.
+- Texte de logo non suffisant pour identifier l'émetteur : role_hint=logo_text.
 - Adresse du vendeur/émetteur : role_hint=supplier_address.
 - SIRET, SIREN, APE, NAF, TVA intracommunautaire, capital social, forme juridique : role_hint=supplier_legal.
 - Téléphone, fax, email, site web du vendeur : role_hint=supplier_contact.
 - Nom du client, acheteur, destinataire ou facturé à : role_hint=customer_identity.
 - Adresse du client, facturé à ou livré à : role_hint=customer_address, billing_address ou shipping_address.
+- Contact client, email client, téléphone client, personne de contact client : role_hint=customer_contact.
 - Titre du document : role_hint=invoice_title.
 - Numéro, date, référence, commande, vendeur, page, devise, objet : role_hint=invoice_details.
 - Tableau principal d'articles/prestations : role_hint=line_items.
+- Note située au début ou au-dessus du tableau articles, liée aux articles mais ne décrivant pas une ligne article : role_hint=line_items_note.
+- Pied de tableau articles, report, page, contact, signature ou total de report situé en bas du tableau articles : role_hint=line_items_footer.
 - Tableau de TVA, taxes, bases, taux, montants de taxe : role_hint=tax_summary.
 - Tableau de total HT, total TTC, acompte, solde, net à payer : role_hint=totals_summary.
 - Echéance, mode de règlement, conditions de paiement : role_hint=payment_terms.
 - Banque, RIB, IBAN, BIC : role_hint=bank_details.
 - Conditions légales, réserve de propriété, pénalités, indemnités, pied de page juridique : role_hint=legal_terms.
 - Slogan, badge SAV, label qualité, argument marketing, texte promotionnel : role_hint=marketing_badge.
-- Texte de logo non suffisant pour identifier l'émetteur : role_hint=logo_text.
 - Tampon ou signature : role_hint=stamp_signature.
 - Texte lisible associé à QR code ou code-barres : role_hint=qr_barcode_text.
 - Note libre : role_hint=notes.
@@ -279,7 +285,7 @@ SÉPARATION DES BLOCS SENSIBLES
 - Si une zone contient à la fois nom fournisseur et slogan marketing, sépare-les si visuellement possible.
 - Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés.
 - Si une zone contient paiement et mentions légales, crée deux blocs séparés si une bordure, un espace ou un changement de style les sépare.
-- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur ou son adresse.
+- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur, contact client ou adresse client.
 - Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=marketing_badge, notes ou unknown.
 
 LECTURE LAYOUT
@@ -301,7 +307,7 @@ BLOCS
 - N'utilise jamais <TAB> dans un [[BLOCK]].
 - N'utilise jamais <BR> dans un [[BLOCK]].
 - Si deux textes sont côte à côte mais ne forment pas une vraie grille, crée deux [[BLOCK]] séparés.
-- Les adresses, mentions légales, notes, conditions et textes libres restent en [[BLOCK]].
+- Les adresses, contacts, mentions légales, notes, conditions et textes libres restent en [[BLOCK]].
 - Les blocs de paiement sans vraie grille doivent rester en [[BLOCK]], pas en [[TABLE]].
 - Dans un [[BLOCK]], conserve les retours à la ligne utiles.
 - Ne regroupe pas dans un même [[BLOCK]] des textes ayant des role_hint différents si une séparation visuelle existe.
@@ -314,6 +320,9 @@ TABLEAUX — DÉTECTION
 - N correspond au nombre réel de colonnes visuelles du tableau.
 - Utilise <TAB> uniquement dans [[TABLE]].
 - Un tableau = une grille continue OU un seul groupe logique d'en-têtes.
+- Un [[TABLE]] doit contenir au minimum une ligne d'en-tête et une ligne de données.
+- Si une zone tabulaire ne contient qu'une seule ligne visible, ne la transcris pas comme [[TABLE]].
+- Une ligne unique contenant des libellés et/ou des valeurs doit être transcrite en [[BLOCK]] avec le role_hint approprié.
 - Ne fusionne jamais deux groupes d'en-têtes indépendants dans une même [[TABLE]].
 - Si deux zones ont des en-têtes, bordures, alignements ou espacements distincts, elles forment deux tableaux.
 - Si un tableau de taxes et un tableau de totaux sont côte à côte, ils doivent rester deux [[TABLE]] séparés.
@@ -330,9 +339,17 @@ TABLEAUX — CELLULES
 - Ne détermine jamais N uniquement avec les libellés visibles de l'en-tête.
 - Si les lignes de données ont plus de colonnes que les en-têtes visibles, ajoute [SANS_ENTETE_n] dans l'en-tête à la position exacte des colonnes sans libellé.
 - Les marqueurs [SANS_ENTETE_n] sont numérotés séquentiellement dans chaque tableau, de gauche à droite, en recommençant à 1 pour chaque nouveau tableau.
+- Une colonne sans en-tête n'est réelle que si au moins une ligne de données contient une valeur non vide dans cette colonne.
+- Ne crée jamais [SANS_ENTETE_n] pour une colonne entièrement vide.
+- Ne crée jamais [SANS_ENTETE_n] pour un simple espace, une bordure, une marge ou une séparation graphique.
+- Si une colonne n'a ni en-tête visible ni valeur visible dans aucune ligne, elle n'existe pas.
 - N'ajoute jamais une colonne vide sans nom en fin d'en-tête.
 - N'invente jamais un nom de colonne à partir du contenu des valeurs.
-- Si aucune ligne d'en-tête n'est visible, crée une ligne d'en-tête avec [SANS_ENTETE_1], [SANS_ENTETE_2], etc.
+- Si aucun en-tête visible n'existe, la première ligne du [[TABLE]] doit être une ligne d'en-têtes génériques.
+- Les en-têtes génériques doivent être [SANS_ENTETE_1], [SANS_ENTETE_2], etc.
+- Ne mets jamais une ligne de données comme première ligne d'un [[TABLE]].
+- Si la première ligne visible contient un libellé financier suivi d'un montant, ce n'est pas un en-tête.
+- Exemples de lignes de données, pas d'en-têtes : "Sous-total 133.94", "Remise - 0.00", "Total TTC 168.94", "Montant HT (1) 133.94".
 - Si une cellule réelle est vide dans une ligne réelle, utilise <EMPTY>.
 - Si une cellule vide est en fin de ligne, écris quand même <EMPTY> pour conserver N cellules.
 - Ne laisse jamais une cellule vide implicite.
@@ -341,6 +358,12 @@ TABLEAUX — EN-TÊTES ET RETOURS LIGNE
 
 - Garde les en-têtes visibles exacts.
 - Si un en-tête est écrit sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
+- Si une ligne située juste sous les en-têtes contient uniquement des unités, devises ou marqueurs courts comme EUR, €, USD, HT, TTC, %, elle fait partie de l'en-tête.
+- Fusionne ces unités dans les cellules d'en-tête correspondantes avec <BR>.
+- Ne crée jamais une ligne de données composée uniquement d'unités, devises ou marqueurs courts.
+- Les cellules vides d'une ligne d'unités restent vides et ne créent pas de nouvelles colonnes.
+- Exemple : "Prix unit. HT" + ligne "EUR" devient "Prix unit. HT<BR>EUR".
+- Exemple : "Total" + ligne "EUR" devient "Total<BR>EUR".
 - Si une désignation ou description continue sur plusieurs lignes dans la même cellule, réunis les lignes avec <BR>.
 - Si une ligne contient seulement une continuation de texte dans une colonne et aucun autre champ significatif, rattache ce texte à la cellule correspondante de la ligne précédente avec <BR>.
 - Si le rattachement est incertain, conserve une ligne réelle avec <EMPTY> dans les autres cellules, mais ne crée pas de ligne vide.
@@ -359,12 +382,22 @@ TABLEAUX — NOMBRES, TAUX, MONTANTS, CODES
 - Une colonne contenant uniquement des codes sans en-tête visible doit avoir [SANS_ENTETE_n] dans l'en-tête.
 - Ne remplace jamais [SANS_ENTETE_n] par "Remise", "TVA", "Code", "Taxe" ou autre libellé non visible.
 
+TABLEAUX — ARTICLES, NOTES ET PIEDS
+
+- Le tableau des articles contient seulement les lignes réelles d'articles ou prestations.
+- Dans un tableau d'articles, les lignes de note, report ou pied de tableau ne sont pas des articles.
+- Les lignes contenant principalement "Commande :", "N° commande", "Report:", "Report", "A Reporter:", "À Reporter", "Page :", "Votre contact:", "Signature:", "Nom:" doivent sortir du tableau articles si elles ne décrivent pas un produit ou une prestation.
+- Une note située avant le premier article réel devient [[BLOCK ... role_hint=line_items_note]].
+- Un pied situé après le dernier article réel devient [[BLOCK ... role_hint=line_items_footer]].
+- Une ligne de continuation descriptive d'un article doit être rattachée à la cellule de désignation précédente avec <BR>.
+- Une référence secondaire, un code-barres imprimé, une garantie ou une description longue sous un article doit rester dans la cellule de l'article précédent, sauf si elle forme clairement un nouvel article.
+- Une ligne de report ou de pied ne doit jamais devenir une ligne article avec cellules vides.
+
 TABLEAUX — ANTI-PADDING
 
 - Ne crée jamais de ligne entièrement vide.
 - Ne crée jamais de ligne composée uniquement de <EMPTY>.
 - Ne crée jamais de lignes pour reproduire l'espace blanc d'un tableau haut.
-- Le tableau des articles contient seulement les lignes réelles d'articles ou prestations.
 - Une grande zone vide sous les articles ne doit produire aucune ligne OCR.
 - Si une valeur isolée apparaît dans une zone vide du tableau sans former une ligne complète, ferme le tableau et transcris cette valeur dans un [[BLOCK ... role_hint=isolated_value]] séparé.
 - Une valeur isolée ne doit pas devenir une ligne d'article.
@@ -372,7 +405,7 @@ TABLEAUX — ANTI-PADDING
 
 RÈGLES FACTURES
 
-- Les zones articles, prestations, taxes, remises, acomptes, totaux, échéances, paiements et mentions peuvent être des tableaux ou des blocs séparés.
+- Les zones articles, prestations, notes d'articles, pieds de tableau, taxes, remises, acomptes, totaux, échéances, paiements et mentions peuvent être des tableaux ou des blocs séparés.
 - Ne suppose jamais qu'un total, une taxe, un acompte ou un solde appartient au tableau voisin.
 - Un montant reste dans le bloc ou tableau où il est visuellement placé.
 - Un montant sous un en-tête de taxe reste dans le tableau de taxe.
@@ -411,10 +444,13 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Chaque ligne de tableau contient exactement N-1 tokens <TAB>.
 - Aucun tableau ne contient de ligne vide de padding.
 - Aucun tableau ne contient deux groupes d'en-têtes indépendants.
+- Aucun tableau ne contient une seule ligne.
 - Aucun tableau côte à côte n'a été fusionné.
+- Aucune colonne [SANS_ENTETE_n] entièrement vide n'a été créée.
 - Aucune colonne réelle sans en-tête n'a été supprimée.
 - Aucune colonne réelle sans en-tête n'a reçu un nom inventé : elle doit être [SANS_ENTETE_n].
 - Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity ou customer_address.
+- Les notes et pieds de tableau articles ne sont pas dans le tableau line_items.
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans la conversion d'OCR layout-aware de factures en Markdown fidèle.
@@ -498,6 +534,7 @@ Vers "Informations Émetteur (Fournisseur)" :
 Vers "Informations Client" :
 - customer_identity
 - customer_address
+- customer_contact
 - billing_address
 - shipping_address
 - customer
@@ -505,10 +542,12 @@ Vers "Informations Client" :
 Vers "Détails de la Facture" :
 - invoice_title
 - invoice_details
-- unknown si le contenu est clairement un titre, une page, un numéro, une date, une référence, une commande, un vendeur, une devise ou un objet de facture
+- unknown si le contenu est clairement un titre, une page, un numéro, une date, une référence, une commande, un vendeur, une devise, un code client ou un objet de facture
 
 Vers "Tableau des Lignes de Facturation" :
+- line_items_note
 - line_items
+- line_items_footer
 
 Vers "Montants Récapitulatifs" :
 - tax_summary
@@ -532,11 +571,12 @@ Vers "Mentions Légales et Notes Complémentaires" :
 
 RÈGLES DE CLASSEMENT STRICTES
 
-- Ne place dans "Informations Client" que le destinataire, facturé à, livré à, acheteur ou son adresse.
+- Ne place dans "Informations Client" que le destinataire, facturé à, livré à, acheteur, contact client ou son adresse.
 - Ne place jamais un slogan, badge SAV, label qualité, tampon, QR code, texte marketing ou logo secondaire dans "Informations Client".
 - Ne place dans "Informations Émetteur" que l'identité, l'adresse, les coordonnées ou les mentions juridiques du fournisseur.
 - Ne place jamais un badge SAV, slogan, label qualité, pictogramme, QR code ou texte promotionnel dans "Informations Émetteur".
-- Les blocs marketing_badge, logo_text, stamp_signature, qr_barcode_text vont dans "Mentions Légales et Notes Complémentaires".
+- Les blocs marketing_badge, stamp_signature, qr_barcode_text vont dans "Mentions Légales et Notes Complémentaires".
+- logo_text va dans "Mentions Légales et Notes Complémentaires", sauf si le bloc contient uniquement le nom/logo évident de l'émetteur et qu'aucun supplier_identity n'existe.
 - Un bloc unknown proche du client ne devient pas client par proximité.
 - Un bloc unknown proche du fournisseur ne devient pas fournisseur par proximité.
 - Un texte isolé d'en-tête sans libellé clair va dans "Détails de la Facture" ou dans "Mentions Légales et Notes Complémentaires", jamais dans le client par défaut.
@@ -564,15 +604,19 @@ BLOCS
 - Pour une valeur isolée dans les montants, écrire simplement la valeur ou :
 Valeur isolée : X
 - Ne crée pas de libellé plus précis que celui fourni par l'OCR.
+- line_items_note doit être rendu en texte simple avant le tableau des articles.
+- line_items_footer doit être rendu en texte simple après le tableau des articles.
+- Ne transforme jamais line_items_note ou line_items_footer en ligne article.
+- Ne transforme jamais line_items_note ou line_items_footer en tableau Markdown sauf si l'OCR les a explicitement marqués [[TABLE]].
 
-TABLEAUX
+TABLEAUX — RÈGLES GÉNÉRALES
 
 - Chaque [[TABLE]] OCR devient un tableau Markdown séparé.
 - Ne fusionne jamais deux [[TABLE]] OCR.
 - Ne fusionne jamais un tableau de taxes avec un tableau de totaux.
 - Ne fusionne jamais deux groupes d'en-têtes indépendants.
 - Une table Markdown doit avoir un seul groupe logique d'en-têtes.
-- La première ligne du [[TABLE]] est l'en-tête.
+- La première ligne du [[TABLE]] est normalement l'en-tête.
 - Les cellules sont séparées par <TAB>.
 - Utilise cols=N si présent pour vérifier le nombre de cellules.
 - Chaque ligne Markdown doit avoir le même nombre de cellules que l'en-tête.
@@ -585,6 +629,35 @@ TABLEAUX
 - Ne crée aucune ligne de tableau entièrement vide.
 - Ne crée aucune ligne composée uniquement de cellules vides.
 - Si un tableau OCR est trop irrégulier pour être converti sûrement, rends ses lignes en texte simple dans la bonne section, cellules séparées par " | ", sans créer de faux tableau Markdown.
+
+TABLEAUX — INTERDICTION DES TABLEAUX SANS DONNÉES
+
+- Ne produis jamais un tableau Markdown avec seulement une ligne d'en-tête et aucune ligne de données.
+- Si une [[TABLE]] OCR ne contient qu'une seule ligne, rends-la en texte simple dans la section appropriée.
+- Ne crée pas de séparateur Markdown |---|---| si aucune ligne de données ne suit.
+- Si un tableau Markdown serait vide après suppression de lignes vides, rends son contenu en texte simple.
+
+TABLEAUX — TABLES SANS EN-TÊTE VISIBLE
+
+- Si la première ligne d'une [[TABLE]] ressemble à une ligne de données et non à un en-tête, ajoute des en-têtes génériques [SANS_ENTETE_n].
+- Indices de ligne de données : libellé financier + montant, par exemple "Sous-total 133.94", "Remise - 0.00", "Total TTC 168.94", "Montant HT (1) 133.94", "TVA (1) : 0.00% 0.00".
+- Ne transforme jamais "Sous-total", "Remise", "Total TTC", "Montant HT", "TVA", "Frais encaissement", "Acompte", "Net à payer" en en-tête de tableau s'ils sont suivis d'un montant sur la même ligne.
+- Pour une table sans en-tête visible, l'en-tête Markdown doit être [SANS_ENTETE_1], [SANS_ENTETE_2], etc.
+
+TABLEAUX — UNITÉS D'EN-TÊTE
+
+- Si la première ligne du corps du tableau contient uniquement des unités, devises ou marqueurs courts comme EUR, €, USD, HT, TTC, %, fusionne ces valeurs dans les en-têtes correspondants avec <br>.
+- Supprime ensuite cette ligne du corps du tableau.
+- Les cellules vides de cette ligne d'unités ne créent pas de colonnes.
+- Exemple : "Prix unit. HT" + ligne "EUR" devient "Prix unit. HT<br>EUR".
+- Exemple : "Total" + ligne "EUR" devient "Total<br>EUR".
+
+TABLEAUX — COLONNES [SANS_ENTETE_n] VIDES
+
+- Si une colonne [SANS_ENTETE_n] est entièrement vide dans toutes les lignes de données, supprime cette colonne du tableau Markdown.
+- Ne supprime jamais une colonne [SANS_ENTETE_n] qui contient au moins une valeur visible.
+- Après suppression d'une colonne [SANS_ENTETE_n] vide, renumérote les colonnes [SANS_ENTETE_n] restantes de gauche à droite.
+- Ne supprime jamais une colonne nommée normalement, même si elle contient des cellules vides.
 
 FORMAT DES TABLEAUX MARKDOWN
 
@@ -599,6 +672,8 @@ RÈGLES FACTURES
 
 - Le tableau des articles/prestations doit rester dans "Tableau des Lignes de Facturation".
 - Le tableau des articles ne doit contenir que les vraies lignes d'articles/prestations présentes dans l'OCR.
+- line_items_note doit apparaître avant le tableau d'articles.
+- line_items_footer doit apparaître après le tableau d'articles.
 - Les consignes "fin du tableau articles" ne s'appliquent qu'au tableau des articles.
 - Après le tableau des articles, continue toujours avec montants, taxes, totaux, échéances, paiement, mentions et pied de page.
 - Les tableaux tax_summary et totals_summary doivent rester séparés.
@@ -608,6 +683,7 @@ RÈGLES FACTURES
 - Ne place jamais NET A PAYER dans un tableau de TVA.
 - Le montant sous l'en-tête "NET A PAYER", "TOTAL A PAYER", "SOLDE" ou équivalent doit rester sous cet en-tête.
 - Si une valeur semble ambiguë, conserve-la comme valeur isolée plutôt que de l'aligner dans un tableau voisin.
+- Si une ligne article contient "Page :", "Votre contact:", "A Reporter:", "Signature:", "Nom:" en bas de tableau, elle doit être rendue hors du tableau articles comme texte simple.
 
 INFORMATIONS DE PAIEMENT
 
@@ -630,7 +706,12 @@ Avant de répondre, vérifie :
 - Aucun tableau Markdown ne contient deux groupes d'en-têtes indépendants.
 - Aucun tableau Markdown ne fusionne taxes et totaux.
 - Aucun tableau Markdown ne contient de ligne entièrement vide.
+- Aucun tableau Markdown ne contient seulement un en-tête sans ligne de données.
+- Les lignes d'unités comme EUR, €, USD, HT, TTC, % ne restent pas comme lignes d'articles.
+- Les colonnes [SANS_ENTETE_n] entièrement vides sont supprimées.
 - Les blocs marketing, SAV, logo secondaire, QR code, tampon et slogans ne sont ni dans Informations Client ni dans Informations Émetteur.
+- customer_contact est dans Informations Client.
+- line_items_note et line_items_footer sont autour du tableau articles, pas dedans comme lignes articles.
 - Les informations après les articles sont présentes.
 - Le Markdown respecte les sections demandées.
 """
