@@ -214,6 +214,9 @@ customer_contact
 customer_legal
 billing_address
 shipping_address
+shipping_details
+shipping_contact
+delivery_confirmation
 invoice_title
 invoice_details
 line_items
@@ -246,7 +249,7 @@ RÈGLES GÉNÉRALES
 - Ne calcule pas.
 - Ne complète aucune information absente.
 - N'ajoute aucun libellé, montant, symbole, devise, champ ou total absent de l'image.
-- Transcris tout texte lisible : fournisseur, client, contacts, adresses, références, articles, prestations, taxes, totaux, échéances, banque, RIB, IBAN, BIC, conditions, mentions légales, pied de page, annotations, tampons, statut de paiement, texte lisible dans un logo.
+- Transcris tout texte lisible : fournisseur, client, contacts, adresses, livraison, références, articles, prestations, taxes, totaux, échéances, banque, RIB, IBAN, BIC, conditions, mentions légales, pied de page, annotations, tampons, statut de paiement, texte lisible dans un logo.
 - Ne transcris pas le contenu encodé d'un QR code ou d'un code-barres.
 - Transcris seulement le texte imprimé lisible autour ou dans un logo, QR code ou code-barres si ce texte est réellement visible.
 - Ignore uniquement les éléments purement graphiques sans texte lisible.
@@ -268,7 +271,7 @@ RÈGLES COMPTABLES — FIDÉLITÉ DES VALEURS
 - Ne fusionne jamais deux taux différents.
 - Pour un avoir, une note de crédit, un remboursement ou un montant négatif : conserve le titre et les montants tels quels.
 - Conserve les mentions de statut exactement : "Payé", "Acquittée", "Soldé", "Reste à payer", "Net à payer", "Échu", "À régler".
-- Conserve les numéros de facture, avoir, commande, client et identifiants fiscaux exactement.
+- Conserve les numéros de facture, avoir, commande, client, livraison, suivi et identifiants fiscaux exactement.
 
 IDENTIFIANTS, ORDRE ET RÔLES
 
@@ -281,7 +284,7 @@ IDENTIFIANTS, ORDRE ET RÔLES
 - Deux blocs peuvent avoir le même pos sans devoir être fusionnés.
 - role_hint doit être choisi selon le contenu visible et le layout, jamais selon la position seule.
 - Si le rôle est incertain, utilise role_hint=unknown.
-- Ne force jamais supplier_identity, supplier_address, customer_identity ou customer_address par position seule.
+- Ne force jamais supplier_identity, supplier_address, customer_identity, customer_address ou shipping_address par position seule.
 
 RÈGLES DE RÔLES
 
@@ -291,9 +294,13 @@ RÈGLES DE RÔLES
 - SIRET, SIREN, APE, NAF, TVA intracommunautaire, capital social, forme juridique, RCS : role_hint=supplier_legal.
 - Téléphone, fax, email, site web du vendeur : role_hint=supplier_contact.
 - Nom du client, acheteur, destinataire ou facturé à : role_hint=customer_identity.
-- Adresse du client, facturé à ou livré à : role_hint=customer_address, billing_address ou shipping_address.
+- Adresse du client, facturé à, adresse de facturation : role_hint=customer_address ou billing_address.
 - Contact client, email client, téléphone client, personne de contact client : role_hint=customer_contact.
 - SIRET, TVA intra, identifiant fiscal ou information légale du client : role_hint=customer_legal.
+- Adresse de livraison, livré à, expédié à, ship to, delivery address : role_hint=shipping_address.
+- Mode de livraison, expédition, retrait, enlevé au comptoir, transporteur, incoterm, instruction de livraison, référence de livraison : role_hint=shipping_details.
+- Contact de livraison, téléphone de livraison, email de livraison, personne à contacter pour la livraison : role_hint=shipping_contact.
+- Confirmation de livraison, preuve de livraison, livré, reçu, nom ou signature liés à la livraison : role_hint=delivery_confirmation.
 - Titre du document : FACTURE, AVOIR, NOTE DE CRÉDIT, PROFORMA, REÇU, etc. : role_hint=invoice_title.
 - Numéro, date, référence, commande, vendeur, page imprimée, devise, objet, code client, statut de paiement isolé : role_hint=invoice_details.
 - Statut de paiement dans la zone des totaux : role_hint=totals_summary.
@@ -307,7 +314,7 @@ RÈGLES DE RÔLES
 - Paiement générique si la distinction payment_terms / bank_details est impossible : role_hint=payment.
 - Conditions légales, réserve de propriété, pénalités, indemnités, pied de page juridique : role_hint=legal_terms.
 - Slogan, badge SAV, label qualité, argument marketing, texte promotionnel : role_hint=marketing_badge.
-- Tampon ou signature : role_hint=stamp_signature.
+- Tampon ou signature non lié à une livraison : role_hint=stamp_signature.
 - Texte lisible associé à QR code ou code-barres : role_hint=qr_barcode_text.
 - Note libre : role_hint=notes.
 - Valeur isolée sans libellé clair : role_hint=isolated_value.
@@ -315,13 +322,15 @@ RÈGLES DE RÔLES
 
 SÉPARATION DES BLOCS
 
-- Ne fusionne jamais un slogan, badge SAV, label qualité, pictogramme, tampon, QR code ou texte marketing avec le fournisseur ou le client.
+- Ne fusionne jamais un slogan, badge SAV, label qualité, pictogramme, tampon, QR code ou texte marketing avec le fournisseur, le client ou la livraison.
 - Ne fusionne jamais un bloc client avec un bloc marketing, même s'ils sont proches.
 - Ne fusionne jamais un bloc fournisseur avec un bloc marketing, sauf si le texte est seulement le nom/logo de l'entreprise émettrice.
+- Ne fusionne jamais une zone client avec une zone de livraison si elles sont visuellement séparées ou libellées différemment.
 - Si une zone contient à la fois nom fournisseur et slogan marketing, sépare-les si visuellement possible.
 - Si une zone contient à la fois marketing/logo et client, crée deux blocs séparés.
 - Si une zone contient paiement et mentions légales, crée deux blocs séparés si une bordure, un espace ou un changement de style les sépare.
-- Un bloc client doit contenir uniquement le destinataire, facturé à, livré à, acheteur, contact client, information légale client ou adresse client.
+- Un bloc client doit contenir uniquement le destinataire, facturé à, acheteur, contact client, information légale client ou adresse de facturation.
+- Les informations de livraison doivent aller dans shipping_address, shipping_details, shipping_contact ou delivery_confirmation, sauf si la facture ne distingue pas visuellement client et livraison.
 - Tout texte proche du client mais sans lien explicite avec le destinataire doit rester dans un bloc séparé avec role_hint=marketing_badge, notes ou unknown.
 
 LECTURE LAYOUT
@@ -343,7 +352,7 @@ BLOCS
 - N'utilise jamais <TAB> dans un [[BLOCK]].
 - N'utilise jamais <BR> dans un [[BLOCK]].
 - Si deux textes sont côte à côte mais ne forment pas une vraie grille, crée deux [[BLOCK]] séparés.
-- Les adresses, contacts, mentions légales, notes, conditions et textes libres restent en [[BLOCK]].
+- Les adresses, contacts, mentions légales, notes, conditions, livraison et textes libres restent en [[BLOCK]].
 - Les blocs de paiement sans vraie grille restent en [[BLOCK]], pas en [[TABLE]].
 - Une ligne unique contenant des libellés et valeurs alignés reste en [[BLOCK]], jamais en [[TABLE]].
 - Exemple : "Echéance Montant Conditions de Règlement 20/06/2025 09:24:16 Poids Brut:1,09Kg" doit être un [[BLOCK]], pas un [[TABLE]].
@@ -417,8 +426,16 @@ TABLEAUX — ARTICLES
 
 - Le tableau des articles contient seulement les vraies lignes d'articles ou prestations.
 - Une ligne article réelle contient normalement une désignation et au moins une quantité, un prix, un montant, une taxe ou un code TVA.
-- Une note, un contexte, une commande, un report ou un pied de tableau ne doit pas devenir une ligne article.
-- Les lignes contenant principalement "Commande :", "N° commande", "Report:", "Report", "A Reporter:", "À Reporter", "Page :", "Votre contact:", "Signature:", "Nom:" doivent sortir du tableau articles si elles ne décrivent pas un produit ou une prestation.
+- Une note, un contexte, une métadonnée documentaire, une information de livraison, une commande, un report ou un pied de tableau ne doit pas devenir une ligne article.
+- Dans le tableau line_items, ne raisonne pas par mots exacts mais par fonction.
+- Une ligne ou un segment appartient au tableau articles seulement s'il décrit un bien/prestation ou s'il porte une valeur commerciale de cette ligne : référence article, désignation, n° de série, quantité, prix, remise, montant, taxe, code TVA.
+- Une ligne ou un segment est une métadonnée documentaire s'il a la forme libellé-valeur, instruction, contexte, report, pagination, contact, signature, livraison, référence de document ou information de suivi, et s'il ne porte pas les valeurs commerciales d'un article.
+- Une métadonnée documentaire ne doit pas être fusionnée dans la désignation d'un article.
+- Si cette métadonnée est située avant le premier article réel ou en tête du tableau, transcris-la en [[BLOCK ... role_hint=line_items_note]], invoice_details, shipping_details ou notes selon sa fonction.
+- Si cette métadonnée est située après le dernier article réel ou en pied de tableau, transcris-la en [[BLOCK ... role_hint=line_items_footer]], shipping_details, delivery_confirmation ou notes selon sa fonction.
+- Si une cellule contient à la fois une métadonnée documentaire et une vraie désignation produit, sépare les deux : la métadonnée sort du tableau, la désignation reste dans l'article.
+- Ne retire jamais un mot simplement parce qu'il ressemble à un libellé documentaire : s'il fait partie d'une désignation produit normale et que la ligne contient quantité/prix/montant/taxe, il reste dans l'article.
+- Exemples non exhaustifs de métadonnées documentaires : commande, référence commande, pièce site, report, à reporter, page, contact, signature, nom, expédition, livraison, transporteur, instruction de livraison.
 - Une note située avant le premier article réel devient [[BLOCK ... role_hint=line_items_note]].
 - Un pied situé après le dernier article réel devient [[BLOCK ... role_hint=line_items_footer]].
 - Si une ligne située après un article réel contient seulement une référence secondaire, un EAN/GTIN, un code-barres imprimé, une garantie, une caractéristique produit ou une description longue, rattache-la à la ligne article précédente avec <BR>.
@@ -442,7 +459,7 @@ TABLEAUX — ANTI-PADDING
 
 RÈGLES FACTURES
 
-- Les zones articles, prestations, notes d'articles, pieds de tableau, taxes, remises, acomptes, totaux, échéances, paiements et mentions peuvent être des tableaux ou des blocs séparés.
+- Les zones articles, prestations, notes d'articles, pieds de tableau, livraison, taxes, remises, acomptes, totaux, échéances, paiements et mentions peuvent être des tableaux ou des blocs séparés.
 - Ne suppose jamais qu'un total, une taxe, un acompte ou un solde appartient au tableau voisin.
 - Un montant reste dans le bloc ou tableau où il est visuellement placé.
 - Un montant sous un en-tête de taxe reste dans le tableau de taxe.
@@ -455,7 +472,7 @@ RÈGLES FACTURES
 
 RÈGLES IDENTIFIANTS ET CODES
 
-- Pour SIRET, SIREN, TVA intracommunautaire, IBAN, BIC, RIB, numéros de facture, références et codes : conserve exactement les caractères visibles.
+- Pour SIRET, SIREN, TVA intracommunautaire, IBAN, BIC, RIB, numéros de facture, références, commandes, livraison, suivi et codes : conserve exactement les caractères visibles.
 - Ne supprime pas d'espace visible.
 - N'ajoute pas d'espace non visible.
 - Si un code est imprimé sans espace, ne lui ajoute pas d'espace.
@@ -486,9 +503,9 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Aucune colonne réelle sans en-tête n'a été supprimée.
 - Aucune colonne réelle sans en-tête n'a reçu un nom inventé.
 - Les colonnes de pourcentages sans en-tête sont placées à leur position visuelle exacte.
-- Les notes et pieds de tableau articles ne sont pas dans le tableau line_items.
+- Les notes, métadonnées documentaires et pieds de tableau articles ne sont pas dans le tableau line_items.
 - Les lignes de continuation d'articles ont été rattachées à l'article précédent quand c'était visuellement justifié.
-- Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity ou customer_address.
+- Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity, customer_address ou shipping_address.
 """
 
 SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans la conversion d'OCR layout-aware de documents comptables : factures, avoirs, notes de crédit, proformas, en Markdown fidèle.
@@ -579,6 +596,7 @@ Omettre une section seulement si aucun contenu ne s'y rattache.
 
 ## Informations Émetteur (Fournisseur)
 ## Informations Client
+## Informations de Livraison
 ## Détails de la Facture
 ## Tableau des Lignes de Facturation
 ## Montants Récapitulatifs
@@ -603,8 +621,14 @@ Vers "Informations Client" :
 - customer_contact
 - customer_legal
 - billing_address
-- shipping_address
 - customer
+
+Vers "Informations de Livraison" :
+- shipping_address
+- shipping_details
+- shipping_contact
+- delivery_confirmation
+- unknown si le contenu contient clairement une adresse de livraison, une expédition, un transporteur, un retrait, un enlevé au comptoir, une confirmation de livraison ou une instruction de livraison
 
 Vers "Détails de la Facture" :
 - invoice_title
@@ -639,7 +663,11 @@ Vers "Mentions Légales et Notes Complémentaires" :
 
 RÈGLES DE CLASSEMENT
 
-- Ne place dans "Informations Client" que le destinataire, facturé à, livré à, acheteur, contact client, information légale client ou son adresse.
+- Ne place dans "Informations Client" que le destinataire, facturé à, acheteur, contact client, information légale client ou son adresse de facturation.
+- Ne place pas shipping_address, shipping_details, shipping_contact ou delivery_confirmation dans "Informations Client" si la section "Informations de Livraison" existe.
+- Une adresse de livraison n'est pas une adresse client par défaut : elle va dans "Informations de Livraison".
+- Si la même adresse est visible à la fois dans une zone client et dans une zone livraison, conserve les deux occurrences dans leurs sections respectives.
+- Les blocs "Expédition", "Adresse de livraison", "Livré à", "Transporteur", "Enlevé au comptoir", "Confirmation de Livraison", "Nom" ou "Signature" liés à la livraison vont dans "Informations de Livraison".
 - Ne place jamais un slogan, badge SAV, label qualité, tampon, QR code, texte marketing ou logo secondaire dans "Informations Client".
 - Ne place dans "Informations Émetteur" que l'identité, l'adresse, les coordonnées ou les mentions juridiques du fournisseur.
 - Ne place jamais un badge SAV, slogan, label qualité, pictogramme, QR code ou texte promotionnel dans "Informations Émetteur".
@@ -745,21 +773,24 @@ Applique ces règles uniquement aux tables role_hint=line_items.
 - Identifie les colonnes par leurs en-têtes visibles : référence, désignation, n° de série, quantité, prix, montant, taxe, TVA, code.
 - Une vraie ligne article contient normalement une désignation et au moins une quantité, un prix, un montant, une taxe ou un code TVA.
 - Une ligne qui ne contient ni quantité, ni prix, ni montant, ni taxe, ni code TVA est une note ou une continuation, pas un nouvel article, sauf preuve claire contraire.
-- Si une telle ligne apparaît avant le premier article réel, rends-la comme texte simple avant le tableau articles.
-- Si une telle ligne apparaît après un article réel, fusionne-la avec l'article précédent :
+- Dans une table line_items, distingue les vraies lignes articles des métadonnées documentaires.
+- Une métadonnée documentaire a généralement la forme libellé-valeur, instruction, contexte, report, pagination, contact, signature, livraison ou référence de suivi.
+- Si une métadonnée documentaire apparaît avant le premier article réel, rends-la comme texte simple avant le tableau articles.
+- Si elle apparaît après le dernier article réel, rends-la comme texte simple après le tableau articles.
+- Si elle apparaît dans une cellule d'article avec une vraie désignation produit, extrais seulement la métadonnée et conserve la désignation produit dans l'article.
+- Ne laisse pas dans le tableau articles une ligne composée seulement d'une note, d'un contexte, d'une garantie, d'un code-barres secondaire, d'un report, d'un contact ou d'un pied de tableau.
+- Si une ligne de continuation apparaît après un article réel, fusionne-la avec l'article précédent :
   - valeur de type EAN/GTIN/code-barres numérique long dans la colonne référence -> ajouter à la cellule Référence précédente avec <br> ;
   - phrase descriptive, garantie, caractéristique produit -> ajouter à la cellule Désignation précédente avec <br> ;
   - valeur située dans une colonne "N° de Série" -> ajouter à la cellule N° de Série précédente avec <br>.
 - Si la ligne contient à la fois une référence secondaire et une description, rattache chaque valeur à la cellule correspondante de l'article précédent.
-- Si une ligne contient "Commande :", "N° commande", "Report:", "Report", "A Reporter:", "À Reporter", "Page :", "Votre contact:", "Signature:", "Nom:" et ne décrit pas un article, rends-la hors tableau comme texte simple.
-- Ne laisse pas dans le tableau articles une ligne composée seulement d'une note, d'une garantie, d'un code-barres secondaire ou d'un pied de tableau.
-- Ne fusionne jamais une ligne qui contient une quantité, un prix, un montant ou une taxe non vide, sauf si elle contient clairement "Page :", "A Reporter:", "Votre contact:", "Signature:" ou "Nom:".
+- Ne fusionne jamais une ligne qui contient une quantité, un prix, un montant ou une taxe non vide, sauf si elle est clairement un pied de tableau ou un report.
 - Une ligne de remise, d'avoir ou de correction avec montant négatif est une vraie ligne du tableau : ne la fusionne pas, ne change pas son signe.
 - Après fusion, supprime les lignes de continuation devenues inutiles.
 
 FORMAT DES TABLEAUX MARKDOWN
 
-- Échappe les caractères "|" présents dans les cellules en "\\|".
+- Échappe les caractères "|" présents dans les cellules en "\|".
 - Utilise un séparateur Markdown simple :
 |---|---|
 - N'ajoute pas d'alignement avec ":".
@@ -773,7 +804,7 @@ RÈGLES FACTURES
 - line_items_note doit apparaître avant le tableau d'articles.
 - line_items_footer doit apparaître après le tableau d'articles.
 - Les consignes "fin du tableau articles" ne s'appliquent qu'au tableau des articles.
-- Après le tableau des articles, continue toujours avec montants, taxes, totaux, échéances, paiement, mentions et pied de page.
+- Après le tableau des articles, continue toujours avec montants, taxes, totaux, échéances, paiement, livraison, mentions et pied de page.
 - Les tableaux tax_summary et totals_summary doivent rester séparés s'ils sont deux [[TABLE]] distincts.
 - Un montant de taxe reste dans le tableau de taxe.
 - Un total à payer reste dans le tableau de total.
@@ -811,8 +842,10 @@ Avant de répondre, vérifie :
 - Les colonnes [SANS_ENTETE_n] entièrement vides sont supprimées.
 - Les colonnes [SANS_ENTETE_n] de pourcentage sont placées au bon endroit par rapport aux données.
 - Les blocs marketing, SAV, logo secondaire, QR code, tampon et slogans ne sont ni dans Informations Client ni dans Informations Émetteur.
+- Les informations de livraison sont dans "Informations de Livraison", pas dans "Informations Client", quand elles sont distinguables.
 - customer_contact et customer_legal sont dans Informations Client.
 - line_items_note et line_items_footer sont autour du tableau articles, pas dedans comme lignes articles.
+- Les métadonnées documentaires liées aux articles sont sorties du tableau articles.
 - Les lignes de continuation d'articles ont été fusionnées quand elles ne contenaient ni quantité, ni prix, ni montant, ni taxe.
 - Les informations après les articles sont présentes.
 - Le Markdown respecte les sections demandées.
