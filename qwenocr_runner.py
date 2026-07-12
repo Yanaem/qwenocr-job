@@ -19,7 +19,7 @@ QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
 try:
     PAGE_WORKERS = max(1, int(os.getenv("PAGE_WORKERS", "2")))
 except ValueError:
-    PAGE_WORKERS = 2
+    PAGE_WORKERS = 4
 
 
 # ---------- GCS utils ----------
