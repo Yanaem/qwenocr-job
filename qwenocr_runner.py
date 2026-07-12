@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -14,6 +15,11 @@ import requests
 
 # Bucket dédié Qwen (figé sur qwenvl par défaut)
 QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
+
+try:
+    PAGE_WORKERS = max(1, int(os.getenv("PAGE_WORKERS", "2")))
+except ValueError:
+    PAGE_WORKERS = 2
 
 
 # ---------- GCS utils ----------
@@ -106,12 +112,12 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     print("=" * 70 + "\n")
 
     start_time = time.time()
-    all_markdown: List[str] = []
-    all_stats: List[Dict] = []
+    markdown_by_page: Dict[int, str] = {}
+    stats_by_page: Dict[int, Dict] = {}
+    pages_to_process: List[int] = []
 
     for page_num in range(1, page_count + 1):
         page_key = str(page_num)
-
         if page_key in completed_pages:
             print(f"      ✓ Page {page_num} (déjà traitée)")
             saved_stats = completed_pages[page_key]["stats"]
@@ -120,51 +126,94 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
                 f"OUT={saved_stats.get('output_tokens', 0):,}"
             )
             print()
-            all_markdown.append(completed_pages[page_key]["markdown"])
-            all_stats.append(saved_stats)
-            continue
+            markdown_by_page[page_num] = completed_pages[page_key]["markdown"]
+            stats_by_page[page_num] = saved_stats
+        else:
+            pages_to_process.append(page_num)
 
-        if page_num > 1 and ocr.INTER_REQUEST_DELAY > 0:
-            time.sleep(ocr.INTER_REQUEST_DELAY)
+    if pages_to_process:
+        worker_count = min(PAGE_WORKERS, len(pages_to_process))
+        print(f"   ⚙️  Pages simultanées : {worker_count}\n")
 
-        try:
-            is_first = (page_num == 1 and len(completed_pages) == 0)
+        completed_since_save = 0
+        critical_error = None
 
-            markdown, stats = ocr.process_page_with_cache(
-                pdf_path, page_num, api_key, is_first_page=is_first
-            )
-
-            all_markdown.append(markdown)
-            all_stats.append(stats)
-
-            completed_pages[page_key] = {
-                "markdown": markdown,
-                "stats": stats,
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_page = {
+                executor.submit(
+                    ocr.process_page_with_cache,
+                    pdf_path,
+                    page_num,
+                    api_key,
+                    page_num == 1 and len(completed_pages) == 0,
+                ): page_num
+                for page_num in pages_to_process
             }
 
-            if page_num % 5 == 0:
-                ocr.save_progress(pdf_path, completed_pages)
-                print("         💾 Progression sauvegardée")
+            for future in as_completed(future_to_page):
+                page_num = future_to_page[future]
+                page_key = str(page_num)
 
-            print(f"         ✅ Page {page_num} terminée\n")
+                if future.cancelled():
+                    continue
 
-        except Exception as e:
-            print(f"\n         ❌ Erreur page {page_num}: {e}")
+                try:
+                    markdown, stats = future.result()
 
-            if ocr.STOP_ON_CRITICAL:
-                raise
+                    markdown_by_page[page_num] = markdown
+                    stats_by_page[page_num] = stats
+                    completed_pages[page_key] = {
+                        "markdown": markdown,
+                        "stats": stats,
+                    }
 
-            error_md = f"<!-- PAGE {page_num} -->\n\n**[ERREUR EXTRACTION]**"
-            all_markdown.append(error_md)
-            all_stats.append(
-                {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                }
-            )
+                    completed_since_save += 1
+                    if completed_since_save >= 5:
+                        ocr.save_progress(pdf_path, completed_pages)
+                        completed_since_save = 0
+                        print("         💾 Progression sauvegardée")
 
-            print("         ⚠️  Marquée comme erreur, continuation...\n")
+                    print(f"         ✅ Page {page_num} terminée\n")
+
+                except Exception as e:
+                    print(f"\n         ❌ Erreur page {page_num}: {e}")
+
+                    if ocr.STOP_ON_CRITICAL:
+                        if critical_error is None:
+                            critical_error = (page_num, e)
+                            for pending_future in future_to_page:
+                                if pending_future is not future:
+                                    pending_future.cancel()
+                        continue
+
+                    error_md = f"<!-- PAGE {page_num} -->\n\n**[ERREUR EXTRACTION]**"
+                    markdown_by_page[page_num] = error_md
+                    stats_by_page[page_num] = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    }
+
+                    print("         ⚠️  Marquée comme erreur, continuation...\n")
+
+        if completed_since_save > 0:
+            ocr.save_progress(pdf_path, completed_pages)
+            print("         💾 Progression sauvegardée")
+
+        if critical_error is not None:
+            failed_page, failed_exception = critical_error
+            raise RuntimeError(
+                f"Échec critique lors du traitement de la page {failed_page}"
+            ) from failed_exception
+
+    all_markdown: List[str] = [
+        markdown_by_page[page_num]
+        for page_num in range(1, page_count + 1)
+    ]
+    all_stats: List[Dict] = [
+        stats_by_page[page_num]
+        for page_num in range(1, page_count + 1)
+    ]
 
     duration = time.time() - start_time
 
@@ -313,5 +362,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
