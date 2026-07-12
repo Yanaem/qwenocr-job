@@ -81,13 +81,10 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     pdf_path = os.path.abspath(pdf_path)
 
     print("\n" + "=" * 70)
-    print("🔬 EXTRACTION DOCUMENTS PDF → MARKDOWN (Qwen3-VL)")
+    print("🔬 EXTRACTION FACTURES PDF → MARKDOWN (Qwen3-VL)")
     print("=" * 70)
     print(f"📄 Fichier PDF      : {pdf_path}")
-    print(f"🤖 Modèle OCR       : {ocr.MODEL_OCR}")
-    print(f"🤖 Modèle Markdown  : {ocr.MODEL_MD}")
-    print(f"🧩 Pipeline         : {ocr.PHASE1_PIPELINE_VERSION}")
-    print(f"🔐 Fingerprint      : {ocr.PIPELINE_FINGERPRINT[:16]}...")
+    print(f"💰 Modèle           : {ocr.MODEL}")
     print("=" * 70)
 
     if not os.path.exists(pdf_path):
@@ -290,15 +287,6 @@ def main():
                             "outputTokens": total_out,
                             "cost": costs["cost_total"],
                         },
-                        "pipeline": {
-                            "version": ocr.PHASE1_PIPELINE_VERSION,
-                            "fingerprint": ocr.PIPELINE_FINGERPRINT,
-                            "ocrPromptVersion": ocr.OCR_PROMPT_VERSION,
-                            "markdownPromptVersion": ocr.MARKDOWN_PROMPT_VERSION,
-                            "ocrModel": ocr.MODEL_OCR,
-                            "markdownModel": ocr.MODEL_MD,
-                            "renderDpi": ocr.RENDER_DPI,
-                        },
                     }
 
                     print(f"📡 Envoi du callback à {callback_url} ...")
@@ -325,3 +313,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
