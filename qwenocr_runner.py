@@ -7,7 +7,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ocr_qwenVL as ocr  # ton script OCR
 from google.cloud import storage
@@ -19,6 +19,22 @@ QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
 DEFAULT_PAGE_WORKERS = 4
 MIN_PAGE_WORKERS = 1
 MAX_PAGE_WORKERS = 8
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed_value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} doit être un entier strictement positif.") from exc
+    if parsed_value < 1:
+        raise RuntimeError(f"{name} doit être un entier strictement positif.")
+    return parsed_value
+
+
+PROGRESS_SAVE_EVERY = _read_positive_int_env("PROGRESS_SAVE_EVERY", 20)
+
+_GCS_CLIENT: Optional[storage.Client] = None
 
 
 def read_page_workers() -> Tuple[str, int]:
@@ -47,6 +63,12 @@ PAGE_WORKERS_RAW, PAGE_WORKERS = read_page_workers()
 
 # ---------- GCS utils ----------
 
+def _get_gcs_client() -> storage.Client:
+    global _GCS_CLIENT
+    if _GCS_CLIENT is None:
+        _GCS_CLIENT = storage.Client()
+    return _GCS_CLIENT
+
 def parse_gs_uri(path: str) -> Tuple[str, str]:
     """
     Normalise un chemin GCS pour utiliser toujours le bucket QWEN_BUCKET.
@@ -67,35 +89,82 @@ def parse_gs_uri(path: str) -> Tuple[str, str]:
     return QWEN_BUCKET, obj
 
 
-def download_from_gcs(gs_uri: str, local_path: str) -> None:
+def download_from_gcs(gs_uri: str, local_path: str) -> str:
     bucket_name, blob_name = parse_gs_uri(gs_uri)
     print("📥 Téléchargement GCS → local")
     print(f"   Bucket : {bucket_name}")
     print(f"   Objet  : {blob_name}")
-    client = storage.Client()
+    client = _get_gcs_client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
+    blob.reload(client=client)
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
     blob.download_to_filename(local_path)
     print(f"✅ Téléchargé dans : {local_path}")
+    return f"gs://{bucket_name}/{blob_name}#{blob.generation}"
 
 
-def upload_to_gcs(local_path: str, gs_uri: str) -> None:
+def download_from_gcs_if_exists(gs_uri: str, local_path: str) -> bool:
+    """Télécharge un objet seulement s'il existe, sans transformer l'absence en erreur."""
     bucket_name, blob_name = parse_gs_uri(gs_uri)
-    print("📤 Upload local → GCS")
-    print(f"   Fichier local : {local_path}")
-    print(f"   Bucket        : {bucket_name}")
-    print(f"   Objet         : {blob_name}")
-    client = storage.Client()
+    client = _get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    if not blob.exists(client=client):
+        return False
+
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(local_path)
+    return True
+
+
+def upload_to_gcs(local_path: str, gs_uri: str, *, quiet: bool = False) -> None:
+    bucket_name, blob_name = parse_gs_uri(gs_uri)
+    if not quiet:
+        print("📤 Upload local → GCS")
+        print(f"   Fichier local : {local_path}")
+        print(f"   Bucket        : {bucket_name}")
+        print(f"   Objet         : {blob_name}")
+    client = _get_gcs_client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(local_path)
-    print("✅ Upload terminé")
+    if not quiet:
+        print("✅ Upload terminé")
+
+
+def delete_from_gcs(gs_uri: str, *, quiet: bool = False) -> None:
+    """Supprime un objet GCS s'il existe."""
+    bucket_name, blob_name = parse_gs_uri(gs_uri)
+    client = _get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    if blob.exists(client=client):
+        blob.delete(client=client)
+        if not quiet:
+            print(f"🗑️  Objet GCS supprimé : gs://{bucket_name}/{blob_name}")
+
+
+def derive_progress_gcs_uri(gcs_input: str) -> str:
+    """Construit un chemin stable de checkpoint à partir de l'objet PDF d'entrée."""
+    bucket_name, blob_name = parse_gs_uri(gcs_input)
+    relative_name = blob_name[len("in/"):] if blob_name.startswith("in/") else blob_name
+    base_name = relative_name.rsplit(".", 1)[0] if "." in relative_name else relative_name
+    return f"gs://{bucket_name}/progress/{base_name}.progress.json"
 
 
 # ---------- Runner logique ----------
 
-def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
+def run_for_pdf(
+    pdf_path: str,
+    api_key: str,
+    output_md_path: str | None = None,
+    *,
+    progress_gcs_uri: str | None = None,
+    source_id: str | None = None,
+):
     """
     Lance toute la chaîne OCR sur un PDF local.
     Retourne:
@@ -116,6 +185,8 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     print(f"📄 Fichier PDF      : {pdf_path}")
     print(f"💰 Modèle           : {ocr.MODEL}")
     print(f"⚙️  PAGE_WORKERS     : {PAGE_WORKERS} (valeur reçue : {PAGE_WORKERS_RAW!r})")
+    print(f"🧠 Cache explicite   : {'configuré' if ocr.ENABLE_EXPLICIT_CACHE else 'désactivé'}")
+    print(f"💾 Checkpoint        : toutes les {PROGRESS_SAVE_EVERY} page(s)")
     print("=" * 70)
 
     if not os.path.exists(pdf_path):
@@ -126,7 +197,17 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     print(f"\n📊 Pages             : {page_count}")
     print(f"💾 Taille            : {pdf_info['file_size_mb']:.2f} MB")
 
-    completed_pages: Dict[str, Dict] = ocr.load_progress(pdf_path)
+    if source_id is None:
+        stat = os.stat(pdf_path)
+        source_id = (
+            f"local:{pdf_path}#{stat.st_size}:{stat.st_mtime_ns}"
+        )
+
+    completed_pages: Dict[str, Dict] = ocr.load_progress(
+        pdf_path,
+        expected_source_id=source_id,
+        expected_page_count=page_count,
+    )
     if completed_pages:
         print(f"\n📂 Reprise détectée : {len(completed_pages)} page(s) déjà traitées")
     else:
@@ -141,6 +222,17 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     stats_by_page: Dict[int, Dict] = {}
     pages_to_process: List[int] = []
     worker_count = 0
+
+    def persist_progress_checkpoint() -> None:
+        ocr.save_progress(
+            pdf_path,
+            completed_pages,
+            source_id=source_id,
+            page_count=page_count,
+        )
+        if progress_gcs_uri:
+            local_progress_path = str(Path(pdf_path).with_suffix(".progress.json"))
+            upload_to_gcs(local_progress_path, progress_gcs_uri, quiet=True)
 
     for page_num in range(1, page_count + 1):
         page_key = str(page_num)
@@ -159,8 +251,23 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
 
     if pages_to_process:
         worker_count = min(PAGE_WORKERS, len(pages_to_process))
+        cache_active = ocr.configure_explicit_cache_for_batch(
+            page_count=len(pages_to_process),
+            worker_count=worker_count,
+        )
         print(f"   ⚙️  Pages simultanées demandées : {PAGE_WORKERS}")
         print(f"   ⚙️  Pages simultanées effectives : {worker_count}")
+        if ocr.ENABLE_EXPLICIT_CACHE:
+            if cache_active:
+                print(
+                    "   🧠 Cache explicite : actif ; amorçage unique puis "
+                    "réutilisation parallèle"
+                )
+            else:
+                print(
+                    "   🧠 Cache explicite : omis pour cette reprise "
+                    "(une seule vague de pages, donc aucun hit utile)"
+                )
         if worker_count < PAGE_WORKERS:
             print(
                 "   ℹ️  Réduction automatique : le nombre de pages restantes "
@@ -201,10 +308,13 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
                     }
 
                     completed_since_save += 1
-                    if completed_since_save >= 5:
-                        ocr.save_progress(pdf_path, completed_pages)
+                    if completed_since_save >= PROGRESS_SAVE_EVERY:
+                        persist_progress_checkpoint()
                         completed_since_save = 0
-                        print("         💾 Progression sauvegardée")
+                        if progress_gcs_uri:
+                            print("         💾 Checkpoint GCS sauvegardé")
+                        else:
+                            print("         💾 Progression locale sauvegardée")
 
                     print(f"         ✅ Page {page_num} terminée\n")
 
@@ -230,8 +340,11 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
                     print("         ⚠️  Marquée comme erreur, continuation...\n")
 
         if completed_since_save > 0:
-            ocr.save_progress(pdf_path, completed_pages)
-            print("         💾 Progression sauvegardée")
+            persist_progress_checkpoint()
+            if progress_gcs_uri:
+                print("         💾 Checkpoint GCS sauvegardé")
+            else:
+                print("         💾 Progression locale sauvegardée")
 
         if critical_error is not None:
             failed_page, failed_exception = critical_error
@@ -276,9 +389,10 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     costs = ocr.calculate_costs(all_stats)
     validation = ocr.validate_markdown_quality(final_markdown, page_count)
 
-    progress_file = Path(pdf_path).with_suffix(".progress.json")
-    if progress_file.exists():
-        progress_file.unlink()
+    if progress_gcs_uri:
+        print("   💾 Checkpoint GCS conservé jusqu'à l'upload du Markdown final")
+    else:
+        ocr.clear_progress(pdf_path)
         print("   🗑️  Fichier de progression supprimé")
 
     print("\n" + "=" * 70)
@@ -315,6 +429,9 @@ def main():
         if not api_key:
             raise RuntimeError("DASHSCOPE_API_KEY non définie.")
 
+        ocr.validate_api_configuration()
+        print(f"🌐 Endpoint Qwen    : {ocr.API_URL}")
+
         gcs_input = os.getenv("GCS_INPUT_URI")
         gcs_output = os.getenv("GCS_OUTPUT_URI")
         local_input = os.getenv("INPUT_PDF_PATH")  # fallback éventuel
@@ -322,7 +439,19 @@ def main():
         if gcs_input:
             # Mode GCS
             local_pdf = "/tmp/input.pdf"
-            download_from_gcs(gcs_input, local_pdf)
+            source_id = download_from_gcs(gcs_input, local_pdf)
+
+            progress_gcs_uri = os.getenv("GCS_PROGRESS_URI") or derive_progress_gcs_uri(gcs_input)
+            local_progress = str(Path(local_pdf).with_suffix(".progress.json"))
+            try:
+                Path(local_progress).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if download_from_gcs_if_exists(progress_gcs_uri, local_progress):
+                print(f"📂 Checkpoint GCS téléchargé : {progress_gcs_uri}")
+            else:
+                print(f"📂 Aucun checkpoint GCS : {progress_gcs_uri}")
 
             # Si pas de GCS_OUTPUT_URI, on dérive la sortie :
             # Entrée : gs://qwenvl/in/xxx.pdf → Sortie : gs://qwenvl/out/xxx.md
@@ -349,9 +478,18 @@ def main():
                 all_stats,
                 costs,
                 worker_count,
-            ) = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
+            ) = run_for_pdf(
+                local_pdf,
+                api_key,
+                output_md_path=local_md,
+                progress_gcs_uri=progress_gcs_uri,
+                source_id=source_id,
+            )
 
             upload_to_gcs(md_path, gcs_output)
+            delete_from_gcs(progress_gcs_uri, quiet=True)
+            ocr.clear_progress(local_pdf)
+            print("🗑️  Checkpoint GCS supprimé après upload réussi du Markdown")
 
             print("=" * 70)
             print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
@@ -365,6 +503,10 @@ def main():
                 try:
                     total_in = sum(s.get("input_tokens", 0) for s in all_stats)
                     total_out = sum(s.get("output_tokens", 0) for s in all_stats)
+                    total_cached = sum(s.get("cached_tokens", 0) for s in all_stats)
+                    total_cache_created = sum(
+                        s.get("cache_creation_input_tokens", 0) for s in all_stats
+                    )
 
                     payload = {
                         "ocrJobId": ocr_job_id,
@@ -376,6 +518,8 @@ def main():
                         "stats": {
                             "inputTokens": total_in,
                             "outputTokens": total_out,
+                            "cachedTokens": total_cached,
+                            "cacheCreationInputTokens": total_cache_created,
                             "cost": costs["cost_total"],
                             "pageWorkersRequested": PAGE_WORKERS,
                             "pageWorkersEffective": worker_count,
@@ -406,4 +550,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
