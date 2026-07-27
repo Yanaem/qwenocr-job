@@ -16,10 +16,33 @@ import requests
 # Bucket dédié Qwen (figé sur qwenvl par défaut)
 QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl")
 
-try:
-    PAGE_WORKERS = max(1, int(os.getenv("PAGE_WORKERS", "2")))
-except ValueError:
-    PAGE_WORKERS = 4
+DEFAULT_PAGE_WORKERS = 4
+MIN_PAGE_WORKERS = 1
+MAX_PAGE_WORKERS = 8
+
+
+def read_page_workers() -> Tuple[str, int]:
+    """Lit et valide le nombre de pages à traiter simultanément."""
+    raw_value = os.getenv("PAGE_WORKERS", str(DEFAULT_PAGE_WORKERS)).strip()
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"PAGE_WORKERS doit être un entier entre {MIN_PAGE_WORKERS} et "
+            f"{MAX_PAGE_WORKERS}. Valeur reçue : {raw_value!r}"
+        ) from exc
+
+    if not MIN_PAGE_WORKERS <= parsed_value <= MAX_PAGE_WORKERS:
+        raise RuntimeError(
+            f"PAGE_WORKERS doit être compris entre {MIN_PAGE_WORKERS} et "
+            f"{MAX_PAGE_WORKERS}. Valeur reçue : {parsed_value}"
+        )
+
+    return raw_value, parsed_value
+
+
+PAGE_WORKERS_RAW, PAGE_WORKERS = read_page_workers()
 
 
 # ---------- GCS utils ----------
@@ -82,6 +105,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
       - md_size_kb
       - all_stats
       - costs
+      - worker_count effectif
     """
 
     pdf_path = os.path.abspath(pdf_path)
@@ -91,6 +115,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     print("=" * 70)
     print(f"📄 Fichier PDF      : {pdf_path}")
     print(f"💰 Modèle           : {ocr.MODEL}")
+    print(f"⚙️  PAGE_WORKERS     : {PAGE_WORKERS} (valeur reçue : {PAGE_WORKERS_RAW!r})")
     print("=" * 70)
 
     if not os.path.exists(pdf_path):
@@ -115,6 +140,7 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
     markdown_by_page: Dict[int, str] = {}
     stats_by_page: Dict[int, Dict] = {}
     pages_to_process: List[int] = []
+    worker_count = 0
 
     for page_num in range(1, page_count + 1):
         page_key = str(page_num)
@@ -133,7 +159,14 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
 
     if pages_to_process:
         worker_count = min(PAGE_WORKERS, len(pages_to_process))
-        print(f"   ⚙️  Pages simultanées : {worker_count}\n")
+        print(f"   ⚙️  Pages simultanées demandées : {PAGE_WORKERS}")
+        print(f"   ⚙️  Pages simultanées effectives : {worker_count}")
+        if worker_count < PAGE_WORKERS:
+            print(
+                "   ℹ️  Réduction automatique : le nombre de pages restantes "
+                "est inférieur au nombre demandé."
+            )
+        print()
 
         completed_since_save = 0
         critical_error = None
@@ -265,7 +298,15 @@ def run_for_pdf(pdf_path: str, api_key: str, output_md_path: str | None = None):
         )
     print("=" * 70 + "\n")
 
-    return str(md_path), page_count, duration, md_size_kb, all_stats, costs
+    return (
+        str(md_path),
+        page_count,
+        duration,
+        md_size_kb,
+        all_stats,
+        costs,
+        worker_count,
+    )
 
 
 def main():
@@ -307,6 +348,7 @@ def main():
                 md_size_kb,
                 all_stats,
                 costs,
+                worker_count,
             ) = run_for_pdf(local_pdf, api_key, output_md_path=local_md)
 
             upload_to_gcs(md_path, gcs_output)
@@ -335,6 +377,8 @@ def main():
                             "inputTokens": total_in,
                             "outputTokens": total_out,
                             "cost": costs["cost_total"],
+                            "pageWorkersRequested": PAGE_WORKERS,
+                            "pageWorkersEffective": worker_count,
                         },
                     }
 
@@ -362,3 +406,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
