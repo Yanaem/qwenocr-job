@@ -34,7 +34,10 @@ ocr = _load_ocr_module()
 def _validate_ocr_contract() -> None:
     required_attributes = [
         "API_URL", "MODEL", "MODEL_MD", "STOP_ON_CRITICAL",
-        "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "PIPELINE_VERSION",
+        "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "MARKDOWN_USES_IMAGE",
+        "ENABLE_THINKING_OCR", "ENABLE_THINKING_MD",
+        "ALLOW_NO_THINK_FALLBACK_MD", "MARKDOWN_FORMAT_RETRIES",
+        "PIPELINE_VERSION",
     ]
     required_callables = [
         "validate_api_configuration", "configure_explicit_cache_for_batch",
@@ -52,6 +55,10 @@ def _validate_ocr_contract() -> None:
             f"Chemin chargé : {loaded_path}. Éléments absents/non appelables : "
             + ", ".join(sorted(set(missing)))
             + ". Déploie ensemble les deux fichiers définitifs fournis."
+        )
+    if ocr.MARKDOWN_USES_IMAGE is not True:
+        raise RuntimeError(
+            "Contrat OCR incompatible : la génération Markdown doit recevoir l'image originale."
         )
 
 
@@ -245,7 +252,7 @@ def run_for_pdf(
     pdf_path = os.path.abspath(pdf_path)
 
     print("\n" + "=" * 70)
-    print("🔬 EXTRACTION FACTURES PDF → MARKDOWN (Qwen3-VL)")
+    print("🔬 EXTRACTION FACTURES PDF → MARKDOWN (Qwen multimodal)")
     print("=" * 70)
     print(f"📄 Fichier PDF      : {pdf_path}")
     print(f"🧩 Module OCR       : {OCR_MODULE_NAME} ({ocr.PIPELINE_VERSION})")
@@ -254,6 +261,17 @@ def run_for_pdf(
     print(f"⚙️  PAGE_WORKERS     : {PAGE_WORKERS} (valeur reçue : {PAGE_WORKERS_RAW!r})")
     print(f"🧠 Cache explicite   : {'configuré' if ocr.ENABLE_EXPLICIT_CACHE else 'désactivé'}")
     print(f"🔎 Haute résolution : {'activée' if ocr.QWEN_HIGH_RES_IMAGES else 'désactivée'}")
+    print("🖼️  Source Markdown  : image originale + comparaison OCR")
+    print(
+        "🧠 Thinking Markdown : "
+        + ("activé" if ocr.ENABLE_THINKING_MD else "désactivé")
+        + (
+            " (aucun fallback sans thinking)"
+            if ocr.ENABLE_THINKING_MD and not ocr.ALLOW_NO_THINK_FALLBACK_MD
+            else ""
+        )
+    )
+    print(f"🔁 Reprises format   : {ocr.MARKDOWN_FORMAT_RETRIES}")
     print(f"🔐 Empreinte        : {ocr.get_pipeline_fingerprint()[:16]}…")
     print(f"💾 Checkpoint        : toutes les {PROGRESS_SAVE_EVERY} page(s)")
     print("=" * 70)
@@ -332,8 +350,8 @@ def run_for_pdf(
         if ocr.ENABLE_EXPLICIT_CACHE:
             if cache_active:
                 print(
-                    "   🧠 Cache explicite : actif sur les prompts user statiques "
-                    "pour les vagues suivantes (rôles inchangés)"
+                    "   🧠 Cache explicite : actif sur les prompts système statiques "
+                    "pour les vagues suivantes"
                 )
             else:
                 print(
@@ -348,7 +366,8 @@ def run_for_pdf(
         print()
 
         completed_since_save = 0
-        critical_error = None
+        critical_error: Optional[Tuple[int, Exception]] = None
+        page_errors: Dict[int, Exception] = {}
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_page = {
@@ -371,45 +390,45 @@ def run_for_pdf(
 
                 try:
                     markdown, stats = future.result()
-
-                    markdown_by_page[page_num] = markdown
-                    stats_by_page[page_num] = stats
-                    completed_pages[page_key] = {
-                        "markdown": markdown,
-                        "stats": stats,
-                    }
-
-                    completed_since_save += 1
-                    if completed_since_save >= PROGRESS_SAVE_EVERY:
-                        persist_progress_checkpoint()
-                        completed_since_save = 0
-                        if progress_gcs_uri:
-                            print("         💾 Checkpoint GCS sauvegardé")
-                        else:
-                            print("         💾 Progression locale sauvegardée")
-
-                    print(f"         ✅ Page {page_num} terminée\n")
-
                 except Exception as e:
+                    page_errors[page_num] = e
                     print(f"\n         ❌ Erreur page {page_num}: {e}")
 
-                    if ocr.STOP_ON_CRITICAL:
-                        if critical_error is None:
-                            critical_error = (page_num, e)
-                            for pending_future in future_to_page:
-                                if pending_future is not future:
-                                    pending_future.cancel()
-                        continue
+                    if ocr.STOP_ON_CRITICAL and critical_error is None:
+                        critical_error = (page_num, e)
+                        for pending_future in future_to_page:
+                            if pending_future is not future:
+                                pending_future.cancel()
+                        print("         ⛔ Arrêt demandé ; annulation des pages non démarrées.\n")
+                    else:
+                        print(
+                            "         ⚠️  La page n'est pas remplacée par un faux Markdown ; "
+                            "les autres pages continuent pour alimenter le checkpoint.\n"
+                        )
+                    continue
 
-                    error_md = f"<!-- PAGE {page_num} -->\n\n**[ERREUR EXTRACTION]**"
-                    markdown_by_page[page_num] = error_md
-                    stats_by_page[page_num] = {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                    }
+                markdown_by_page[page_num] = markdown
+                stats_by_page[page_num] = stats
+                completed_pages[page_key] = {
+                    "markdown": markdown,
+                    "stats": stats,
+                }
 
-                    print("         ⚠️  Marquée comme erreur, continuation...\n")
+                completed_since_save += 1
+                if completed_since_save >= PROGRESS_SAVE_EVERY:
+                    try:
+                        persist_progress_checkpoint()
+                    except Exception as checkpoint_error:
+                        raise RuntimeError(
+                            f"Échec de sauvegarde du checkpoint après la page {page_num}."
+                        ) from checkpoint_error
+                    completed_since_save = 0
+                    if progress_gcs_uri:
+                        print("         💾 Checkpoint GCS sauvegardé")
+                    else:
+                        print("         💾 Progression locale sauvegardée")
+
+                print(f"         ✅ Page {page_num} terminée\n")
 
         if completed_since_save > 0:
             persist_progress_checkpoint()
@@ -421,8 +440,19 @@ def run_for_pdf(
         if critical_error is not None:
             failed_page, failed_exception = critical_error
             raise RuntimeError(
-                f"Échec critique lors du traitement de la page {failed_page}"
+                f"Échec critique lors du traitement de la page {failed_page}. "
+                "Le checkpoint contient uniquement les pages réellement validées."
             ) from failed_exception
+
+        if page_errors:
+            failed_pages = sorted(page_errors)
+            first_page = failed_pages[0]
+            raise RuntimeError(
+                "Traitement incomplet : échec des pages "
+                + ", ".join(str(page) for page in failed_pages)
+                + ". Aucun Markdown final partiel n'a été produit ; le checkpoint conserve "
+                "uniquement les pages validées."
+            ) from page_errors[first_page]
 
     missing_pages = [
         page_num for page_num in range(1, page_count + 1)
@@ -482,7 +512,10 @@ def run_for_pdf(
     print(f"💾 Taille Markdown  : {md_size_kb:.1f} KB")
     print(f"⏱️  Durée totale     : {duration // 60:.0f}min {duration % 60:.0f}s")
     print(f"⚡ Vitesse moyenne  : {duration / page_count:.1f}s/page")
-    print(f"💵 Coût total       : ${costs['cost_total']:.4f}")
+    if costs.get("cost_available"):
+        print(f"💵 Coût total       : ${costs['cost_total']:.4f}")
+    else:
+        print("💵 Coût total       : non calculé (tarifs non configurés)")
     if validation["stats"]:
         stats = validation["stats"]
         print(
@@ -610,6 +643,7 @@ def main():
 
                     print(f"📡 Envoi du callback à {callback_url} ...")
                     resp = requests.post(callback_url, json=payload, timeout=30)
+                    resp.raise_for_status()
                     print(f"✅ Callback envoyé ({resp.status_code})")
                 except Exception as e:
                     print(f"⚠️ Erreur callback: {e}")
@@ -632,5 +666,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
