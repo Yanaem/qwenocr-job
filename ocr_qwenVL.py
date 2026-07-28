@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ocr_qwenVL.py — OCR Qwen validé + Markdown Python déterministe, compatible qwenocr_runner.py
+ocr_qwenVL_def.py — Qwen OCR + Qwen Markdown, compatible qwenocr_runner_def.py
 
 Expose (d'après tes logs) :
 - MODEL (str)
@@ -17,36 +17,34 @@ Expose (d'après tes logs) :
 - validate_markdown_quality(final_markdown, page_count) -> dict
 
 Implémentation :
-- 1 appel Qwen principal : OCR structuré image -> texte.
-- Validation bloquante et retries ciblés si la structure OCR est incohérente.
-- Markdown construit exclusivement par Python : aucun second appel Qwen, aucune réinterprétation générative.
-- Annexe OCR brut ajoutée dans le markdown (côté code, 0 token).
+- 2 étapes (fidélité) :
+  1) OCR brut (image -> texte brut)
+  2) Markdown (texte brut -> markdown structuré)
+- Python sécurise le Markdown produit par Qwen, valide le document et ajoute l’annexe OCR brute.
 
 Robustesse :
 - DPI par défaut = 300 (configurable via env RENDER_DPI)
 - Conversion PDF->PNG low-memory (pdf2image paths_only + fichiers temporaires)
 - Retry court + logs en cas de 429/overloaded
-- Retry spécifique si OCR invalide ou trop court (jusqu'à 3 reprises qualité par défaut)
+- Retry spécifique si OCR "trop court" (réessaye l'OCR 2 fois par défaut)
 - Payload stats contient des clés "flat" + sous-clé "stats" (compat runner)
 """
 
 from __future__ import annotations
 
 import base64
+import gc
 import hashlib
-import html
-import io
 import json
 import os
 import re
-import shlex
 import tempfile
 import threading
 import time
-import unicodedata
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -98,11 +96,15 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =====================
 
+PIPELINE_VERSION = "qwen-ocr-qwen-markdown-def-v2.1-20260728"
+CHECKPOINT_VERSION = 3
+CLEANER_VERSION = "lossless-markdown-cleaners-v2.1"
+
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
 
-# Le Workspace ID est prioritaire. Ainsi, une ancienne variable QWEN_API_URL
-# restée dans Cloud Run ne peut pas forcer silencieusement l'ancien domaine.
+# Le domaine workspace est prioritaire, sans empêcher un déploiement existant
+# qui fournit explicitement QWEN_API_URL.
 if QWEN_WORKSPACE_ID:
     API_URL = (
         f"https://{QWEN_WORKSPACE_ID}.ap-southeast-1.maas.aliyuncs.com/"
@@ -111,76 +113,54 @@ if QWEN_WORKSPACE_ID:
 elif _QWEN_API_URL_OVERRIDE:
     API_URL = _QWEN_API_URL_OVERRIDE
 else:
-    API_URL = ""
+    API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen3.7-plus")
-MODEL_MD = "python-deterministic-v4"
+MODEL_MD = os.getenv("QWEN_MODEL_MD", "qwen3.7-plus")
+MODEL = MODEL_OCR  # attendu par le runner
 
-# Isole les checkpoints et les statistiques des anciennes versions du processeur.
-PROCESSOR_VERSION = "python-markdown-v4-20260727"
-_PROCESSOR_VERSION_SAFE = re.sub(r"[^A-Za-z0-9_.-]+", "-", PROCESSOR_VERSION).strip(".-")
-
-# Attendu par le runner (affiché au démarrage)
-MODEL = MODEL_OCR
-
-# Conservé pour compatibilité avec le runner, sans pause fixe par défaut.
 INTER_REQUEST_DELAY = _env_float("INTER_REQUEST_DELAY", 0.0)
-
-# Attendu par le runner : stop ou non sur erreur page "critique"
-# Recommandation : True pour ne pas générer de Markdown incomplet sans le savoir.
 STOP_ON_CRITICAL = _env_bool("STOP_ON_CRITICAL", True)
-
-# Qualité demandée : 300 DPI (configurable)
 RENDER_DPI = _env_int("RENDER_DPI", 300)
 
-MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 16000)
-
+MAX_TOKENS_OCR = _env_int("MAX_TOKENS_OCR", 12000)
+MAX_TOKENS_MD = _env_int("MAX_TOKENS_MD", 12000)
 TEMPERATURE = _env_float("TEMPERATURE", 0.0)
 
-# Timeouts/retries réseau
 REQUEST_TIMEOUT_SECONDS = _env_int("REQUEST_TIMEOUT_SECONDS", 600)
 CONNECT_TIMEOUT_SECONDS = _env_int("CONNECT_TIMEOUT_SECONDS", 10)
 HTTP_POOL_SIZE = max(1, _env_int("HTTP_POOL_SIZE", 8))
-
-MAX_RETRIES = _env_int("MAX_RETRIES", 3)
+MAX_RETRIES = max(1, _env_int("MAX_RETRIES", 3))
 BACKOFF_BASE = _env_float("BACKOFF_BASE", 2.0)
-BACKOFF_MAX = _env_float("BACKOFF_MAX", 20.0)  # volontairement bas
+BACKOFF_MAX = _env_float("BACKOFF_MAX", 20.0)
 
-# Logs
 VERBOSE = _env_bool("VERBOSE", True)
+FAIL_FAST_ON_429 = _env_bool("FAIL_FAST_ON_429", False)
 
-# Rate-limit behavior
-FAIL_FAST_ON_429 = _env_bool("FAIL_FAST_ON_429", False)  # False = retry court; True = fail vite
-
-# Contrôles qualité OCR. Une page n'est acceptée que si la sortie structurée est valide.
-OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 40)
+OCR_MIN_CHARS = max(1, _env_int("OCR_MIN_CHARS", 40))
 OCR_EMPTY_RETRIES = max(0, _env_int("OCR_EMPTY_RETRIES", 2))
-OCR_QUALITY_RETRIES = max(0, _env_int("OCR_QUALITY_RETRIES", 3))
-OCR_EMPTY_RETRY_SLEEP = _env_float("OCR_EMPTY_RETRY_SLEEP", 1.5)
-OCR_EMPTY_PAGE_CONFIRMATIONS = max(1, _env_int("OCR_EMPTY_PAGE_CONFIRMATIONS", 2))
-STRICT_OCR_STRUCTURE = _env_bool("STRICT_OCR_STRUCTURE", True)
-STRICT_FUSED_CELL_HEURISTICS = _env_bool("STRICT_FUSED_CELL_HEURISTICS", True)
-ALLOW_SAFE_STRUCTURE_REPAIR = _env_bool("ALLOW_SAFE_STRUCTURE_REPAIR", False)
-BLANK_PAGE_DARK_PIXEL_RATIO = max(0.0, _env_float("BLANK_PAGE_DARK_PIXEL_RATIO", 0.001))
+OCR_EMPTY_RETRY_SLEEP = max(0.0, _env_float("OCR_EMPTY_RETRY_SLEEP", 1.5))
 
-# Le mode haute résolution est explicitement demandé à Qwen-VL pour préserver les petits caractères.
-QWEN_HIGH_RES_IMAGES = _env_bool("QWEN_HIGH_RES_IMAGES", True)
-# Garde une marge sous la limite de transport des images encodées en base64.
-MAX_BASE64_IMAGE_MB = max(1.0, _env_float("MAX_BASE64_IMAGE_MB", 9.5))
-
-# Le Markdown est exclusivement produit par Python. Une éventuelle ancienne variable
-# USE_QWEN_MARKDOWN présente dans Cloud Run est volontairement ignorée.
-USE_QWEN_MARKDOWN = False
-
-# Thinking mode : uniquement pour la lecture OCR.
 ENABLE_THINKING_OCR = _env_bool("ENABLE_THINKING_OCR", True)
-ENABLE_THINKING_MD = False
+ENABLE_THINKING_MD = _env_bool("ENABLE_THINKING_MD", True)
 ALLOW_NO_THINK_FALLBACK = _env_bool("ALLOW_NO_THINK_FALLBACK", True)
-EMPTY_RESPONSE_LOG_CHARS = _env_int("EMPTY_RESPONSE_LOG_CHARS", 1500)
+EMPTY_RESPONSE_LOG_CHARS = max(200, _env_int("EMPTY_RESPONSE_LOG_CHARS", 1500))
 
-# Le cache explicite porte uniquement sur le long prompt statique. Il ne change ni la hiérarchie
-# des messages ni le contenu de l’image. Pour un lot d’une seule vague, il est désactivé automatiquement.
+# Cache explicite : le marqueur reste dans le contenu du message user. Les
+# rôles et l'ordre historique des messages ne sont pas modifiés.
 ENABLE_EXPLICIT_CACHE = _env_bool("ENABLE_EXPLICIT_CACHE", True)
+FORCE_EXPLICIT_CACHE = _env_bool("FORCE_EXPLICIT_CACHE", False)
+_EXPLICIT_CACHE_ACTIVE = ENABLE_EXPLICIT_CACHE
+_CACHE_STATE_LOCK = threading.Lock()
+
+# Haute résolution visuelle Qwen. Ce paramètre est envoyé uniquement à
+# l'appel OCR qui contient l'image, jamais à l'appel Markdown.
+QWEN_HIGH_RES_IMAGES = _env_bool("QWEN_HIGH_RES_IMAGES", True)
+MAX_BASE64_IMAGE_MB = max(1.0, _env_float("MAX_BASE64_IMAGE_MB", 9.5))
+REQUIRE_WORKSPACE_ENDPOINT = _env_bool("REQUIRE_WORKSPACE_ENDPOINT", False)
+ENABLE_HEURISTIC_HEADER_REORDER = _env_bool(
+    "ENABLE_HEURISTIC_HEADER_REORDER", False
+)
 
 
 def _log(msg: str) -> None:
@@ -188,80 +168,107 @@ def _log(msg: str) -> None:
         print(msg, flush=True)
 
 
-if os.getenv("USE_QWEN_MARKDOWN", "").strip().lower() not in {"", "0", "false", "no", "off"}:
-    _log("⚠️ USE_QWEN_MARKDOWN est ignoré : cette version impose le rendu Markdown Python.")
-
-
 def validate_api_configuration() -> None:
-    """Valide l'endpoint Qwen avant le premier appel réseau."""
-    if not API_URL:
-        raise RuntimeError(
-            "Endpoint Qwen non configuré. Définis QWEN_WORKSPACE_ID avec l'identifiant "
-            "du workspace Alibaba Cloud Model Studio (région Singapour), ou fournis "
-            "QWEN_API_URL avec le nouvel endpoint workspace-specific."
-        )
-
-    if not API_URL.startswith("https://"):
-        raise RuntimeError("QWEN_API_URL doit commencer par https://")
-
-    if "dashscope-intl.aliyuncs.com" in API_URL.lower():
-        raise RuntimeError(
-            "L'ancien endpoint Qwen Singapour est encore configuré. Supprime "
-            "QWEN_API_URL ou remplace-le, puis définis QWEN_WORKSPACE_ID afin "
-            "d'utiliser le domaine dédié au workspace."
-        )
-
+    """Valide le contrat API avant le premier appel réseau."""
+    if not API_URL or not API_URL.startswith("https://"):
+        raise RuntimeError("Endpoint Qwen invalide ou absent.")
+    if not MODEL_OCR.strip() or not MODEL_MD.strip():
+        raise RuntimeError("QWEN_MODEL_OCR et QWEN_MODEL_MD doivent être définis.")
     if QWEN_WORKSPACE_ID and (
-        any(ch.isspace() for ch in QWEN_WORKSPACE_ID)
-        or "/" in QWEN_WORKSPACE_ID
+        any(ch.isspace() for ch in QWEN_WORKSPACE_ID) or "/" in QWEN_WORKSPACE_ID
     ):
-        raise RuntimeError("QWEN_WORKSPACE_ID est invalide : fournis uniquement l'identifiant du workspace.")
+        raise RuntimeError(
+            "QWEN_WORKSPACE_ID invalide : fournis uniquement l'identifiant du workspace."
+        )
+    if "dashscope-intl.aliyuncs.com" in API_URL.lower():
+        message = (
+            "L'ancien endpoint partagé de Singapour est utilisé. Définis "
+            "QWEN_WORKSPACE_ID pour utiliser le domaine dédié au workspace."
+        )
+        if REQUIRE_WORKSPACE_ENDPOINT:
+            raise RuntimeError(message)
+        _log(f"⚠️ {message}")
 
+
+def configure_explicit_cache_for_batch(page_count: int, worker_count: int) -> bool:
+    """
+    Active le cache des deux prompts statiques pour le lot courant.
+
+    Le cache est activé par défaut lorsqu'au moins une vague ultérieure de
+    pages peut réutiliser les prompts. FORCE_EXPLICIT_CACHE permet de l'imposer.
+    """
+    global _EXPLICIT_CACHE_ACTIVE
+    pages = max(0, int(page_count or 0))
+    workers = max(1, int(worker_count or 1))
+    active = bool(
+        ENABLE_EXPLICIT_CACHE
+        and (FORCE_EXPLICIT_CACHE or pages > workers)
+    )
+    with _CACHE_STATE_LOCK:
+        _EXPLICIT_CACHE_ACTIVE = active
+    return active
+
+
+def _cacheable_text_block(text: str) -> Dict[str, Any]:
+    block: Dict[str, Any] = {"type": "text", "text": text}
+    with _CACHE_STATE_LOCK:
+        active = _EXPLICIT_CACHE_ACTIVE
+    if active:
+        block["cache_control"] = {"type": "ephemeral"}
+    return block
 
 # =====================
 # Helpers structure Markdown canonique
 # =====================
 
 OCR_PAGE_TOKEN_RE = re.compile(
-    r"^\s*\[\[(?:PDF_)?PAGE\s+\d+\]\]\s*$",
+    r"^\s*\[\[(?:PDF_)?PAGE\s+(\d+)\]\]\s*$",
     flags=re.IGNORECASE,
 )
-
 HTML_PAGE_MARKER_RE = re.compile(
     r"^\s*<!--\s*PAGE\s+(\d+)\s*:?\s*-->\s*$",
     flags=re.IGNORECASE,
 )
-
-FENCE_MARKER_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-
-
-def _fence_state_after_line(line: str, active_fence: Optional[str]) -> Tuple[Optional[str], bool]:
-    """Retourne (nouvel état, la ligne est-elle une vraie ouverture/fermeture)."""
-    match = FENCE_MARKER_RE.match(line or "")
-    if not match:
-        return active_fence, False
-    token = match.group(1)
-    if active_fence is None:
-        return token, True
-    remainder = (line or "")[match.end():].strip()
-    if token[0] == active_fence[0] and len(token) >= len(active_fence) and not remainder:
-        return None, True
-    return active_fence, False
+ANNEX_HEADING_RE = re.compile(
+    r"^\s*##\s+Annexe\s*-\s*OCR\s+brut\s*$",
+    flags=re.IGNORECASE,
+)
+FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:[A-Za-z0-9_.+-]+)?\s*$")
 
 
-def _ocr_appendix_fence(ocr_text: str) -> str:
-    """Choisit un fence plus long que toute suite de backticks contenue dans l'OCR."""
-    runs = [len(match.group(0)) for match in re.finditer(r"`+", ocr_text or "")]
-    return "`" * max(3, (max(runs) + 1) if runs else 3)
+def _fence_token(line: str) -> Optional[str]:
+    match = FENCE_OPEN_RE.match(line or "")
+    return match.group(1) if match else None
+
+
+def _walk_lines_with_fence_state(text: str) -> Iterable[Tuple[int, str, bool]]:
+    """Produit (index, ligne, hors_fence) et gère les fences de longueur variable."""
+    active_char: Optional[str] = None
+    active_len = 0
+    for index, line in enumerate((text or "").splitlines()):
+        stripped = line.strip()
+        outside = active_char is None
+        yield index, line, outside
+
+        if active_char is None:
+            token = _fence_token(line)
+            if token:
+                active_char = token[0]
+                active_len = len(token)
+        else:
+            if re.fullmatch(
+                re.escape(active_char) + "{" + str(active_len) + ",}\\s*",
+                stripped,
+            ):
+                active_char = None
+                active_len = 0
+
+    if active_char is not None:
+        raise RuntimeError("Bloc de code Markdown non fermé.")
 
 
 def _strip_model_page_tokens(text: str) -> str:
-    """
-    Supprime les tokens techniques [[PAGE n]] ou [[PDF_PAGE n]] produits par le modèle.
-
-    La pagination physique est ajoutée exclusivement par le code Python.
-    Les textes visibles de facture comme "Page 1/1" restent inchangés.
-    """
+    """Supprime seulement les marqueurs techniques de page produits par Qwen."""
     return "\n".join(
         line
         for line in (text or "").splitlines()
@@ -270,31 +277,24 @@ def _strip_model_page_tokens(text: str) -> str:
 
 
 def _strip_model_html_page_markers(markdown: str) -> str:
-    """Supprime les marqueurs physiques générés hors fences, jamais ceux qui sont visibles dans un code block."""
-    output: List[str] = []
-    active_fence: Optional[str] = None
-    for line in (markdown or "").splitlines():
-        new_state, boundary = _fence_state_after_line(line, active_fence)
-        if boundary:
-            active_fence = new_state
-            output.append(line)
-            continue
-        if active_fence is None and HTML_PAGE_MARKER_RE.match(line):
-            continue
-        output.append(line)
+    """Supprime les marqueurs PAGE autonomes hors blocs de code."""
+    lines = (markdown or "").splitlines()
+    outside_by_index = {
+        index: outside
+        for index, _line, outside in _walk_lines_with_fence_state(markdown or "")
+    }
+    output = [
+        line
+        for index, line in enumerate(lines)
+        if not (outside_by_index.get(index, True) and HTML_PAGE_MARKER_RE.match(line))
+    ]
     return "\n".join(output).strip()
 
 
 def _extract_html_page_markers_outside_fences(markdown: str) -> List[int]:
-    """Retourne les numéros de balises <!-- PAGE n --> situées hors blocs de code."""
     markers: List[int] = []
-    active_fence: Optional[str] = None
-    for line in (markdown or "").splitlines():
-        new_state, boundary = _fence_state_after_line(line, active_fence)
-        if boundary:
-            active_fence = new_state
-            continue
-        if active_fence is not None:
+    for _index, line, outside in _walk_lines_with_fence_state(markdown or ""):
+        if not outside:
             continue
         match = HTML_PAGE_MARKER_RE.match(line)
         if match:
@@ -302,28 +302,230 @@ def _extract_html_page_markers_outside_fences(markdown: str) -> List[int]:
     return markers
 
 
+def _outside_fence_lines(markdown: str) -> List[Tuple[int, str]]:
+    return [
+        (index, line)
+        for index, line, outside in _walk_lines_with_fence_state(markdown or "")
+        if outside and _fence_token(line) is None
+    ]
+
+
+def _split_md_cells_for_validation(line: str) -> List[str]:
+    raw = (line or "").strip()
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|"):
+        raw = raw[:-1]
+    cells: List[str] = []
+    buf: List[str] = []
+    escaped = False
+    for char in raw:
+        if escaped:
+            buf.append("\\" + char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(char)
+    if escaped:
+        buf.append("\\")
+    cells.append("".join(buf).strip())
+    return cells
+
+
+def _is_table_row_for_validation(line: str) -> bool:
+    return bool(re.match(r"^\s*\|.*\|\s*$", line or ""))
+
+
+def _is_separator_for_validation(line: str) -> bool:
+    if not _is_table_row_for_validation(line):
+        return False
+    cells = _split_md_cells_for_validation(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c.strip()) for c in cells)
+
+
+def _validate_markdown_tables_outside_fences(markdown: str) -> Tuple[int, int]:
+    outside = _outside_fence_lines(markdown)
+    lines = {index: line for index, line in outside}
+    indexes = sorted(lines)
+    table_count = 0
+    data_row_count = 0
+    consumed: set[int] = set()
+
+    for index in indexes:
+        if index in consumed or not _is_table_row_for_validation(lines[index]):
+            continue
+        next_index = index + 1
+        if next_index not in lines or not _is_separator_for_validation(lines[next_index]):
+            raise RuntimeError(
+                f"Ligne de tableau Markdown isolée ou sans séparateur à la ligne {index + 1}."
+            )
+
+        header = _split_md_cells_for_validation(lines[index])
+        separator = _split_md_cells_for_validation(lines[next_index])
+        width = len(header)
+        if width < 1 or len(separator) != width:
+            raise RuntimeError(
+                f"Tableau Markdown incohérent à la ligne {index + 1}: "
+                f"en-tête={width}, séparateur={len(separator)}."
+            )
+
+        consumed.update({index, next_index})
+        cursor = next_index + 1
+        rows = 0
+        while cursor in lines and _is_table_row_for_validation(lines[cursor]):
+            if _is_separator_for_validation(lines[cursor]):
+                raise RuntimeError(
+                    f"Deuxième séparateur détecté dans le tableau à la ligne {cursor + 1}."
+                )
+            cells = _split_md_cells_for_validation(lines[cursor])
+            if len(cells) != width:
+                raise RuntimeError(
+                    f"Tableau Markdown irrégulier à la ligne {cursor + 1}: "
+                    f"{len(cells)} cellule(s), attendu {width}."
+                )
+            if all(not cell.strip() for cell in cells):
+                raise RuntimeError(
+                    f"Ligne entièrement vide dans un tableau à la ligne {cursor + 1}."
+                )
+            consumed.add(cursor)
+            rows += 1
+            cursor += 1
+
+        if rows == 0:
+            raise RuntimeError(
+                f"Tableau Markdown sans ligne de données à la ligne {index + 1}."
+            )
+        table_count += 1
+        data_row_count += rows
+
+    return table_count, data_row_count
+
+
+def _choose_code_fence(text: str) -> str:
+    max_run = max((len(match.group(0)) for match in re.finditer(r"`+", text or "")), default=0)
+    return "`" * max(3, max_run + 1)
+
+
+def _validate_single_page_artifact(page_markdown: str, page_num: int) -> None:
+    markers = _extract_html_page_markers_outside_fences(page_markdown)
+    if markers != [int(page_num)]:
+        raise RuntimeError(
+            f"Page {page_num}: marqueur physique invalide, obtenu={markers}."
+        )
+
+    outside = _outside_fence_lines(page_markdown)
+    annex_indexes = [index for index, line in outside if ANNEX_HEADING_RE.match(line)]
+    if len(annex_indexes) != 1:
+        raise RuntimeError(
+            f"Page {page_num}: une annexe OCR exactement est requise, obtenu={len(annex_indexes)}."
+        )
+
+    lines = page_markdown.splitlines()
+    annex_index = annex_indexes[0]
+    core_lines = [line for line in lines[1:annex_index] if line.strip()]
+    if not core_lines:
+        raise RuntimeError(f"Page {page_num}: Markdown structuré vide avant l'annexe OCR.")
+
+    cursor = annex_index + 1
+    while cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    if cursor >= len(lines):
+        raise RuntimeError(f"Page {page_num}: bloc OCR absent après l'annexe.")
+
+    opening = _fence_token(lines[cursor])
+    if not opening:
+        raise RuntimeError(f"Page {page_num}: l'annexe OCR doit être dans un bloc de code.")
+    opening_char = opening[0]
+    opening_len = len(opening)
+    cursor += 1
+
+    content: List[str] = []
+    closing_index: Optional[int] = None
+    while cursor < len(lines):
+        stripped = lines[cursor].strip()
+        if re.fullmatch(
+            re.escape(opening_char) + "{" + str(opening_len) + ",}\\s*",
+            stripped,
+        ):
+            closing_index = cursor
+            break
+        content.append(lines[cursor])
+        cursor += 1
+
+    if closing_index is None:
+        raise RuntimeError(f"Page {page_num}: bloc OCR non fermé.")
+    if any(line.strip() for line in lines[closing_index + 1:]):
+        raise RuntimeError(f"Page {page_num}: contenu inattendu après l'annexe OCR.")
+
+    first_content = next((line.strip() for line in content if line.strip()), "")
+    expected_token = f"[[PAGE {int(page_num)}]]"
+    if first_content != expected_token:
+        raise RuntimeError(
+            f"Page {page_num}: annexe OCR mal identifiée, attendu {expected_token!r}."
+        )
+
+    # Les tokens OCR techniques ne doivent exister que dans l'annexe clôturée.
+    core = "\n".join(lines[:annex_index])
+    forbidden = ["[[BLOCK", "[[TABLE", "[[/BLOCK]]", "[[/TABLE]]", "<TAB>", "<EMPTY>", "<BR>"]
+    leftovers = [token for token in forbidden if token in core]
+    if leftovers:
+        raise RuntimeError(
+            f"Page {page_num}: tokens OCR résiduels dans le Markdown: {leftovers}."
+        )
+
+    _validate_markdown_tables_outside_fences(core)
+
+
 def validate_canonical_markdown_structure(final_markdown: str, page_count: int) -> None:
-    """
-    Validation bloquante du contrat Markdown phase 1.
+    """Validation finale bloquante : pages, annexes, fences et tableaux."""
+    if not isinstance(final_markdown, str) or not final_markdown.strip():
+        raise RuntimeError("Markdown final vide.")
 
-    Format attendu : exactement une balise HTML <!-- PAGE n --> par page physique,
-    hors blocs de code, dans l'ordre [1..page_count].
-    """
-    expected_pages = list(range(1, int(page_count or 0) + 1))
+    expected_count = int(page_count or 0)
+    if expected_count < 1:
+        raise RuntimeError("Le nombre de pages attendu doit être supérieur ou égal à 1.")
+
+    # Déclenche également le contrôle des fences non fermées.
     actual_pages = _extract_html_page_markers_outside_fences(final_markdown)
-
+    expected_pages = list(range(1, expected_count + 1))
     if actual_pages != expected_pages:
         raise RuntimeError(
             "Structure Markdown physique invalide: "
             f"attendu={expected_pages}, obtenu={actual_pages}"
         )
 
-    if re.search(r"(?:^|\n)\s*---\s*$", final_markdown.rstrip(), flags=re.MULTILINE):
-        # Vérification stricte du séparateur final : le document ne doit pas finir par une ligne ---.
-        lines = final_markdown.rstrip().splitlines()
-        if lines and lines[-1].strip() == "---":
-            raise RuntimeError("Le Markdown canonique ne doit pas finir par ---")
+    lines = final_markdown.splitlines()
+    marker_positions: List[Tuple[int, int]] = []
+    for index, line, outside in _walk_lines_with_fence_state(final_markdown):
+        if outside:
+            match = HTML_PAGE_MARKER_RE.match(line)
+            if match:
+                marker_positions.append((index, int(match.group(1))))
 
+    for position, (start, page_num) in enumerate(marker_positions):
+        end = marker_positions[position + 1][0] if position + 1 < len(marker_positions) else len(lines)
+        segment = "\n".join(lines[start:end]).strip()
+        # Le séparateur inter-page appartient au segment précédent : il est retiré
+        # avant la validation de l'artefact individuel.
+        segment_lines = segment.splitlines()
+        while segment_lines and segment_lines[-1].strip() == "---":
+            segment_lines.pop()
+        _validate_single_page_artifact("\n".join(segment_lines).strip(), page_num)
+
+    annex_count = sum(
+        1 for _index, line in _outside_fence_lines(final_markdown) if ANNEX_HEADING_RE.match(line)
+    )
+    if annex_count != expected_count:
+        raise RuntimeError(
+            f"Nombre d'annexes OCR invalide: attendu={expected_count}, obtenu={annex_count}."
+        )
+
+    if final_markdown.rstrip().splitlines()[-1].strip() == "---":
+        raise RuntimeError("Le Markdown canonique ne doit pas finir par ---")
 
 # =====================
 # Prompts
@@ -685,128 +887,519 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 - Aucun bloc marketing, SAV, tampon, QR code textuel ou slogan n'a été fusionné avec supplier_identity, supplier_address, customer_identity, customer_address ou shipping_address.
 """
 
-# Le Markdown est rendu par Python : aucun prompt Markdown Qwen n'est chargé.
+SYSTEM_PROMPT_MD = """Vous êtes un assistant spécialisé dans la conversion d'OCR layout-aware de documents comptables : factures, avoirs, notes de crédit, proformas, en Markdown fidèle.
+
+Entrée : texte OCR structuré d'une ou plusieurs pages.
+
+Sortie : Markdown uniquement.
+Interdiction : JSON, explication, commentaire, annexe OCR, bloc de code autour de la réponse.
+
+L'OCR peut contenir ces éléments :
+[[BLOCK id=B001 order=001 pos=top-left role_hint=unknown]]
+[[BLOCK id=B001 order=001 pos=top-left bbox=000,000,000,000 role_hint=unknown]]
+[[/BLOCK]]
+[[TABLE id=T001 order=001 pos=middle role_hint=line_items cols=N]]
+[[TABLE id=T001 order=001 pos=middle bbox=000,000,000,000 role_hint=line_items cols=N]]
+[[/TABLE]]
+
+Tokens possibles dans le contenu :
+<TAB>
+<EMPTY>
+<BR>
+[ILLISIBLE]
+[SANS_ENTETE_n]
+<SANS_ENTETE_n>
+
+PRIORITÉ DES RÈGLES
+
+En cas de conflit, applique les règles dans cet ordre :
+
+1. Fidélité : utiliser uniquement le contenu OCR, sans rien inventer, corriger, normaliser ou calculer.
+2. Ne jamais perdre un contenu OCR non vide.
+3. Respecter la séparation des [[TABLE]] OCR : ne jamais fusionner deux tables OCR distinctes.
+4. Classer par role_hint, jamais par position seule.
+5. Préserver les valeurs comptables : montants, signes, devises, taux, statuts.
+6. En cas de doute de classement : Mentions Légales et Notes Complémentaires.
+7. En cas de doute sur la structure d'un tableau : rendu en texte simple plutôt qu'un faux tableau.
+
+RÈGLES ABSOLUES
+
+- Utilise uniquement le contenu de l'OCR fourni.
+- Ne corrige pas.
+- Ne reformule pas.
+- Ne normalise pas.
+- Ne calcule pas.
+- Ne complète aucune information absente.
+- Ne déduis aucun montant, libellé, taxe, devise, adresse, identité ou référence.
+- Ne crée jamais [CHAMP MANQUANT].
+- Ne transforme jamais <EMPTY> en [CHAMP MANQUANT].
+- Ne recopie jamais l'OCR brut complet.
+- Ne crée jamais de section "Annexe - OCR brut".
+- Supprime les tokens techniques [[...]], [[/BLOCK]], [[/TABLE]], id, order, pos, bbox, role_hint, cols=N du rendu final.
+- Conserve [ILLISIBLE] exactement.
+- Convertis <SANS_ENTETE_n> en [SANS_ENTETE_n].
+- Conserve [SANS_ENTETE_n] exactement après normalisation.
+- Convertis <EMPTY> en cellule vide dans un tableau Markdown.
+- Convertis <BR> en <br> dans les cellules Markdown.
+- Si <BR> apparaît hors tableau, remplace-le par un retour à la ligne simple.
+- Si <TAB> apparaît hors tableau malgré l'OCR, ne crée pas de tableau : remplace <TAB> par quatre espaces.
+- Tout contenu OCR non classé doit rester visible dans le Markdown, dans la section la plus sûre.
+
+RÈGLES COMPTABLES — FIDÉLITÉ DES VALEURS
+
+- Garde les montants exactement tels quels : chiffres, virgules, points, espaces, séparateurs de milliers.
+- Conserve le signe et les parenthèses comptables des montants négatifs : -12,50 ou (12,50).
+- Ne transforme jamais un signe moins en parenthèses, ni des parenthèses en signe moins.
+- Conserve la devise exactement : €, EUR, $, USD, CHF, etc.
+- Conserve la position de la devise : avant ou après le montant.
+- Conserve les taux de TVA exactement.
+- Ne fusionne jamais deux taux différents.
+- Pour un avoir ou une note de crédit, conserve le titre et les montants tels quels, sans changer de signe ni recalculer.
+- Conserve les mentions de statut : "Payé", "Acquittée", "Soldé", "Reste à payer", "Net à payer", "Échu", "À régler".
+- Ne convertis jamais un montant d'une devise à une autre.
+
+ORDRE
+
+- Chaque appel traite exactement une seule page physique.
+- Ne génère aucun commentaire HTML de pagination.
+- Ne génère jamais de balise <!-- PAGE n -->.
+- Le code appelant ajoute lui-même l'unique balise de page physique.
+- Ne transforme jamais une pagination visible comme "Page 1/1", "Page : 2" ou "2/3" en commentaire HTML.
+- À l'intérieur de la page, utilise order si présent.
+- Si order est absent, respecte l'ordre d'apparition dans l'OCR.
+- Les sections Markdown regroupent les contenus par rôle, mais l'ordre interne de chaque section doit suivre order.
+
+SECTIONS MARKDOWN
+
+Utilise ces sections, dans cet ordre.
+Omettre une section seulement si aucun contenu ne s'y rattache.
+
+## Informations Émetteur (Fournisseur)
+## Informations Client
+## Informations de Livraison
+## Détails de la Facture
+## Tableau des Lignes de Facturation
+## Montants Récapitulatifs
+## Informations de Paiement
+## Mentions Légales et Notes Complémentaires
+
+CLASSEMENT PAR role_hint
+
+Utilise role_hint en priorité.
+N'utilise jamais pos seul pour classer un bloc.
+
+Vers "Informations Émetteur (Fournisseur)" :
+- supplier_identity
+- supplier_address
+- supplier_legal
+- supplier_contact
+- supplier
+
+Vers "Informations Client" :
+- customer_identity
+- customer_address
+- customer_contact
+- customer_legal
+- billing_address
+- customer
+
+Vers "Informations de Livraison" :
+- shipping_address
+- shipping_details
+- shipping_contact
+- delivery_confirmation
+- unknown si le contenu contient clairement une adresse de livraison, une expédition, un transporteur, un retrait, un enlevé au comptoir, une confirmation de livraison ou une instruction de livraison
+
+Vers "Détails de la Facture" :
+- invoice_title
+- invoice_details
+- unknown si le contenu est clairement un titre, une page imprimée, un numéro, une date, une référence, une commande, un vendeur, une devise, un code client, un statut de paiement ou un objet de facture
+
+Vers "Tableau des Lignes de Facturation" :
+- line_items_note
+- line_items
+- line_items_footer
+
+Vers "Montants Récapitulatifs" :
+- tax_summary
+- totals_summary
+- isolated_value si la valeur est proche ou située entre les articles et les récapitulatifs
+- unknown si le contenu est clairement un sous-total, une taxe, un acompte, une remise globale, un solde, un total, un net à payer ou une valeur financière isolée
+
+Vers "Informations de Paiement" :
+- payment_terms
+- bank_details
+- payment
+- unknown si le contenu contient clairement "Echéance", "Montant", "Conditions de Règlement", "Mode de règlement", "Règlement", "Acompte", "CB", "Virement" ou une date d'échéance
+
+Vers "Mentions Légales et Notes Complémentaires" :
+- legal_terms
+- marketing_badge
+- logo_text si le bloc ne permet pas d'identifier l'émetteur
+- stamp_signature
+- qr_barcode_text
+- notes
+- unknown non classable avec certitude
+
+RÈGLES DE CLASSEMENT
+
+- Ne place dans "Informations Client" que le destinataire, facturé à, acheteur, contact client, information légale client ou son adresse de facturation.
+- Ne place pas shipping_address, shipping_details, shipping_contact ou delivery_confirmation dans "Informations Client" si la section "Informations de Livraison" existe.
+- Une adresse de livraison n'est pas une adresse client par défaut : elle va dans "Informations de Livraison".
+- Si la même adresse est visible à la fois dans une zone client et dans une zone livraison, conserve les deux occurrences dans leurs sections respectives.
+- Les blocs "Expédition", "Adresse de livraison", "Livré à", "Transporteur", "Enlevé au comptoir", "Confirmation de Livraison", "Nom" ou "Signature" liés à la livraison vont dans "Informations de Livraison".
+- Ne place jamais un slogan, badge SAV, label qualité, tampon, QR code, texte marketing ou logo secondaire dans "Informations Client".
+- Ne place dans "Informations Émetteur" que l'identité, l'adresse, les coordonnées ou les mentions juridiques du fournisseur.
+- Ne place jamais un badge SAV, slogan, label qualité, pictogramme, QR code ou texte promotionnel dans "Informations Émetteur".
+- marketing_badge, stamp_signature, qr_barcode_text vont dans "Mentions Légales et Notes Complémentaires".
+- logo_text va dans "Informations Émetteur" uniquement si le bloc contient le nom/logo évident de l'émetteur ou s'il correspond clairement à l'identité fournisseur.
+- logo_text va dans "Mentions Légales et Notes Complémentaires" s'il ne permet pas d'identifier l'émetteur.
+- Un bloc unknown proche du client ne devient pas client par proximité.
+- Un bloc unknown proche du fournisseur ne devient pas fournisseur par proximité.
+- Un bloc unknown contenant "Echéance", "Conditions de Règlement", "Mode de règlement", "Règlement", "Acompte", "CB" ou "Virement" va dans "Informations de Paiement".
+- Un texte isolé d'en-tête sans libellé clair va dans "Détails de la Facture" ou dans "Mentions Légales et Notes Complémentaires", jamais dans le client par défaut.
+- Ne déplace jamais une valeur d'un tableau vers un autre tableau.
+- Ne fusionne jamais deux sections parce qu'elles sont proches visuellement.
+
+COMPATIBILITÉ AVEC ANCIENS role_hint
+
+Si l'OCR utilise d'anciens role_hint :
+- supplier -> Informations Émetteur
+- supplier_address -> Informations Émetteur
+- customer -> Informations Client
+- payment -> Informations de Paiement
+- logo_marketing -> Mentions Légales et Notes Complémentaires, sauf si le bloc contient clairement le nom/logo de l'émetteur
+- unknown -> classer par contenu explicite ; sinon Mentions Légales et Notes Complémentaires
+
+BLOCS
+
+- Un [[BLOCK]] devient du texte simple dans la section appropriée.
+- Ne transforme pas un [[BLOCK]] en tableau Markdown.
+- Ne fusionne pas deux [[BLOCK]] ayant des role_hint différents.
+- Conserve les retours à la ligne utiles.
+- Ne supprime aucun bloc non vide.
+- Une valeur isolée doit être conservée.
+- Pour une valeur isolée dans les montants, écrire simplement la valeur ou : Valeur isolée : X
+- Ne crée pas de libellé plus précis que celui fourni par l'OCR.
+- line_items_note doit être rendu en texte simple avant le tableau des articles.
+- line_items_footer doit être rendu en texte simple après le tableau des articles.
+- Ne transforme jamais line_items_note ou line_items_footer en ligne article.
+- Ne transforme jamais line_items_note ou line_items_footer en tableau Markdown sauf si l'OCR les a explicitement marqués [[TABLE]].
+
+TABLEAUX — RÈGLES GÉNÉRALES
+
+- Chaque [[TABLE]] OCR devient un tableau Markdown séparé.
+- Ne fusionne jamais deux [[TABLE]] OCR.
+- Si un tableau de taxes et un tableau de totaux sont deux [[TABLE]] OCR distincts, ils doivent rester séparés.
+- Si l'OCR contient une seule [[TABLE]] mêlant taxes et totaux dans une grille continue, rends cette seule table telle quelle ; ne crée pas une séparation artificielle.
+- Ne fusionne jamais deux groupes d'en-têtes indépendants.
+- Une table Markdown doit avoir un seul groupe logique d'en-têtes.
+- Les cellules sont séparées par <TAB>.
+- Utilise cols=N si présent pour vérifier le nombre de cellules.
+- Chaque ligne Markdown doit avoir le même nombre de cellules que l'en-tête.
+- Si une ligne a moins de cellules que l'en-tête, complète seulement par des cellules vides.
+- Si une ligne a plus de cellules que l'en-tête, ajoute des colonnes [SANS_ENTETE_n] à l'en-tête plutôt que de fusionner ou supprimer des cellules.
+- Si une cellule d'en-tête est vide ou <EMPTY> alors que la colonne contient des valeurs, remplace seulement cette cellule d'en-tête par [SANS_ENTETE_n].
+- Numérote les [SANS_ENTETE_n] de gauche à droite, en recommençant à 1 pour chaque tableau.
+- Ne renomme jamais [SANS_ENTETE_n].
+- Ne remplace jamais [SANS_ENTETE_n] par "Remise", "TVA", "Code", "Taxe" ou autre libellé non visible.
+- Ne crée aucune ligne de tableau entièrement vide.
+- Ne crée aucune ligne composée uniquement de cellules vides.
+- Si un tableau OCR est trop irrégulier pour être converti sûrement, rends ses lignes en texte simple dans la bonne section, cellules séparées par " | ", sans créer de faux tableau Markdown.
+
+TABLEAUX — TABLES SANS DONNÉES
+
+- Ne produis jamais un tableau Markdown avec seulement une ligne d'en-tête et aucune ligne de données.
+- Si une [[TABLE]] OCR ne contient qu'une seule ligne, rends-la en texte simple dans la section appropriée.
+- Ne crée pas de séparateur Markdown |---|---| si aucune ligne de données ne suit.
+- Si un tableau Markdown serait vide après suppression de lignes vides, rends son contenu en texte simple.
+
+TABLEAUX — TABLES SANS EN-TÊTE VISIBLE
+
+- Si la première ligne d'une [[TABLE]] ressemble à une ligne de données et non à un en-tête, ajoute des en-têtes génériques [SANS_ENTETE_n].
+- Indices de ligne de données : libellé financier + montant, par exemple "Sous-total 133.94", "Remise - 0.00", "Total TTC 168.94", "Montant HT (1) 133.94", "TVA (1) : 0.00% 0.00".
+- Ne transforme jamais "Sous-total", "Remise", "Total TTC", "Montant HT", "TVA", "Frais encaissement", "Acompte", "Net à payer" en en-tête de tableau s'ils sont suivis d'un montant sur la même ligne.
+- Pour une table sans en-tête visible, l'en-tête Markdown doit être [SANS_ENTETE_1], [SANS_ENTETE_2], etc.
+
+TABLEAUX — UNITÉS D'EN-TÊTE
+
+- Si la première ligne du corps du tableau contient uniquement des unités, devises ou marqueurs courts comme EUR, €, USD, HT, TTC, %, fusionne ces valeurs dans les en-têtes correspondants avec <br>.
+- Supprime ensuite cette ligne du corps du tableau.
+- Les cellules vides de cette ligne d'unités ne créent pas de colonnes.
+- Exemple : "Prix unit. HT" + ligne "EUR" devient "Prix unit. HT<br>EUR".
+- Exemple : "Total" + ligne "EUR" devient "Total<br>EUR".
+
+TABLEAUX — COLONNES [SANS_ENTETE_n] VIDES
+
+- Si une colonne [SANS_ENTETE_n] est entièrement vide dans toutes les lignes de données, supprime cette colonne du tableau Markdown.
+- Ne supprime jamais une colonne [SANS_ENTETE_n] qui contient au moins une valeur visible.
+- Après suppression d'une colonne [SANS_ENTETE_n] vide, renumérote les colonnes [SANS_ENTETE_n] restantes de gauche à droite.
+- Ne supprime jamais une colonne nommée normalement, même si elle contient des cellules vides.
+
+TABLEAUX — POSITION DES COLONNES DE POURCENTAGE
+
+Applique ces règles uniquement aux tableaux où les valeurs montrent un motif nombre/prix -> pourcentage -> nombre/prix.
+
+- Si les données suivent le motif nombre/prix -> pourcentage -> nombre/prix, mais que l'en-tête [SANS_ENTETE_n] est placé après la deuxième colonne numérique, corrige uniquement l'ordre des en-têtes sans déplacer les valeurs.
+- Exemple mauvais : Px unitaire | Px unitaire remisé | [SANS_ENTETE_1] avec des valeurs 0,870 | 0% | 0,870.
+- Exemple corrigé : Px unitaire | [SANS_ENTETE_1] | Px unitaire remisé.
+- Ne modifie jamais les cellules de données pour cette correction ; seul l'ordre des en-têtes est corrigé.
+- Ne crée pas un libellé "Remise" si ce mot n'est pas visible.
+
+TABLEAUX — RÉPARATION DES LIGNES ARTICLES
+
+Applique ces règles uniquement aux tables role_hint=line_items.
+
+- Identifie les colonnes par leurs en-têtes visibles : référence, désignation, n° de série, quantité, prix, montant, taxe, TVA, code.
+- Une vraie ligne article contient normalement une désignation et au moins une quantité, un prix, un montant, une taxe ou un code TVA.
+- Une ligne qui ne contient ni quantité, ni prix, ni montant, ni taxe, ni code TVA est une note ou une continuation, pas un nouvel article, sauf preuve claire contraire.
+- Dans une table line_items, distingue les vraies lignes articles des métadonnées documentaires.
+- Une métadonnée documentaire a généralement la forme libellé-valeur, instruction, contexte, report, pagination, contact, signature, livraison ou référence de suivi.
+- Si une métadonnée documentaire apparaît avant le premier article réel, rends-la comme texte simple avant le tableau articles.
+- Si elle apparaît après le dernier article réel, rends-la comme texte simple après le tableau articles.
+- Si elle apparaît dans une cellule d'article avec une vraie désignation produit, extrais seulement la métadonnée et conserve la désignation produit dans l'article.
+- Ne laisse pas dans le tableau articles une ligne composée seulement d'une note, d'un contexte, d'une garantie, d'un code-barres secondaire, d'un report, d'un contact ou d'un pied de tableau.
+- Si une ligne de continuation apparaît après un article réel, fusionne-la avec l'article précédent :
+  - valeur de type EAN/GTIN/code-barres numérique long dans la colonne référence -> ajouter à la cellule Référence précédente avec <br> ;
+  - phrase descriptive, garantie, caractéristique produit -> ajouter à la cellule Désignation précédente avec <br> ;
+  - valeur située dans une colonne "N° de Série" -> ajouter à la cellule N° de Série précédente avec <br>.
+- Si la ligne contient à la fois une référence secondaire et une description, rattache chaque valeur à la cellule correspondante de l'article précédent.
+- Ne fusionne jamais une ligne qui contient une quantité, un prix, un montant ou une taxe non vide, sauf si elle est clairement un pied de tableau ou un report.
+- Une ligne de remise, d'avoir ou de correction avec montant négatif est une vraie ligne du tableau : ne la fusionne pas, ne change pas son signe.
+- Après fusion, supprime les lignes de continuation devenues inutiles.
+
+FORMAT DES TABLEAUX MARKDOWN
+
+- Échappe les caractères "|" présents dans les cellules en "\\|".
+- Utilise un séparateur Markdown simple :
+|---|---|
+- N'ajoute pas d'alignement avec ":".
+- Garde les valeurs exactement telles qu'elles sont dans l'OCR.
+- Ne modifie pas les virgules, points, espaces, devises, %, signes, parenthèses comptables ou symboles.
+
+RÈGLES FACTURES
+
+- Le tableau des articles/prestations doit rester dans "Tableau des Lignes de Facturation".
+- Le tableau des articles ne doit contenir que les vraies lignes d'articles/prestations présentes ou réparables depuis l'OCR.
+- line_items_note doit apparaître avant le tableau d'articles.
+- line_items_footer doit apparaître après le tableau d'articles.
+- Les consignes "fin du tableau articles" ne s'appliquent qu'au tableau des articles.
+- Après le tableau des articles, continue toujours avec montants, taxes, totaux, échéances, paiement, livraison, mentions et pied de page.
+- Les tableaux tax_summary et totals_summary doivent rester séparés s'ils sont deux [[TABLE]] distincts.
+- Un montant de taxe reste dans le tableau de taxe.
+- Un total à payer reste dans le tableau de total.
+- Ne place jamais un montant de TVA dans NET A PAYER.
+- Ne place jamais NET A PAYER dans un tableau de TVA.
+- Le montant sous l'en-tête "NET A PAYER", "TOTAL A PAYER", "SOLDE" ou équivalent doit rester sous cet en-tête.
+- Si une valeur semble ambiguë, conserve-la comme valeur isolée plutôt que de l'aligner dans un tableau voisin.
+
+INFORMATIONS DE PAIEMENT
+
+- Les blocs payment_terms, payment et bank_details vont dans "Informations de Paiement".
+- Ne transforme pas un bloc paiement en tableau Markdown sauf si l'OCR l'a explicitement marqué [[TABLE]].
+- Si une table payment_terms ne contient qu'une seule ligne, rends-la en texte simple.
+- Conserve les libellés bancaires exactement : BRED, RIB, IBAN, BIC, Code BIC, échéance, mode de règlement.
+- Ne modifie jamais les espaces des IBAN, BIC, RIB ou références bancaires.
+- Ne rajoute pas d'espace dans un BIC.
+- Ne supprime pas d'espace dans un IBAN.
+
+CONTRÔLE FINAL SILENCIEUX
+
+Avant de répondre, vérifie :
+- La sortie contient uniquement le Markdown final.
+- Il n'y a pas de section "Annexe - OCR brut".
+- Aucun token [[...]], [[/BLOCK]], [[/TABLE]], <TAB>, <EMPTY>, bbox ne reste dans le Markdown.
+- Aucun token <BR> ne reste ; il doit être converti en <br>.
+- Aucun token <SANS_ENTETE_n> ne reste ; il doit être converti en [SANS_ENTETE_n].
+- Aucun [CHAMP MANQUANT] n'a été créé.
+- Les montants, signes, parenthèses comptables, devises et taux sont conservés à l'identique.
+- Tous les [[TABLE]] OCR sont rendus comme des tableaux séparés, sauf les tables à une seule ligne qui sont rendues en texte simple.
+- Aucun tableau Markdown ne contient deux groupes d'en-têtes indépendants.
+- Aucun tableau Markdown ne fusionne taxes et totaux à partir de deux tables distinctes.
+- Aucun tableau Markdown ne contient de ligne entièrement vide.
+- Aucun tableau Markdown ne contient seulement un en-tête sans ligne de données.
+- Les lignes d'unités comme EUR, €, USD, HT, TTC, % ne restent pas comme lignes d'articles.
+- Les colonnes [SANS_ENTETE_n] entièrement vides sont supprimées.
+- Les colonnes [SANS_ENTETE_n] de pourcentage sont placées au bon endroit par rapport aux données.
+- Les blocs marketing, SAV, logo secondaire, QR code, tampon et slogans ne sont ni dans Informations Client ni dans Informations Émetteur.
+- Les informations de livraison sont dans "Informations de Livraison", pas dans "Informations Client", quand elles sont distinguables.
+- customer_contact et customer_legal sont dans Informations Client.
+- line_items_note et line_items_footer sont autour du tableau articles, pas dedans comme lignes articles.
+- Les métadonnées documentaires liées aux articles sont sorties du tableau articles.
+- Les lignes de continuation d'articles ont été fusionnées quand elles ne contenaient ni quantité, ni prix, ni montant, ni taxe.
+- Les informations après les articles sont présentes.
+- Le Markdown respecte les sections demandées.
+"""
 
 
 # =====================
-# Progress (attendu par le runner)
+# Progress / checkpoints (contrat runner)
 # =====================
 
-PIPELINE_VERSION = "qwen-vl-ocr-python-markdown-v4"
 
-
-def _pipeline_fingerprint() -> str:
-    """Identifie tous les réglages susceptibles de modifier le contenu d'une page."""
-    payload = {
-        "pipeline_version": PIPELINE_VERSION,
-        "processor_version": PROCESSOR_VERSION,
-        "model_ocr": MODEL_OCR,
-        "markdown_engine": MODEL_MD,
-        "render_dpi": RENDER_DPI,
-        "high_resolution_images": QWEN_HIGH_RES_IMAGES,
-        "strict_ocr_structure": STRICT_OCR_STRUCTURE,
-        "strict_fused_cell_heuristics": STRICT_FUSED_CELL_HEURISTICS,
-        "allow_safe_structure_repair": ALLOW_SAFE_STRUCTURE_REPAIR,
-        "ocr_prompt_sha256": hashlib.sha256(OCR_PROMPT.encode("utf-8")).hexdigest(),
-        "renderer_contract": "exact-atom-roundtrip-v4",
-    }
-    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-PIPELINE_FINGERPRINT = _pipeline_fingerprint()
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
 def get_pipeline_fingerprint() -> str:
-    """Retourne l'empreinte publique du pipeline attendue par le runner."""
-    return PIPELINE_FINGERPRINT
+    payload = {
+        "pipeline_version": PIPELINE_VERSION,
+        "cleaner_version": CLEANER_VERSION,
+        "api_url": API_URL,
+        "model_ocr": MODEL_OCR,
+        "model_md": MODEL_MD,
+        "render_dpi": RENDER_DPI,
+        "high_resolution": QWEN_HIGH_RES_IMAGES,
+        "max_tokens_ocr": MAX_TOKENS_OCR,
+        "max_tokens_md": MAX_TOKENS_MD,
+        "temperature": TEMPERATURE,
+        "thinking_ocr": ENABLE_THINKING_OCR,
+        "thinking_md": ENABLE_THINKING_MD,
+        "heuristic_header_reorder": ENABLE_HEURISTIC_HEADER_REORDER,
+        "ocr_prompt_sha256": _sha256_text(OCR_PROMPT),
+        "md_prompt_sha256": _sha256_text(SYSTEM_PROMPT_MD),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def get_progress_path(pdf_path: str) -> str:
-    """Retourne le chemin public du checkpoint attendu par le runner."""
-    # Un nouveau processeur ne doit jamais reprendre des pages produites par une
-    # ancienne logique OCR/Markdown.
-    return str(Path(pdf_path).with_suffix(f".{_PROCESSOR_VERSION_SAFE}.progress.json"))
+    return str(Path(pdf_path).with_suffix(".progress.json"))
 
 
 def _progress_path(pdf_path: str) -> str:
-    """Alias interne conservé pour éviter toute régression dans le module."""
     return get_progress_path(pdf_path)
+
+
+def _checkpoint_page_hashes(pages: Dict[str, Dict]) -> Dict[str, str]:
+    hashes: Dict[str, str] = {}
+    for page_key, record in (pages or {}).items():
+        if isinstance(record, dict) and isinstance(record.get("markdown"), str):
+            hashes[str(page_key)] = _sha256_text(record["markdown"])
+    return hashes
+
+
+def _valid_checkpoint_page_record(page_key: str, value: Any, page_count: Optional[int]) -> bool:
+    try:
+        page_num = int(page_key)
+    except Exception:
+        return False
+    if page_num < 1 or (page_count is not None and page_num > int(page_count)):
+        return False
+    if not isinstance(value, dict):
+        return False
+    markdown = value.get("markdown")
+    stats = value.get("stats")
+    if not isinstance(markdown, str) or not markdown.strip() or not isinstance(stats, dict):
+        return False
+    try:
+        _validate_single_page_artifact(markdown, page_num)
+    except Exception as exc:
+        _log(f"⚠️ Checkpoint: page {page_num} ignorée ({exc}).")
+        return False
+    return True
+
 
 def load_progress(
     pdf_path: str,
     expected_source_id: Optional[str] = None,
     expected_page_count: Optional[int] = None,
+    expected_pipeline_fingerprint: Optional[str] = None,
 ) -> Dict[str, Dict]:
-    p = _progress_path(pdf_path)
-    if not os.path.exists(p):
+    path = _progress_path(pdf_path)
+    if not os.path.exists(path):
         return {}
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, dict) or data.get("processor_version") != PROCESSOR_VERSION:
-            _log("⚠️ Checkpoint ignoré : version du processeur différente ou absente.")
-            return {}
-
-        if "pages" in data and isinstance(data["pages"], dict):
-            if data.get("pipeline_fingerprint") != PIPELINE_FINGERPRINT:
-                _log(
-                    "⚠️ Checkpoint ignoré : il provient d'une autre version du pipeline, "
-                    "d'un autre modèle ou d'un autre réglage qualité."
-                )
-                return {}
-
-            if expected_source_id is not None and data.get("source_id") != expected_source_id:
-                _log("⚠️ Checkpoint ignoré : il ne correspond pas à cette version du PDF.")
-                return {}
-
-            if expected_page_count is not None:
-                saved_page_count = data.get("page_count")
-                if saved_page_count is None or int(saved_page_count) != int(expected_page_count):
-                    _log("⚠️ Checkpoint ignoré : nombre de pages différent du PDF courant.")
-                    return {}
-
-            return data["pages"]
-
-        # Un ancien checkpoint ne contient ni empreinte du pipeline ni garanties
-        # suffisantes. Il est volontairement ignoré pour éviter de réutiliser un OCR
-        # produit avant les contrôles qualité stricts.
-        if isinstance(data, dict):
-            _log("⚠️ Ancien checkpoint ignoré : qualité et version non vérifiables.")
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        _log(f"⚠️ Checkpoint illisible ignoré: {exc}")
         return {}
-    except Exception:
+
+    if not isinstance(data, dict) or not isinstance(data.get("pages"), dict):
+        _log("⚠️ Ancien checkpoint ignoré : format sans métadonnées vérifiables.")
         return {}
+
+    current_fingerprint = expected_pipeline_fingerprint or get_pipeline_fingerprint()
+    checks = [
+        (data.get("checkpoint_version") == CHECKPOINT_VERSION, "version de checkpoint"),
+        (data.get("pipeline_version") == PIPELINE_VERSION, "version de pipeline"),
+        (data.get("pipeline_fingerprint") == current_fingerprint, "empreinte du pipeline"),
+    ]
+    if expected_source_id is not None:
+        checks.append((data.get("source_id") == expected_source_id, "identité du PDF"))
+    if expected_page_count is not None:
+        try:
+            same_page_count = int(data.get("page_count")) == int(expected_page_count)
+        except Exception:
+            same_page_count = False
+        checks.append((same_page_count, "nombre de pages"))
+
+    failed = [label for ok, label in checks if not ok]
+    if failed:
+        _log("⚠️ Checkpoint ignoré : incompatibilité sur " + ", ".join(failed) + ".")
+        return {}
+
+    pages = data["pages"]
+    stored_hashes = data.get("page_markdown_sha256")
+    if not isinstance(stored_hashes, dict):
+        _log("⚠️ Checkpoint ignoré : empreintes des pages absentes.")
+        return {}
+    actual_hashes = _checkpoint_page_hashes(pages)
+    normalized_stored_hashes = {str(key): str(value) for key, value in stored_hashes.items()}
+    if actual_hashes != normalized_stored_hashes:
+        _log("⚠️ Checkpoint ignoré : contenu d'une page altéré ou incomplet.")
+        return {}
+
+    validated: Dict[str, Dict] = {}
+    for page_key, value in pages.items():
+        if _valid_checkpoint_page_record(page_key, value, expected_page_count):
+            validated[str(int(page_key))] = value
+    return validated
+
 
 def save_progress(
     pdf_path: str,
     completed_pages: Dict[str, Dict],
     source_id: Optional[str] = None,
     page_count: Optional[int] = None,
+    pipeline_fingerprint: Optional[str] = None,
 ) -> None:
-    p = _progress_path(pdf_path)
-    tmp = p + ".tmp"
+    path = _progress_path(pdf_path)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path + ".tmp"
     payload = {
-        "version": 3,
-        "processor_version": PROCESSOR_VERSION,
+        "checkpoint_version": CHECKPOINT_VERSION,
         "pipeline_version": PIPELINE_VERSION,
-        "pipeline_fingerprint": PIPELINE_FINGERPRINT,
+        "pipeline_fingerprint": pipeline_fingerprint or get_pipeline_fingerprint(),
         "source_id": source_id,
         "page_count": int(page_count) if page_count is not None else None,
+        "models": {"ocr": MODEL_OCR, "markdown": MODEL_MD},
+        "render_dpi": RENDER_DPI,
+        "qwen_high_resolution_images": QWEN_HIGH_RES_IMAGES,
+        "heuristic_header_reorder": ENABLE_HEURISTIC_HEADER_REORDER,
+        "prompt_sha256": {
+            "ocr": _sha256_text(OCR_PROMPT),
+            "markdown": _sha256_text(SYSTEM_PROMPT_MD),
+        },
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "page_markdown_sha256": _checkpoint_page_hashes(completed_pages),
         "pages": completed_pages,
     }
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-    os.replace(tmp, p)
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
 
 def clear_progress(pdf_path: str) -> None:
-    p = _progress_path(pdf_path)
+    path = _progress_path(pdf_path)
     try:
-        if os.path.exists(p):
-            os.remove(p)
-    except Exception:
-        pass
-
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as exc:
+        _log(f"⚠️ Impossible de supprimer le checkpoint local: {exc}")
 
 # =====================
 # PDF info (attendu par le runner)
@@ -907,16 +1500,11 @@ def _supports_thinking_toggle(model: str) -> bool:
     )
 
 def _strip_triple_backticks(text: str) -> str:
-    """Retire un éventuel fence englobant de longueur 3 ou plus, sans toucher au contenu interne."""
-    t = (text or "").strip()
-    opening = re.match(r"^(?P<fence>`{3,}|~{3,})(?:[A-Za-z0-9_-]+)?[ \t]*\n", t)
-    if not opening:
-        return t.strip("\n")
-    fence = opening.group("fence")
-    closing = re.search(r"\n" + re.escape(fence) + r"[ \t]*$", t)
-    if not closing or closing.start() < opening.end():
-        return t.strip("\n")
-    return t[opening.end():closing.start()].strip("\n")
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t)
+    return t.strip("\n")
 
 def _strip_existing_ocr_appendix(md: str) -> str:
     m = re.search(r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$", md, flags=re.IGNORECASE | re.MULTILINE)
@@ -924,1171 +1512,308 @@ def _strip_existing_ocr_appendix(md: str) -> str:
         return md.strip()
     return md[:m.start()].rstrip()
 
+def _remove_empty_md_table_rows(md: str) -> str:
+    """Supprime uniquement les lignes de tableau dont toutes les cellules sont vides."""
+    output: List[str] = []
+    for line in (md or "").splitlines():
+        if _is_md_table_row(line) and not _is_md_separator_row(line):
+            cells = _split_md_cells(line)
+            if cells and all(cell.strip() == "" for cell in cells):
+                continue
+        output.append(line)
+    return "\n".join(output)
+
+
 def _normalize_sans_entete_tokens(text: str) -> str:
-    """
-    Normalise les erreurs de forme du modèle : <SANS_ENTETE_1>
-    devient [SANS_ENTETE_1]. Applicable OCR + Markdown.
-    """
     if not text:
         return text
     return re.sub(r"<SANS_ENTETE_(\d+)>", r"[SANS_ENTETE_\1]", text)
 
 
+def _normalize_markdown_tokens(md: str) -> str:
+    if not md:
+        return md
+    md = _normalize_sans_entete_tokens(md)
+    md = md.replace("<BR>", "<br>")
+    md = md.replace("<EMPTY>", "")
+    md = md.replace("<TAB>", "    ")
+    return md
+
+
 def _is_md_table_row(line: str) -> bool:
-    return bool(re.match(r"^\|.*\|\s*$", line or ""))
-
-
-def _is_md_separator_row(line: str) -> bool:
-    return bool(re.match(r"^\|[\s:\-|]+\|\s*$", line or ""))
+    return bool(re.match(r"^\s*\|.*\|\s*$", line or ""))
 
 
 def _split_md_cells(line: str) -> List[str]:
-    """
-    Découpe une ligne de tableau Markdown en respectant les pipes échappés.
-    """
+    """Découpe une ligne Markdown sans couper les pipes échappés."""
     raw = (line or "").strip()
     if raw.startswith("|"):
         raw = raw[1:]
     if raw.endswith("|"):
         raw = raw[:-1]
-
     cells: List[str] = []
-    buf: List[str] = []
+    buffer: List[str] = []
     escaped = False
-
-    for ch in raw:
+    for char in raw:
         if escaped:
-            # On garde l'échappement pour ne pas modifier la valeur visible.
-            buf.append("\\" + ch)
+            buffer.append("\\" + char)
             escaped = False
-            continue
-        if ch == "\\":
+        elif char == "\\":
             escaped = True
-            continue
-        if ch == "|":
-            cells.append("".join(buf).strip())
-            buf = []
+        elif char == "|":
+            cells.append("".join(buffer).strip())
+            buffer = []
         else:
-            buf.append(ch)
-
+            buffer.append(char)
     if escaped:
-        buf.append("\\")
-
-    cells.append("".join(buf).strip())
+        buffer.append("\\")
+    cells.append("".join(buffer).strip())
     return cells
+
+
+def _is_md_separator_row(line: str) -> bool:
+    if not _is_md_table_row(line):
+        return False
+    cells = _split_md_cells(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
 
 
 def _build_md_row(cells: List[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
-def _build_md_separator(n: int) -> str:
-    return "| " + " | ".join(["---"] * max(n, 1)) + " |"
+def _build_md_separator(count: int) -> str:
+    return "| " + " | ".join(["---"] * max(1, count)) + " |"
 
 
-
-# =====================
-# Validation OCR structurée et rendu Markdown Python déterministe
-# =====================
-
-OCR_OPEN_TAG_RE = re.compile(r"^\s*\[\[(BLOCK|TABLE)\s+(.+?)\]\]\s*$", re.IGNORECASE)
-OCR_CLOSE_TAG_RE = re.compile(r"^\s*\[\[/(BLOCK|TABLE)\]\]\s*$", re.IGNORECASE)
-OCR_ANY_TAG_RE = re.compile(r"\[\[(?:/?(?:BLOCK|TABLE)|(?:PDF_)?PAGE)\b", re.IGNORECASE)
-_GENERIC_HEADER_RE = re.compile(r"\[SANS_ENTETE_(\d+)\]", re.IGNORECASE)
-_ALLOWED_ATTRS = {"id", "order", "pos", "role_hint", "cols", "bbox"}
-
-_ALLOWED_POSITIONS = {
-    "top-left", "top", "top-right",
-    "middle-left", "middle", "middle-right",
-    "bottom-left", "bottom", "bottom-right", "unknown",
-}
-
-_ALLOWED_ROLES = {
-    "supplier_identity", "supplier_address", "supplier_legal", "supplier_contact", "supplier",
-    "customer_identity", "customer_address", "customer_contact", "customer_legal", "customer",
-    "billing_address", "shipping_address", "shipping_details", "shipping_contact",
-    "delivery_confirmation", "invoice_title", "invoice_details", "line_items",
-    "line_items_note", "line_items_footer", "tax_summary", "totals_summary",
-    "payment_terms", "bank_details", "payment", "legal_terms", "marketing_badge",
-    "logo_text", "logo_marketing", "stamp_signature", "qr_barcode_text", "notes",
-    "isolated_value", "unknown",
-}
-
-_SECTION_ORDER = [
-    "## Informations Émetteur (Fournisseur)",
-    "## Informations Client",
-    "## Informations de Livraison",
-    "## Détails de la Facture",
-    "## Tableau des Lignes de Facturation",
-    "## Montants Récapitulatifs",
-    "## Informations de Paiement",
-    "## Mentions Légales et Notes Complémentaires",
-]
-
-_SECTION_INDEX = {title: index for index, title in enumerate(_SECTION_ORDER)}
-
-_UNIT_MARKERS = {
-    "EUR", "€", "EUROS", "USD", "$", "CHF", "GBP", "£", "CAD", "AUD", "JPY", "¥",
-    "HT", "TTC", "%", "U", "UN", "UNIT", "UNITE", "UNITÉ", "PCS", "PC", "PCE",
-    "KG", "G", "MG", "L", "ML", "M", "M2", "M²", "M3", "M³", "MTR", "CM", "MM",
-    "H", "HEURE", "HEURES", "J", "JOUR", "JOURS",
-}
-
-_LINE_ITEM_COMMERCIAL_TERMS = (
-    "QTE", "QUANT", "NOMBRE", "NB", "PRIX", "MONTANT", "TOTAL", "TVA", "TAXE", "TAUX",
-    "REMISE", "RABAIS", "P.U", "PU ", "UNITAIRE", "UNIT PRICE", "CODE TVA", "CODE TAXE",
-    "HT", "TTC", "COUT", "COÛT",
-)
-_LINE_ITEM_DESCRIPTION_TERMS = ("DESIGN", "DÉSIGN", "DESCRIPTION", "LIBELLE", "LIBELLÉ", "PRESTATION", "ARTICLE", "PRODUIT", "SERVICE")
-_LINE_ITEM_REFERENCE_TERMS = ("REFERENCE", "RÉFÉRENCE", "REF", "ARTICLE", "SKU", "CODE ARTICLE")
-_LINE_ITEM_SERIAL_TERMS = ("SERIE", "SÉRIE", "SERIAL", "EAN", "GTIN", "LOT")
+def _collect_table(lines: List[str], start: int) -> Tuple[List[str], List[List[str]], int]:
+    header = _split_md_cells(lines[start])
+    cursor = start + 2
+    rows: List[List[str]] = []
+    while cursor < len(lines) and _is_md_table_row(lines[cursor]) and not _is_md_separator_row(lines[cursor]):
+        rows.append(_split_md_cells(lines[cursor]))
+        cursor += 1
+    return header, rows, cursor
 
 
-def _strip_accents(value: str) -> str:
-    return "".join(
-        ch for ch in unicodedata.normalize("NFD", value or "")
-        if unicodedata.category(ch) != "Mn"
-    )
+def _placeholder_indexes(header: List[str]) -> Iterable[int]:
+    for index, value in enumerate(header):
+        stripped = value.strip()
+        if stripped == "" or re.fullmatch(r"\[SANS_ENTETE_\d+\]", stripped):
+            yield index
 
 
-def _normalize_label(value: str) -> str:
-    value = _strip_accents(value or "").upper()
-    value = value.replace("<BR>", " ").replace("<EMPTY>", " ")
-    return re.sub(r"\s+", " ", value).strip()
+def _renumber_placeholders(header: List[str]) -> List[str]:
+    result = list(header)
+    counter = 1
+    for index in _placeholder_indexes(result):
+        result[index] = f"[SANS_ENTETE_{counter}]"
+        counter += 1
+    return result
 
 
-_UNIT_MARKERS_NORMALIZED = frozenset(_normalize_label(value) for value in _UNIT_MARKERS)
-
-
-def _normalize_technical_tokens(text: str) -> str:
-    """Normalise uniquement des variantes techniques, jamais le texte comptable."""
-    if not text:
-        return text
-    text = re.sub(r"<SANS_ENTETE_(\d+)>", r"[SANS_ENTETE_\1]", text, flags=re.IGNORECASE)
-    return text
-
-
-def _parse_tag_attributes_strict(raw: str, line_no: int) -> Tuple[Dict[str, str], List[str]]:
-    attrs: Dict[str, str] = {}
-    errors: List[str] = []
-    try:
-        tokens = shlex.split(raw or "", posix=True)
-    except ValueError as exc:
-        return {}, [f"ligne {line_no}: attributs de balise illisibles: {exc}"]
-
-    for token in tokens:
-        if "=" not in token:
-            errors.append(f"ligne {line_no}: attribut sans '=': {token!r}")
+def _visible_table_values(header: List[str], rows: List[List[str]]) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for value in [*header, *(cell for row in rows for cell in row)]:
+        stripped = value.strip()
+        if not stripped or re.fullmatch(r"\[SANS_ENTETE_\d+\]", stripped):
             continue
-        key, value = token.split("=", 1)
-        key = key.strip().lower()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key):
-            errors.append(f"ligne {line_no}: nom d'attribut invalide {key!r}")
-            continue
-        if key in attrs:
-            errors.append(f"ligne {line_no}: attribut dupliqué {key}")
-            continue
-        if key not in _ALLOWED_ATTRS:
-            errors.append(f"ligne {line_no}: attribut non autorisé {key}")
-            continue
-        attrs[key] = value
-    return attrs, errors
+        counter[stripped] += 1
+    return counter
 
 
-def _parse_bbox(value: str, line_no: int) -> Tuple[Optional[Tuple[int, int, int, int]], List[str]]:
-    if not value:
-        return None, []
-    errors: List[str] = []
-    parts = [part.strip() for part in value.split(",")]
-    if len(parts) != 4 or any(not re.fullmatch(r"\d{1,4}", part) for part in parts):
-        return None, [f"ligne {line_no}: bbox invalide {value!r}; format attendu x1,y1,x2,y2"]
-    coords = tuple(int(part) for part in parts)
-    x1, y1, x2, y2 = coords
-    if any(coord < 0 or coord > 1000 for coord in coords):
-        errors.append(f"ligne {line_no}: bbox hors intervalle 0-1000: {value!r}")
-    if x1 >= x2 or y1 >= y2:
-        errors.append(f"ligne {line_no}: bbox non croissante: {value!r}")
-    return coords, errors
-
-
-def _parse_structured_ocr(text: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
-    raw = (text or "").strip()
-    if raw == "[PAGE VIDE]":
-        return [], [], []
-
-    items: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    warnings: List[str] = []
-    active: Optional[Dict[str, Any]] = None
-
-    for line_no, raw_line in enumerate(raw.splitlines(), start=1):
-        line = raw_line.rstrip("\r")
-        open_match = OCR_OPEN_TAG_RE.match(line)
-        close_match = OCR_CLOSE_TAG_RE.match(line)
-
-        if open_match:
-            if active is not None:
-                errors.append(
-                    f"ligne {line_no}: ouverture {open_match.group(1).upper()} avant fermeture de {active['kind']}"
-                )
-                continue
-            kind = open_match.group(1).upper()
-            attrs, attr_errors = _parse_tag_attributes_strict(open_match.group(2), line_no)
-            errors.extend(attr_errors)
-            active = {
-                "kind": kind,
-                "attrs": attrs,
-                "lines": [],
-                "start_line": line_no,
-            }
-            continue
-
-        if close_match:
-            close_kind = close_match.group(1).upper()
-            if active is None:
-                errors.append(f"ligne {line_no}: fermeture [[/{close_kind}]] sans ouverture")
-                continue
-            if close_kind != active["kind"]:
-                errors.append(
-                    f"ligne {line_no}: fermeture [[/{close_kind}]] alors que {active['kind']} est ouvert"
-                )
-                # Ne pas rattacher la suite au mauvais élément.
-                active = None
-                continue
-            active["end_line"] = line_no
-            items.append(active)
-            active = None
-            continue
-
-        if active is None:
-            if line.strip():
-                errors.append(f"ligne {line_no}: texte hors [[BLOCK]]/[[TABLE]]: {line.strip()[:100]}")
-            continue
-
-        active["lines"].append(line.rstrip())
-
-    if active is not None:
-        errors.append(f"ligne {active['start_line']}: {active['kind']} non fermé en fin de réponse")
-
-    return items, errors, warnings
-
-
-def _looks_like_fused_vat_cell(value: str) -> bool:
-    v = (value or "").strip()
-    if not v or "%" in v or re.search(r"[A-Za-z€$£¥]", v):
-        return False
-    # Exemples suspects : 12,00 2 ; 55.80 0 ; (12,00) 2.
-    return bool(re.fullmatch(r"[-+−]?\(?\d[\d\s.,']*\)?\s+\d{1,2}", v))
-
-
-def _quantity_fusion_signature(value: str) -> Optional[Tuple[str, str]]:
-    v = (value or "").strip()
-    match = re.fullmatch(
-        r"([-+−]?\d{1,5}(?:[.,]\d+)?)\s+([-+−]?\d+(?:[.,]\d+)?)(?:\s+[A-Za-zÀ-ÿ²³]{1,10})?",
-        v,
-    )
-    if not match:
-        return None
-    return match.group(1), match.group(2)
-
-
-def _row_header_score(row: List[str]) -> int:
-    joined = " | ".join(_normalize_label(cell) for cell in row)
-    terms = (
-        "REFERENCE", "DESIGNATION", "DESCRIPTION", "QTE", "QUANTITE", "PRIX", "MONTANT",
-        "TVA", "TAXE", "DATE", "FACTURE", "CLIENT", "ECHEANCE", "CODE", "LIBELLE",
-        "IBAN", "BIC", "MODE DE REGLEMENT", "TOTAL", "TAUX", "BASE",
-    )
-    return sum(1 for term in terms if term in joined)
-
-
-def _table_has_header(item: Dict[str, Any], rows: List[List[str]]) -> bool:
-    if not rows:
-        return False
-    role = (item.get("attrs", {}).get("role_hint") or "unknown").lower()
-    first = rows[0]
-    if any(_GENERIC_HEADER_RE.fullmatch((cell or "").strip()) for cell in first):
-        return True
-    if role in {"line_items", "invoice_details", "tax_summary"}:
-        return True
-    score = _row_header_score(first)
-    first_norm = " | ".join(_normalize_label(cell) for cell in first)
-    looks_financial_data = any(
-        token in first_norm
-        for token in ("TOTAL HT", "TOTAL TTC", "NET A PAYER", "SOLDE A PAYER", "SOUS-TOTAL", "ACOMPTE")
-    ) and any(re.search(r"\d", cell or "") for cell in first)
-    if role == "totals_summary":
-        return score >= 2 and not looks_financial_data
-    return score >= 2 and not looks_financial_data
-
-
-def _is_unit_only_row(row: List[str]) -> bool:
-    nonempty = []
-    for cell in row:
-        value = (cell or "").strip()
-        if value in {"", "<EMPTY>"}:
-            continue
-        segments = [segment.strip() for segment in value.split("<BR>") if segment.strip()]
-        nonempty.extend(segments)
-    if not nonempty:
-        return False
-    return all(_normalize_label(value) in _UNIT_MARKERS_NORMALIZED for value in nonempty)
-
-
-def _header_indexes(header: List[str], terms: Tuple[str, ...], *, exclude: Tuple[str, ...] = ()) -> List[int]:
-    indexes: List[int] = []
-    for idx, cell in enumerate(header):
-        normalized = _normalize_label(cell)
-        if any(term in normalized for term in terms) and not any(term in normalized for term in exclude):
-            indexes.append(idx)
-    return indexes
-
-
-def _line_item_indexes(header: List[str]) -> Dict[str, List[int]]:
-    return {
-        "commercial": _header_indexes(header, _LINE_ITEM_COMMERCIAL_TERMS),
-        "description": _header_indexes(header, _LINE_ITEM_DESCRIPTION_TERMS),
-        "reference": _header_indexes(header, _LINE_ITEM_REFERENCE_TERMS, exclude=("TVA", "TAXE")),
-        "serial": _header_indexes(header, _LINE_ITEM_SERIAL_TERMS),
-    }
-
-
-def _is_long_identifier(value: str) -> bool:
-    compact = re.sub(r"[\s-]", "", (value or "").strip())
-    return bool(re.fullmatch(r"\d{8,18}", compact))
-
-
-def _line_item_continuation_action(
-    row: List[str],
-    indexes: Dict[str, List[int]],
-    has_previous: bool,
-) -> Tuple[str, List[int]]:
-    """Renvoie ('merge'|'data'|'error', indexes à fusionner)."""
-    nonempty = [
-        idx for idx, cell in enumerate(row)
-        if (cell or "").strip() not in {"", "<EMPTY>"}
-    ]
-    if not nonempty:
-        return "error", []
-
-    commercial = set(indexes["commercial"])
-    if any(idx in commercial for idx in nonempty):
-        return "data", []
-
-    if not has_previous:
-        return "error", []
-
-    description = set(indexes["description"])
-    serial = set(indexes["serial"])
-    reference = set(indexes["reference"])
-    allowed = description | serial
-
-    # Une continuation purement descriptive ou de numéro de série est sûre.
-    if set(nonempty).issubset(allowed) and nonempty:
-        return "merge", nonempty
-
-    # Un identifiant long seul dans la colonne référence est un EAN/GTIN probable.
-    if len(nonempty) == 1 and nonempty[0] in reference and _is_long_identifier(row[nonempty[0]]):
-        return "merge", nonempty
-
-    return "error", []
-
-
-def _validate_line_item_continuations(item: Dict[str, Any], rows: List[List[str]]) -> List[str]:
-    if len(rows) < 2:
-        return []
-    table_id = item.get("attrs", {}).get("id", "?")
-    header = rows[0]
-    indexes = _line_item_indexes(header)
-    if not indexes["commercial"]:
-        # Certaines factures présentent une liste descriptive et portent les montants
-        # uniquement dans un récapitulatif séparé. On conserve alors chaque ligne telle quelle.
-        return []
-    if not (indexes["description"] or indexes["reference"]):
-        return [f"table {table_id}: aucune colonne référence/désignation identifiable dans line_items"]
-
-    errors: List[str] = []
-    has_previous = False
-    for row_index, row in enumerate(rows[1:], start=2):
-        action, _ = _line_item_continuation_action(row, indexes, has_previous)
-        if action == "data":
-            has_previous = True
-        elif action == "merge":
-            continue
-        else:
-            preview = " | ".join(cell for cell in row if cell and cell != "<EMPTY>")[:160]
-            errors.append(
-                f"table {table_id} ligne logique {row_index}: ligne sans valeur commerciale ambiguë; "
-                f"Qwen devait la placer dans un BLOCK ou la rattacher explicitement avec <BR>: {preview!r}"
-            )
-    return errors
-
-
-def _validate_semantic_table_risks(item: Dict[str, Any], rows: List[List[str]]) -> List[str]:
-    errors: List[str] = []
-    role = (item.get("attrs", {}).get("role_hint") or "unknown").lower()
-    table_id = item.get("attrs", {}).get("id", "?")
-    flat = " | ".join(cell for row in rows for cell in row)
-    flat_norm = _normalize_label(flat)
-
-    if role == "tax_summary":
-        tax_markers = any(token in flat_norm for token in ("CODES TVA", "CODE TVA", "EXONERE", "SOUMIS", "TAUX TVA", "BASE TVA"))
-        total_markers = any(token in flat_norm for token in ("NET A PAYER", "TOTAL TTC", "SOLDE A PAYER", "AMOUNT DUE"))
-        if tax_markers and total_markers:
-            errors.append(f"table {table_id}: probable fusion du tableau TVA avec le tableau des totaux")
-        elif tax_markers and "TOTAL HT" in flat_norm and rows and len(rows[0]) >= 7:
-            errors.append(f"table {table_id}: TOTAL HT semble fusionné horizontalement au tableau TVA")
-
-    if role == "totals_summary":
-        if "CODES TVA" in flat_norm or ("EXONERE" in flat_norm and "SOUMIS" in flat_norm):
-            errors.append(f"table {table_id}: probable fusion du tableau des totaux avec le tableau TVA")
-
-    if role != "line_items" or len(rows) < 2:
-        return errors
-
-    header = [_normalize_label(cell) for cell in rows[0]]
-    data_rows = rows[1:]
-    quantity_indexes = [
-        idx for idx, name in enumerate(header)
-        if any(token in name for token in ("QTE", "QUANTITE", "QUANTITY", "NOMBRE"))
-    ]
-    vat_indexes = [
-        idx for idx, name in enumerate(header)
-        if name in {"TVA", "T", "TX", "TAX", "TAXE", "CODE TVA", "CODE TAXE"}
-        or "CODE TVA" in name or "CODE TAXE" in name
-    ]
-
-    if STRICT_FUSED_CELL_HEURISTICS:
-        for idx in vat_indexes:
-            suspicious = [row[idx] for row in data_rows if idx < len(row) and _looks_like_fused_vat_cell(row[idx])]
-            if suspicious:
-                preview = ", ".join(repr(value) for value in suspicious[:4])
-                errors.append(
-                    f"table {table_id}: montant et code TVA probablement fusionnés dans la colonne {idx + 1}: {preview}"
-                )
-
-        for idx in quantity_indexes:
-            signatures: List[Tuple[str, str, str]] = []
-            for row in data_rows:
-                if idx >= len(row):
-                    continue
-                signature = _quantity_fusion_signature(row[idx])
-                if signature:
-                    signatures.append((signature[0], signature[1], row[idx]))
-            if len(signatures) >= 2:
-                first_values = [value[0] for value in signatures]
-                repeated_prefix = len(set(first_values)) < len(first_values)
-                second_has_decimal_or_unit_pattern = any(
-                    re.search(r"[,.]", value[1]) or len(re.sub(r"\D", "", value[1])) <= 3
-                    for value in signatures
-                )
-                if repeated_prefix or second_has_decimal_or_unit_pattern:
-                    preview = ", ".join(repr(value[2]) for value in signatures[:5])
-                    errors.append(
-                        f"table {table_id}: plusieurs quantités semblent contenir deux colonnes fusionnées: {preview}"
-                    )
-
-    # Un second groupe d'en-têtes au milieu d'une table est un signe de fusion de zones.
-    for row_index, row in enumerate(data_rows, start=2):
-        if _row_header_score(row) >= 3 and not any(re.search(r"\d", cell or "") for cell in row):
-            errors.append(f"table {table_id} ligne logique {row_index}: second groupe d'en-têtes probable")
-            break
-
-    errors.extend(_validate_line_item_continuations(item, rows))
-    return errors
-
-
-def _validate_table_columns(item: Dict[str, Any], rows: List[List[str]]) -> List[str]:
-    errors: List[str] = []
-    role = (item.get("attrs", {}).get("role_hint") or "unknown").lower()
-    table_id = item.get("attrs", {}).get("id", "?")
-    if not rows:
-        return errors
-    has_header = _table_has_header(item, rows)
-    if not has_header:
-        return errors
-
-    header = rows[0]
-    data_rows = rows[1:]
-    for idx, header_cell in enumerate(header):
-        h = (header_cell or "").strip()
-        unnamed = h in {"", "<EMPTY>"} or bool(_GENERIC_HEADER_RE.fullmatch(h))
-        if not unnamed:
-            continue
-        values = [
-            (row[idx] or "").strip() if idx < len(row) else ""
-            for row in data_rows
-        ]
-        if values and all(value in {"", "<EMPTY>"} for value in values):
-            errors.append(
-                f"table {table_id}: colonne {idx + 1} sans en-tête et entièrement vide; "
-                "elle ne devait pas être créée"
-            )
-
-    if role == "line_items":
-        normalized = " | ".join(_normalize_label(cell) for cell in header)
-        if not any(term in normalized for term in ("DESIGN", "DESCRIPTION", "LIBELLE", "REFERENCE", "ARTICLE")):
-            errors.append(f"table {table_id}: en-tête line_items sans référence ni désignation")
-    return errors
-
-
-def validate_structured_ocr(text: str) -> Dict[str, Any]:
-    """Valide la sortie OCR avant tout rendu. Aucune valeur visible n'est réparée ici."""
-    raw = _normalize_technical_tokens((text or "").strip())
-    errors: List[str] = []
-    warnings: List[str] = []
-
-    if not raw:
-        return {"ok": False, "errors": ["réponse OCR vide"], "warnings": [], "items": [], "page_empty": False}
-
-    if raw == "[PAGE VIDE]":
-        return {"ok": True, "errors": [], "warnings": [], "items": [], "page_empty": True}
-
-    if "[PAGE VIDE]" in raw:
-        errors.append("[PAGE VIDE] ne peut pas être mélangé à d'autres contenus")
-    if len(raw) < OCR_MIN_CHARS:
-        errors.append(f"OCR anormalement court: {len(raw)} caractères")
-    if "\x00" in raw:
-        errors.append("caractère NUL interdit dans l'OCR")
-    if "\t" in raw:
-        errors.append("tabulation littérale interdite; Qwen doit utiliser <TAB>")
-    if re.search(r"^\s*\[\[(?:PDF_)?PAGE\b", raw, flags=re.IGNORECASE | re.MULTILINE):
-        errors.append("token de pagination technique interdit dans la sortie OCR")
-
-    items, parse_errors, parse_warnings = _parse_structured_ocr(raw)
-    errors.extend(parse_errors)
-    warnings.extend(parse_warnings)
-
-    seen_ids: set[Tuple[str, str]] = set()
-    seen_orders: set[int] = set()
-    appearance_orders: List[int] = []
-
-    for item in items:
-        kind = item["kind"]
-        attrs = item.get("attrs", {})
-        start_line = int(item.get("start_line", 0) or 0)
-        item_id = attrs.get("id", "")
-        order_raw = attrs.get("order", "")
-        pos = attrs.get("pos", "")
-        role = attrs.get("role_hint", "").lower()
-        attrs["role_hint"] = role
-
-        required = ["id", "order", "pos", "role_hint"] + (["cols"] if kind == "TABLE" else [])
-        missing = [name for name in required if not attrs.get(name)]
-        if missing:
-            errors.append(f"ligne {start_line}: attribut(s) manquant(s) {', '.join(missing)}")
-
-        if item_id:
-            key = (kind, item_id.upper())
-            if key in seen_ids:
-                errors.append(f"ligne {start_line}: identifiant dupliqué {kind} {item_id}")
-            seen_ids.add(key)
-            expected_prefix = "B" if kind == "BLOCK" else "T"
-            if not re.fullmatch(expected_prefix + r"\d+", item_id, flags=re.IGNORECASE):
-                errors.append(f"ligne {start_line}: identifiant invalide {item_id!r} pour {kind}")
-            elif not re.fullmatch(expected_prefix + r"\d{3}", item_id, flags=re.IGNORECASE):
-                warnings.append(f"ligne {start_line}: identifiant non canonique {item_id!r}; format conseillé {expected_prefix}001")
-
-        try:
-            order = int(order_raw)
-            if order <= 0:
-                raise ValueError
-            item["order_int"] = order
-            appearance_orders.append(order)
-            if order in seen_orders:
-                errors.append(f"ligne {start_line}: order dupliqué {order_raw}")
-            seen_orders.add(order)
-            if not re.fullmatch(r"\d{3}", order_raw):
-                warnings.append(f"ligne {start_line}: order non canonique {order_raw!r}; format conseillé 001")
-        except (TypeError, ValueError):
-            errors.append(f"ligne {start_line}: order invalide {order_raw!r}")
-            item["order_int"] = 10**9
-
-        if pos and pos not in _ALLOWED_POSITIONS:
-            errors.append(f"ligne {start_line}: pos non autorisé {pos!r}")
-        if role and role not in _ALLOWED_ROLES:
-            errors.append(f"ligne {start_line}: role_hint non autorisé {role!r}")
-
-        bbox, bbox_errors = _parse_bbox(attrs.get("bbox", ""), start_line)
-        errors.extend(bbox_errors)
-        item["bbox"] = bbox
-
-        content_lines = item.get("lines", [])
-        if not any(line.strip() for line in content_lines):
-            errors.append(f"ligne {start_line}: {kind} vide")
-            continue
-
-        if kind == "BLOCK":
-            for offset, line in enumerate(content_lines, start=1):
-                absolute_line = start_line + offset
-                if "<TAB>" in line:
-                    errors.append(f"ligne {absolute_line}: <TAB> interdit dans un BLOCK")
-                if "<BR>" in line:
-                    errors.append(f"ligne {absolute_line}: <BR> interdit dans un BLOCK")
-                if "<EMPTY>" in line:
-                    errors.append(f"ligne {absolute_line}: <EMPTY> interdit dans un BLOCK")
-                if OCR_ANY_TAG_RE.search(line):
-                    errors.append(f"ligne {absolute_line}: balise technique imbriquée dans un BLOCK")
-            continue
-
-        try:
-            declared_cols = int(attrs.get("cols", "0"))
-        except (TypeError, ValueError):
-            declared_cols = 0
-        if declared_cols <= 0:
-            errors.append(f"ligne {start_line}: cols invalide {attrs.get('cols')!r}")
-            continue
-        item["declared_cols"] = declared_cols
-
-        rows: List[List[str]] = []
-        for offset, line in enumerate(content_lines, start=1):
-            absolute_line = start_line + offset
-            if not line.strip():
-                errors.append(f"ligne {absolute_line}: ligne vide interdite dans TABLE {item_id}")
-                continue
-            if "\t" in line:
-                errors.append(f"ligne {absolute_line}: tabulation littérale interdite dans TABLE {item_id}")
-            cells = line.split("<TAB>")
-            rows.append(cells)
-            if len(cells) != declared_cols:
-                errors.append(
-                    f"ligne {absolute_line}: TABLE {item_id} déclare {declared_cols} colonnes "
-                    f"mais la ligne en contient {len(cells)}"
-                )
-            if all((cell or "").strip() in {"", "<EMPTY>"} for cell in cells):
-                errors.append(f"ligne {absolute_line}: ligne de tableau entièrement vide")
-            for cell_index, cell in enumerate(cells, start=1):
-                stripped = (cell or "").strip()
-                if OCR_ANY_TAG_RE.search(cell):
-                    errors.append(f"ligne {absolute_line}: balise technique imbriquée dans TABLE {item_id}")
-                if "<EMPTY>" in cell and stripped != "<EMPTY>":
-                    errors.append(
-                        f"ligne {absolute_line}, cellule {cell_index}: <EMPTY> doit occuper toute la cellule"
-                    )
-                if stripped.startswith("<BR>") or stripped.endswith("<BR>") or "<BR><BR>" in stripped:
-                    errors.append(
-                        f"ligne {absolute_line}, cellule {cell_index}: usage invalide de <BR>"
-                    )
-
-        if len(rows) < 2:
-            errors.append(f"TABLE {item_id} contient moins de deux lignes; Qwen devait utiliser un BLOCK")
-        if rows and all(len(row) == declared_cols for row in rows):
-            errors.extend(_validate_table_columns(item, rows))
-            errors.extend(_validate_semantic_table_risks(item, rows))
-        item["rows"] = rows
-        item["has_header"] = _table_has_header(item, rows) if rows else False
-
-    if appearance_orders and appearance_orders != sorted(appearance_orders):
-        errors.append("les valeurs order ne suivent pas l'ordre d'apparition")
-    if appearance_orders:
-        expected_sequence = list(range(min(appearance_orders), min(appearance_orders) + len(appearance_orders)))
-        if appearance_orders != expected_sequence:
-            warnings.append("les valeurs order contiennent des sauts; cela n'altère pas le rendu mais n'est pas canonique")
-
-    if STRICT_OCR_STRUCTURE and not items:
-        errors.append("aucun [[BLOCK]] ou [[TABLE]] détecté")
-
-    errors = list(dict.fromkeys(errors))[:50]
-    warnings = list(dict.fromkeys(warnings))[:50]
-    return {
-        "ok": not errors,
-        "errors": errors,
-        "warnings": warnings,
-        "items": items,
-        "page_empty": False,
-    }
-
-
-def _repair_unambiguous_ocr_structure(text: str) -> Tuple[str, List[str]]:
+def _normalize_markdown_table_widths(md: str) -> str:
     """
-    Répare uniquement des métadonnées techniques, jamais une valeur visible.
-    Désactivé par défaut. Une table dont les lignes n'ont pas toutes la même largeur
-    n'est jamais réparée.
+    Aligne toutes les lignes sur la largeur maximale observée.
+
+    Aucune cellule n'est tronquée. Quand les données sont plus larges que
+    l'en-tête, des en-têtes génériques sont ajoutés.
     """
-    lines = (text or "").splitlines()
-    repairs: List[str] = []
-    output = list(lines)
-
-    active_kind: Optional[str] = None
-    for index, line in enumerate(output):
-        open_match = OCR_OPEN_TAG_RE.match(line)
-        close_match = OCR_CLOSE_TAG_RE.match(line)
-        if open_match and active_kind is None:
-            active_kind = open_match.group(1).upper()
-        elif close_match and active_kind is not None:
-            close_kind = close_match.group(1).upper()
-            if close_kind != active_kind:
-                output[index] = f"[[/{active_kind}]]"
-                repairs.append(
-                    f"ligne {index + 1}: fermeture [[/{close_kind}]] remplacée par [[/{active_kind}]]"
-                )
-            active_kind = None
-
-    index = 0
-    while index < len(output):
-        match = OCR_OPEN_TAG_RE.match(output[index])
-        if not match or match.group(1).upper() != "TABLE":
-            index += 1
-            continue
-        attrs, _ = _parse_tag_attributes_strict(match.group(2), index + 1)
-        end = index + 1
-        widths: List[int] = []
-        while end < len(output):
-            close = OCR_CLOSE_TAG_RE.match(output[end])
-            if close and close.group(1).upper() == "TABLE":
-                break
-            if output[end].strip():
-                widths.append(output[end].count("<TAB>") + 1)
-            end += 1
-        if end < len(output) and widths and len(set(widths)) == 1:
-            actual = widths[0]
-            try:
-                declared = int(attrs.get("cols", "0"))
-            except ValueError:
-                declared = 0
-            if declared > 0 and declared != actual:
-                output[index] = re.sub(r"\bcols=\d+\b", f"cols={actual}", output[index], count=1, flags=re.IGNORECASE)
-                repairs.append(
-                    f"table ligne {index + 1}: cols={declared} remplacé par cols={actual}; toutes les lignes concordent"
-                )
-        index = max(index + 1, end + 1)
-    return "\n".join(output).strip(), repairs
-
-
-def _financial_text(value: str) -> bool:
-    norm = _normalize_label(value)
-    return any(
-        token in norm
-        for token in (
-            "TOTAL", "NET A PAYER", "SOLDE", "MONTANT", "TVA", "TAXE", "REMISE",
-            "ACOMPTE", "ECO-CONTRIBUTION", "SOUS-TOTAL", "AMOUNT DUE", "BALANCE DUE",
-        )
-    )
-
-
-def _supplier_context(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    supplier_text = " ".join(
-        " ".join(item.get("lines", []))
-        for item in items
-        if (item.get("attrs", {}).get("role_hint") or "").lower()
-        in {"supplier_identity", "supplier_address", "supplier_legal", "supplier_contact", "supplier"}
-    )
-    tokens = {
-        token for token in re.findall(r"[A-ZÀ-Ÿ0-9]{3,}", _normalize_label(supplier_text))
-        if token not in {"SAS", "SARL", "EURL", "SA", "SIRET", "SIREN", "RCS", "TVA", "TEL", "FAX", "SITE"}
-    }
-    return {"tokens": tokens}
-
-
-def _section_for_ocr_item(item: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
-    attrs = item.get("attrs", {})
-    role = (attrs.get("role_hint") or "unknown").lower()
-    text = "\n".join(item.get("lines", []))
-    norm = _normalize_label(text)
-    context = context or {}
-
-    if role in {"supplier_identity", "supplier_address", "supplier_legal", "supplier_contact", "supplier"}:
-        return _SECTION_ORDER[0]
-    if role == "logo_text":
-        logo_tokens = set(re.findall(r"[A-ZÀ-Ÿ0-9]{3,}", norm))
-        shares_supplier_name = bool(logo_tokens & set(context.get("tokens", set())))
-        return _SECTION_ORDER[0] if shares_supplier_name else _SECTION_ORDER[7]
-    if role in {"customer_identity", "customer_address", "customer_contact", "customer_legal", "billing_address", "customer"}:
-        return _SECTION_ORDER[1]
-    if role in {"shipping_address", "shipping_details", "shipping_contact", "delivery_confirmation"}:
-        return _SECTION_ORDER[2]
-    if role in {"invoice_title", "invoice_details"}:
-        return _SECTION_ORDER[3]
-    if role in {"line_items_note", "line_items", "line_items_footer"}:
-        return _SECTION_ORDER[4]
-    if role in {"tax_summary", "totals_summary"}:
-        return _SECTION_ORDER[5]
-    if role in {"payment_terms", "bank_details", "payment"}:
-        return _SECTION_ORDER[6]
-    if role in {"legal_terms", "marketing_badge", "logo_marketing", "qr_barcode_text", "notes"}:
-        return _SECTION_ORDER[7]
-    if role == "stamp_signature":
-        if any(token in norm for token in ("LIVRE", "LIVRÉ", "DELIVERED", "RECU", "REÇU", "NOM DATE ET SIGNATURE")):
-            return _SECTION_ORDER[2]
-        return _SECTION_ORDER[7]
-    if role == "isolated_value":
-        if _financial_text(text):
-            return _SECTION_ORDER[5]
-        if re.fullmatch(r"\s*\d{1,2}:\d{2}(?::\d{0,2})?\s*", text or ""):
-            return _SECTION_ORDER[3]
-        return _SECTION_ORDER[7]
-
-    # unknown : classement conservateur, fondé uniquement sur des marqueurs explicites.
-    if any(token in norm for token in ("ADRESSE DE LIVRAISON", "LIVRE A", "LIVRÉ À", "SHIP TO", "TRANSPORTEUR", "EXPEDITION", "EXPÉDITION", "INCOTERM")):
-        return _SECTION_ORDER[2]
-    if any(token in norm for token in ("IBAN", "BIC", "RIB", "MODE DE REGLEMENT", "MODE DE RÈGLEMENT", "ECHEANCE", "ÉCHÉANCE", "VIREMENT", "PRELEVEMENT", "PRÉLÈVEMENT")):
-        return _SECTION_ORDER[6]
-    if _financial_text(text):
-        return _SECTION_ORDER[5]
-    if any(token in norm for token in ("FACTURE", "AVOIR", "PROFORMA", "DATE", "N CLIENT", "REFERENCE CLIENT", "RÉFÉRENCE CLIENT", "COMMANDE")):
-        return _SECTION_ORDER[3]
-    return _SECTION_ORDER[7]
-
-
-def _escape_table_segment(value: str) -> str:
-    escaped = html.escape(value, quote=False)
-    escaped = escaped.replace("\\", "\\\\")
-    escaped = escaped.replace("|", r"\|")
-    return escaped
-
-
-def _render_ocr_cell(value: str) -> str:
-    raw = (value or "").strip()
-    if raw in {"", "<EMPTY>"}:
-        return ""
-    parts = raw.split("<BR>")
-    return "<br>".join(_escape_table_segment(part) for part in parts)
-
-
-def _escape_block_line(value: str) -> str:
-    original = (value or "").rstrip()
-    escaped = html.escape(original, quote=False)
-    # Évite les structures Markdown accidentelles sans modifier le texte visible rendu.
-    leading_spaces = len(original) - len(original.lstrip(" "))
-    stripped = original.lstrip(" ")
-    prefix = original[:leading_spaces]
-    body = escaped[leading_spaces:]
-
-    if leading_spaces >= 4 and prefix:
-        prefix = "&#32;" + prefix[1:]
-    if re.match(r"^(?:#{1,6}\s|[-+*]\s|\d+[.)]\s|```|~~~|\|)", stripped):
-        first = stripped[0]
-        entity = {
-            "#": "&#35;", "-": "&#45;", "+": "&#43;", "*": "&#42;",
-            "`": "&#96;", "~": "&#126;", "|": "&#124;",
-        }.get(first)
-        if entity:
-            body = entity + body[1:]
-        elif first.isdigit():
-            # Encode le séparateur du numéro de liste, pas les chiffres.
-            body = re.sub(r"^(\d+)([.)])", lambda m: m.group(1) + ("&#46;" if m.group(2) == "." else "&#41;"), body, count=1)
-    if re.fullmatch(r"\s*(?:-{3,}|\*{3,}|_{3,}|={3,})\s*", original):
-        char = stripped[0] if stripped else "-"
-        entity = {"-": "&#45;", "*": "&#42;", "_": "&#95;", "=": "&#61;"}[char]
-        body = entity + body[1:]
-    return prefix + body
-
-
-def _prepare_table(item: Dict[str, Any]) -> Tuple[List[str], List[List[str]], Dict[str, Any]]:
-    rows = [list(row) for row in item.get("rows", [])]
-    if not rows:
-        rows = [line.split("<TAB>") for line in item.get("lines", []) if line.strip()]
-    if not rows:
-        return [], [], {"unit_row_merged": False, "continuations_merged": 0}
-
-    has_header = bool(item.get("has_header", _table_has_header(item, rows)))
-    if has_header:
-        header = list(rows[0])
-        data = [list(row) for row in rows[1:]]
-    else:
-        header = [f"[SANS_ENTETE_{index + 1}]" for index in range(len(rows[0]))]
-        data = [list(row) for row in rows]
-
-    unit_row_merged = False
-    if data and _is_unit_only_row(data[0]):
-        unit_row = data.pop(0)
-        for index, unit in enumerate(unit_row):
-            unit_value = (unit or "").strip()
-            if unit_value in {"", "<EMPTY>"}:
-                continue
-            header_value = (header[index] or "").strip()
-            header[index] = unit_value if header_value in {"", "<EMPTY>"} else header_value + "<BR>" + unit_value
-        unit_row_merged = True
-
-    continuations_merged = 0
-    role = (item.get("attrs", {}).get("role_hint") or "unknown").lower()
-    if role == "line_items":
-        indexes = _line_item_indexes(header)
-        if indexes["commercial"]:
-            merged_rows: List[List[str]] = []
-            for row in data:
-                action, merge_indexes = _line_item_continuation_action(row, indexes, bool(merged_rows))
-                if action == "merge":
-                    previous = merged_rows[-1]
-                    for index in merge_indexes:
-                        value = (row[index] or "").strip()
-                        prior = (previous[index] or "").strip()
-                        previous[index] = value if prior in {"", "<EMPTY>"} else prior + "<BR>" + value
-                    continuations_merged += 1
-                else:
-                    merged_rows.append(list(row))
-            data = merged_rows
-
-    unnamed_counter = 1
-    for index, cell in enumerate(header):
-        if (cell or "").strip() in {"", "<EMPTY>"}:
-            header[index] = f"[SANS_ENTETE_{unnamed_counter}]"
-            unnamed_counter += 1
-
-    return header, data, {
-        "unit_row_merged": unit_row_merged,
-        "continuations_merged": continuations_merged,
-    }
-
-
-def _render_ocr_table(item: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    header_raw, data_raw, metadata = _prepare_table(item)
-    if not header_raw:
-        return "", metadata
-    header = [_render_ocr_cell(cell) for cell in header_raw]
-    output = [_build_md_row(header), _build_md_separator(len(header))]
-    for row in data_raw:
-        rendered = [_render_ocr_cell(cell) for cell in row]
-        if all(not cell.strip() for cell in rendered):
-            continue
-        output.append(_build_md_row(rendered))
-    metadata = {
-        **metadata,
-        "cols": len(header),
-        "data_rows": len(output) - 2,
-        "table_id": item.get("attrs", {}).get("id", "?"),
-    }
-    return "\n".join(output), metadata
-
-
-def _render_markdown_from_items(items: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
-    context = _supplier_context(items)
-    buckets: Dict[str, List[Tuple[int, int, str]]] = {section: [] for section in _SECTION_ORDER}
-    table_signatures: List[Dict[str, Any]] = []
-
-    for item in sorted(items, key=lambda value: (value.get("order_int", 10**9), value.get("start_line", 10**9))):
-        section = _section_for_ocr_item(item, context)
-        if item["kind"] == "TABLE":
-            rendered, metadata = _render_ocr_table(item)
-            if rendered:
-                metadata["section"] = section
-                metadata["order"] = item.get("order_int", 10**9)
-                table_signatures.append(metadata)
-        else:
-            rendered = "\n".join(_escape_block_line(line) for line in item.get("lines", [])).strip()
-        if rendered:
-            buckets[section].append((item.get("order_int", 10**9), item.get("start_line", 10**9), rendered))
-
-    parts: List[str] = []
-    for section in _SECTION_ORDER:
-        entries = sorted(buckets[section], key=lambda value: (value[0], value[1]))
-        if not entries:
-            continue
-        parts.append(section + "\n\n" + "\n\n".join(value[2] for value in entries))
-    return "\n\n".join(parts).strip(), {"tables": table_signatures}
-
-
-def render_markdown_deterministic(ocr_text: str, page_num: int) -> str:
-    validation = validate_structured_ocr(ocr_text)
-    if not validation["ok"]:
-        raise RuntimeError(
-            f"Page {page_num}: OCR invalide avant rendu Markdown: "
-            + "; ".join(validation["errors"][:10])
-        )
-    if validation.get("page_empty"):
-        return "[PAGE VIDE]"
-    markdown, manifest = _render_markdown_from_items(validation["items"])
-    result = _validate_markdown_core(markdown, validation["items"], manifest=manifest)
-    if not result["ok"]:
-        raise RuntimeError(
-            f"Page {page_num}: échec interne du rendu Markdown Python: "
-            + "; ".join(result["errors"][:10])
-        )
-    return markdown
-
-
-def _decode_table_cell(value: str) -> str:
-    raw = value or ""
+    lines = (md or "").splitlines()
     output: List[str] = []
     index = 0
-    while index < len(raw):
-        if raw[index] == "\\" and index + 1 < len(raw) and raw[index + 1] in {"\\", "|"}:
-            output.append(raw[index + 1])
-            index += 2
-            continue
-        output.append(raw[index])
-        index += 1
-    return html.unescape("".join(output))
-
-
-def _source_atoms(items: List[Dict[str, Any]]) -> Counter[Tuple[str, str]]:
-    context = _supplier_context(items)
-    atoms: Counter[Tuple[str, str]] = Counter()
-    for item in items:
-        section = _section_for_ocr_item(item, context)
-        if item.get("kind") == "TABLE":
-            rows = item.get("rows", [])
-            for row in rows:
-                for cell in row:
-                    value = (cell or "").strip()
-                    if value in {"", "<EMPTY>"} or _GENERIC_HEADER_RE.fullmatch(value):
-                        continue
-                    for part in value.split("<BR>"):
-                        part = part.strip()
-                        if part:
-                            atoms[(section, part)] += 1
-        else:
-            for line in item.get("lines", []):
-                candidate = (line or "").strip()
-                if candidate:
-                    atoms[(section, candidate)] += 1
-    return atoms
-
-
-def _parse_markdown_core(core: str) -> Tuple[Counter[Tuple[str, str]], List[Dict[str, Any]], List[str]]:
-    atoms: Counter[Tuple[str, str]] = Counter()
-    tables: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    lines = (core or "").splitlines()
-    current_section: Optional[str] = None
-    index = 0
-
     while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            if stripped not in _SECTION_INDEX:
-                errors.append(f"ligne Markdown {index + 1}: section inattendue {stripped!r}")
-                current_section = None
-            else:
-                current_section = stripped
-            index += 1
-            continue
-        if not stripped:
-            index += 1
-            continue
-        if current_section is None:
-            errors.append(f"ligne Markdown {index + 1}: contenu hors section")
-            index += 1
-            continue
-
-        if _is_md_table_row(line):
-            if index + 1 >= len(lines) or not _is_md_separator_row(lines[index + 1]):
-                errors.append(f"ligne Markdown {index + 1}: table sans séparateur")
-                index += 1
+        if (
+            index + 1 < len(lines)
+            and _is_md_table_row(lines[index])
+            and _is_md_separator_row(lines[index + 1])
+        ):
+            header, rows, end = _collect_table(lines, index)
+            width = max([len(header), *(len(row) for row in rows)] or [len(header)])
+            if width < 1:
+                output.extend(lines[index:end])
+                index = end
                 continue
-            header = _split_md_cells(line)
-            separator = _split_md_cells(lines[index + 1])
-            if len(separator) != len(header):
-                errors.append(
-                    f"ligne Markdown {index + 2}: séparateur à {len(separator)} cellules; attendu {len(header)}"
-                )
-            rows: List[List[str]] = []
-            cursor = index + 2
-            while cursor < len(lines) and _is_md_table_row(lines[cursor]):
-                row = _split_md_cells(lines[cursor])
-                if len(row) != len(header):
-                    errors.append(
-                        f"ligne Markdown {cursor + 1}: {len(row)} cellules; attendu {len(header)}"
-                    )
-                rows.append(row)
-                cursor += 1
-            if not rows:
-                errors.append(f"ligne Markdown {index + 1}: tableau sans ligne de données")
-            tables.append({"section": current_section, "cols": len(header), "data_rows": len(rows)})
-            for row in [header] + rows:
-                for cell in row:
-                    raw_cell = cell.strip()
-                    if not raw_cell:
-                        continue
-                    # Le <br> généré par le code sépare des atomes OCR ; un <br> littéral
-                    # provenant du document aurait été encodé en &lt;br&gt;.
-                    for part in re.split(r"<br\s*/?>", raw_cell, flags=re.IGNORECASE):
-                        decoded = _decode_table_cell(part).strip()
-                        if not decoded or _GENERIC_HEADER_RE.fullmatch(decoded):
-                            continue
-                        atoms[(current_section, decoded)] += 1
-            index = cursor
+            header = header + [""] * (width - len(header))
+            padded_rows = [row + [""] * (width - len(row)) for row in rows]
+            for column in range(width):
+                if header[column].strip() == "" and any(row[column].strip() for row in padded_rows):
+                    header[column] = "[SANS_ENTETE_0]"
+            header = _renumber_placeholders(header)
+            output.append(_build_md_row(header))
+            output.append(_build_md_separator(width))
+            output.extend(_build_md_row(row) for row in padded_rows)
+            index = end
             continue
-
-        decoded_line = html.unescape(line).strip()
-        if decoded_line:
-            atoms[(current_section, decoded_line)] += 1
+        output.append(lines[index])
         index += 1
+    return "\n".join(output)
 
-    return atoms, tables, errors
+
+def _remove_header_only_md_tables(md: str) -> str:
+    """Convertit un tableau sans données en texte simple sans perdre son en-tête."""
+    lines = (md or "").splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        if (
+            index + 1 < len(lines)
+            and _is_md_table_row(lines[index])
+            and _is_md_separator_row(lines[index + 1])
+        ):
+            header, rows, end = _collect_table(lines, index)
+            if not rows:
+                visible = [cell for cell in header if cell.strip()]
+                if visible:
+                    output.append(" | ".join(visible))
+                index = end
+                continue
+        output.append(lines[index])
+        index += 1
+    return "\n".join(output)
 
 
-def _validate_markdown_core(
-    md: str,
-    ocr_items: Optional[List[Dict[str, Any]]] = None,
-    *,
-    manifest: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    errors: List[str] = []
-    warnings: List[str] = []
-    core = (md or "").strip()
-    if not core:
-        return {"ok": False, "errors": ["Markdown de page vide"], "warnings": []}
+def _drop_empty_unnamed_columns(md: str) -> str:
+    """
+    Supprime seulement une colonne anonyme entièrement vide.
 
-    if core == "[PAGE VIDE]":
-        if ocr_items:
-            errors.append("[PAGE VIDE] alors que l'OCR contient des éléments")
-        return {"ok": not errors, "errors": errors, "warnings": warnings}
+    La largeur maximale de toutes les lignes est prise en compte. Une cellule
+    supplémentaire ne peut donc plus être supprimée par troncature.
+    """
+    normalized = _normalize_markdown_table_widths(md)
+    lines = normalized.splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        if (
+            index + 1 < len(lines)
+            and _is_md_table_row(lines[index])
+            and _is_md_separator_row(lines[index + 1])
+        ):
+            header, rows, end = _collect_table(lines, index)
+            if not rows:
+                output.extend(lines[index:end])
+                index = end
+                continue
 
-    for token in ("[[BLOCK", "[[TABLE", "[[/BLOCK]]", "[[/TABLE]]"):
-        if token.lower() in core.lower():
-            errors.append(f"token OCR résiduel dans le Markdown: {token}")
-    for token in ("<TAB>", "<EMPTY>", "<BR>"):
-        if token in core:
-            errors.append(f"token OCR résiduel dans le Markdown: {token}")
-    if HTML_PAGE_MARKER_RE.search(core):
-        errors.append("balise physique <!-- PAGE n --> présente dans le cœur Markdown")
-    if re.search(r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$", core, flags=re.IGNORECASE | re.MULTILINE):
-        errors.append("annexe OCR présente dans le cœur Markdown")
-    if re.search(r"^\s*```", core, flags=re.MULTILINE):
-        errors.append("bloc de code résiduel dans le cœur Markdown")
+            before = _visible_table_values(header, rows)
+            keep: List[int] = []
+            for column, title in enumerate(header):
+                title_clean = title.strip()
+                anonymous = title_clean == "" or bool(
+                    re.fullmatch(r"\[SANS_ENTETE_\d+\]", title_clean)
+                )
+                values = [row[column].strip() for row in rows]
+                if anonymous and all(value == "" for value in values):
+                    continue
+                keep.append(column)
 
-    headings = [line.strip() for line in core.splitlines() if line.strip().startswith("## ")]
-    unexpected = [heading for heading in headings if heading not in _SECTION_INDEX]
-    if unexpected:
-        errors.append("section(s) inattendue(s): " + ", ".join(unexpected[:5]))
-    positions = [_SECTION_INDEX[heading] for heading in headings if heading in _SECTION_INDEX]
-    if positions != sorted(positions):
-        errors.append("ordre des sections non canonique")
-    if len(headings) != len(set(headings)):
-        errors.append("section Markdown dupliquée")
+            new_header = _renumber_placeholders([header[column] for column in keep])
+            new_rows = [[row[column] for column in keep] for row in rows]
+            after = _visible_table_values(new_header, new_rows)
+            if before != after:
+                _log("⚠️ Nettoyage annulé : une valeur visible aurait été perdue.")
+                output.extend(lines[index:end])
+            else:
+                output.append(_build_md_row(new_header))
+                output.append(_build_md_separator(len(new_header)))
+                output.extend(_build_md_row(row) for row in new_rows)
+            index = end
+            continue
+        output.append(lines[index])
+        index += 1
+    return "\n".join(output)
 
-    target_atoms, actual_tables, parse_errors = _parse_markdown_core(core)
-    errors.extend(parse_errors)
 
-    if ocr_items is not None:
-        expected_atoms = _source_atoms(ocr_items)
-        missing = expected_atoms - target_atoms
-        added = target_atoms - expected_atoms
-        if missing:
-            preview = [f"{section}: {value!r}" for (section, value), count in missing.items() for _ in range(min(count, 2))]
-            errors.append("contenu OCR absent ou mal classé: " + " | ".join(preview[:12]))
-        if added:
-            preview = [f"{section}: {value!r}" for (section, value), count in added.items() for _ in range(min(count, 2))]
-            errors.append("contenu ajouté ou dupliqué par le Markdown: " + " | ".join(preview[:12]))
+def _looks_like_number_or_amount(value: str) -> bool:
+    value = (value or "").strip()
+    if not value:
+        return False
+    return bool(re.fullmatch(
+        r"[-+−]?\(?\d[\d\s.,']*\)?\s*(?:€|EUR|USD|CHF|GBP|£|\$)?",
+        value,
+        flags=re.IGNORECASE,
+    ))
 
-        if manifest is None:
-            _, manifest = _render_markdown_from_items(ocr_items)
-        expected_tables = [
-            {
-                "section": table["section"],
-                "cols": int(table["cols"]),
-                "data_rows": int(table["data_rows"]),
-            }
-            for table in manifest.get("tables", [])
-        ]
-        if actual_tables != expected_tables:
-            errors.append(
-                f"structure des tableaux différente du rendu attendu: attendu={expected_tables}, obtenu={actual_tables}"
-            )
 
-    errors = list(dict.fromkeys(errors))[:50]
-    warnings = list(dict.fromkeys(warnings))[:50]
-    return {
-        "ok": not errors,
-        "errors": errors,
-        "warnings": warnings,
-        "stats": {
-            "tables": len(actual_tables),
-            "visible_atoms": sum(target_atoms.values()),
-        },
-    }
+def _looks_like_percent(value: str) -> bool:
+    return bool(re.fullmatch(r"[-+−]?\d+(?:[,.]\d+)?\s*%", (value or "").strip()))
+
+
+def _fix_percent_header_position_in_tables(md: str) -> str:
+    """Réordonne seulement deux en-têtes prouvés ; les données ne bougent jamais."""
+    normalized = _normalize_markdown_table_widths(md)
+    lines = normalized.splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        if (
+            index + 1 < len(lines)
+            and _is_md_table_row(lines[index])
+            and _is_md_separator_row(lines[index + 1])
+        ):
+            header, rows, end = _collect_table(lines, index)
+            changed = False
+            for column in range(max(0, len(header) - 2)):
+                h0 = header[column].lower()
+                h1 = header[column + 1].lower()
+                h2 = header[column + 2].strip()
+                bad_order = (
+                    "unitaire" in h0
+                    and "remis" in h1
+                    and bool(re.fullmatch(r"\[SANS_ENTETE_\d+\]", h2))
+                )
+                if not bad_order:
+                    continue
+                evidence = sum(
+                    1
+                    for row in rows
+                    if _looks_like_number_or_amount(row[column])
+                    and _looks_like_percent(row[column + 1])
+                    and _looks_like_number_or_amount(row[column + 2])
+                )
+                if evidence:
+                    header[column + 1], header[column + 2] = header[column + 2], header[column + 1]
+                    changed = True
+            if changed:
+                output.append(_build_md_row(header))
+                output.append(_build_md_separator(len(header)))
+                output.extend(_build_md_row(row) for row in rows)
+            else:
+                output.extend(lines[index:end])
+            index = end
+            continue
+        output.append(lines[index])
+        index += 1
+    return "\n".join(output)
+
+
+def _clean_markdown_losslessly(md: str, page_num: int) -> str:
+    original = md
+    md = _normalize_markdown_tokens(md)
+    md = _remove_empty_md_table_rows(md)
+    md = _normalize_markdown_table_widths(md)
+    md = _remove_header_only_md_tables(md)
+    if ENABLE_HEURISTIC_HEADER_REORDER:
+        md = _fix_percent_header_position_in_tables(md)
+    md = _drop_empty_unnamed_columns(md)
+    md = _normalize_markdown_table_widths(md)
+    md = _remove_empty_md_table_rows(md)
+    md = _normalize_markdown_tokens(md)
+    md = _strip_model_html_page_markers(md)
+    if md != original:
+        _log(f"🧹 Page {page_num}: nettoyages Markdown défensifs appliqués.")
+    return md.strip()
 
 # =====================
 # Rendu PDF -> PNG base64 (low memory)
@@ -2141,46 +1866,9 @@ def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER
 # =====================
 
 _HTTP_LOCAL = threading.local()
-_CACHE_STATE_LOCK = threading.Lock()
-_CACHE_PRIME_LOCKS: Dict[str, threading.Lock] = {}
-_CACHE_READY_KEYS: set[str] = set()
-_CACHE_RUNTIME_ENABLED = ENABLE_EXPLICIT_CACHE
-_CACHE_SERIALIZE_PRIME = True
-
-
-def configure_explicit_cache_for_batch(page_count: int, worker_count: int) -> bool:
-    """
-    Active le cache explicite uniquement lorsqu'au moins une seconde vague de
-    pages pourra réellement en profiter.
-
-    Avec une seule vague (par exemple 4 pages pour 4 workers), créer un cache
-    explicite ne peut accélérer aucune page suivante et ajoute un coût de
-    création. Dans ce cas, les marqueurs sont omis, sans modifier les prompts.
-
-    Pour les lots plus longs, le premier appel de chaque prompt statique est
-    sérialisé. Les appels suivants partent en parallèle une fois le cache créé.
-    """
-    global _CACHE_RUNTIME_ENABLED, _CACHE_SERIALIZE_PRIME
-
-    remaining_pages = max(0, int(page_count))
-    effective_workers = max(1, int(worker_count))
-    runtime_enabled = bool(
-        ENABLE_EXPLICIT_CACHE and remaining_pages > effective_workers
-    )
-
-    with _CACHE_STATE_LOCK:
-        _CACHE_RUNTIME_ENABLED = runtime_enabled
-        _CACHE_SERIALIZE_PRIME = runtime_enabled
-        # Nouveau lot : ne pas considérer un cache vieux de plus de cinq minutes
-        # comme encore amorcé dans la mémoire du processus.
-        _CACHE_READY_KEYS.clear()
-        _CACHE_PRIME_LOCKS.clear()
-
-    return runtime_enabled
 
 
 def _get_http_session() -> requests.Session:
-    """Retourne une session HTTP persistante propre au thread courant."""
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
@@ -2195,183 +1883,61 @@ def _get_http_session() -> requests.Session:
     return session
 
 
-def _cacheable_text_block(text: str) -> Dict[str, Any]:
-    """Construit un bloc texte statique, explicitement mis en cache si activé."""
-    block: Dict[str, Any] = {"type": "text", "text": text}
-    if _CACHE_RUNTIME_ENABLED:
-        block["cache_control"] = {"type": "ephemeral"}
-    return block
-
-
-def _usage_to_stats(usage: Dict[str, Any]) -> Dict[str, int]:
-    """Normalise les statistiques OpenAI-compatible, y compris le cache Qwen."""
-    input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-    output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
-    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
-
-    prompt_details = usage.get("prompt_tokens_details", {}) or {}
-    cached_tokens = int(
-        prompt_details.get("cached_tokens", usage.get("cached_tokens", 0)) or 0
-    )
-    cache_creation_input_tokens = int(
-        prompt_details.get(
-            "cache_creation_input_tokens",
-            usage.get("cache_creation_input_tokens", 0),
-        )
-        or 0
-    )
-
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "cached_tokens": cached_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
-        "uncached_input_tokens": max(
-            0,
-            input_tokens - cached_tokens - cache_creation_input_tokens,
-        ),
-    }
-
-
-def _merge_token_stats(*items: Dict[str, Any]) -> Dict[str, int]:
-    """Additionne les consommations de plusieurs tentatives réelles."""
-    keys = (
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "cached_tokens",
-        "cache_creation_input_tokens",
-        "uncached_input_tokens",
-    )
-    return {
-        key: sum(int(item.get(key, 0) or 0) for item in items)
-        for key in keys
-    }
-
-
-def _call_chat_with_cache_prime(
-    *,
-    cache_name: str,
-    api_key: str,
-    model: str,
-    messages: List[Dict[str, Any]],
-    max_tokens: int,
-    context: str,
-    enable_thinking: Optional[bool],
-    extra_body: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, Dict[str, int]]:
-    """
-    Le premier appel réel d'un prompt statique crée le cache. Les autres threads
-    attendent sa fin avant d'appeler Qwen, ce qui évite plusieurs créations de cache
-    simultanées au démarrage d'un lot.
-    """
-    if not _CACHE_RUNTIME_ENABLED:
-        return _call_chat(
-            api_key=api_key,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            context=context,
-            enable_thinking=enable_thinking,
-            extra_body=extra_body,
-        )
-
-    cache_key = f"{API_URL}|{model}|{cache_name}"
-
-    if not _CACHE_SERIALIZE_PRIME:
-        return _call_chat(
-            api_key=api_key,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            context=context,
-            enable_thinking=enable_thinking,
-            extra_body=extra_body,
-        )
-
-    with _CACHE_STATE_LOCK:
-        if cache_key in _CACHE_READY_KEYS:
-            prime_lock = None
-        else:
-            prime_lock = _CACHE_PRIME_LOCKS.setdefault(cache_key, threading.Lock())
-
-    if prime_lock is None:
-        return _call_chat(
-            api_key=api_key,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            context=context,
-            enable_thinking=enable_thinking,
-            extra_body=extra_body,
-        )
-
-    with prime_lock:
-        with _CACHE_STATE_LOCK:
-            already_ready = cache_key in _CACHE_READY_KEYS
-
-        if not already_ready:
-            _log(f"🧠 {context}: amorçage du cache explicite '{cache_name}'")
-            text, stats = _call_chat(
-                api_key=api_key,
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                context=context,
-                enable_thinking=enable_thinking,
-                extra_body=extra_body,
-            )
-
-            with _CACHE_STATE_LOCK:
-                _CACHE_READY_KEYS.add(cache_key)
-
-            created = int(stats.get("cache_creation_input_tokens", 0) or 0)
-            hit = int(stats.get("cached_tokens", 0) or 0)
-            _log(
-                f"🧠 {context}: cache prêt "
-                f"(création={created:,} tokens, hit={hit:,} tokens)"
-            )
-            return text, stats
-
-    # Le cache est maintenant prêt. Le verrou est relâché avant l'appel réseau,
-    # afin que tous les workers qui attendaient puissent repartir simultanément.
-    return _call_chat(
-        api_key=api_key,
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        context=context,
-        enable_thinking=enable_thinking,
-        extra_body=extra_body,
-    )
-
 def _backoff(attempt: int) -> float:
-    delay = min((BACKOFF_BASE ** attempt), BACKOFF_MAX)
-    return float(delay)
+    return float(min((BACKOFF_BASE ** attempt), BACKOFF_MAX))
+
 
 def _compute_retry_delay(http_status: Optional[int], err_msg: str, attempt: int) -> Tuple[bool, float]:
-    """
-    Renvoie (retry?, delay_sec). Backoff court pour éviter les kills de job.
-    """
     if attempt >= MAX_RETRIES:
         return False, 0.0
-
-    msg = (err_msg or "").lower()
-
-    non_retryable = ["invalid api key", "authentication failed", "permission denied"]
-    if any(x in msg for x in non_retryable):
+    message = (err_msg or "").lower()
+    if any(value in message for value in ["invalid api key", "authentication failed", "permission denied"]):
         return False, 0.0
-
-    if http_status == 429 or "rate limit" in msg:
+    if http_status == 429 or "rate limit" in message:
         if FAIL_FAST_ON_429:
             return False, 0.0
         return True, min(10.0 * attempt, 20.0)
-
-    if "overloaded" in msg:
+    if "overloaded" in message:
         return True, min(5.0 * attempt, 15.0)
-
     return True, _backoff(attempt)
+
+
+def _usage_int(usage: Dict[str, Any], *paths: Tuple[str, ...]) -> int:
+    for path in paths:
+        current: Any = usage
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if current is not None:
+            try:
+                return int(current or 0)
+            except Exception:
+                continue
+    return 0
+
+
+def _merge_stats(*values: Dict[str, Any]) -> Dict[str, Any]:
+    numeric = [
+        "input_tokens", "output_tokens", "total_tokens", "cached_tokens",
+        "cache_creation_input_tokens", "attempts", "duration_ms",
+    ]
+    result: Dict[str, Any] = {key: 0 for key in numeric}
+    finish_reasons: List[str] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in numeric:
+            result[key] += int(value.get(key, 0) or 0)
+        reason = value.get("finish_reason")
+        if reason:
+            finish_reasons.append(str(reason))
+    result["finish_reason"] = finish_reasons[-1] if finish_reasons else None
+    if len(finish_reasons) > 1:
+        result["finish_reasons"] = finish_reasons
+    return result
+
 
 def _call_chat(
     api_key: str,
@@ -2381,9 +1947,8 @@ def _call_chat(
     context: str,
     enable_thinking: Optional[bool] = None,
     allow_no_think_fallback: Optional[bool] = None,
-    extra_body: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, Dict[str, int]]:
-    validate_api_configuration()
+    high_resolution_images: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
     url = f"{API_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body: Dict[str, Any] = {
@@ -2392,509 +1957,349 @@ def _call_chat(
         "temperature": TEMPERATURE,
         "messages": messages,
     }
-
     if enable_thinking is not None and _supports_thinking_toggle(model):
         body["enable_thinking"] = bool(enable_thinking)
-
-    if extra_body:
-        protected = {"model", "messages", "max_tokens", "temperature"}
-        for key, value in extra_body.items():
-            if key not in protected:
-                body[key] = value
-
+    if high_resolution_images:
+        body["vl_high_resolution_images"] = True
     if allow_no_think_fallback is None:
         allow_no_think_fallback = ALLOW_NO_THINK_FALLBACK
 
     for attempt in range(1, MAX_RETRIES + 1):
-        t0 = time.time()
+        started = time.time()
         try:
-            r = _get_http_session().post(
+            response = _get_http_session().post(
                 url,
                 headers=headers,
                 json=body,
                 timeout=(CONNECT_TIMEOUT_SECONDS, REQUEST_TIMEOUT_SECONDS),
             )
-
-            if r.status_code == 200:
-                js = r.json()
-                usage = js.get("usage", {}) or {}
-                stats = _usage_to_stats(usage)
-                input_tokens = stats["input_tokens"]
-                output_tokens = stats["output_tokens"]
-
-                choices = js.get("choices", []) or []
+            if response.status_code == 200:
+                payload = response.json()
+                usage = payload.get("usage", {}) or {}
+                choices = payload.get("choices", []) or []
                 if not choices:
                     raise RuntimeError(f"{context}: réponse 200 mais aucune choice")
 
-                choice0 = choices[0] or {}
-                finish_reason = choice0.get("finish_reason")
-                stats["finish_reason"] = finish_reason
-                stats["truncated"] = int(str(finish_reason or "").lower() in {"length", "max_tokens"})
-                message = choice0.get("message", {}) or {}
+                choice = choices[0] or {}
+                finish_reason = choice.get("finish_reason")
+                message = choice.get("message", {}) or {}
                 text, reasoning_text = _extract_message_texts(message)
 
-                if not text and output_tokens > 0:
-                    finish_reason = choice0.get("finish_reason")
-                    msg_preview = json.dumps(message, ensure_ascii=False)[:EMPTY_RESPONSE_LOG_CHARS]
+                input_tokens = _usage_int(
+                    usage,
+                    ("prompt_tokens",),
+                    ("input_tokens",),
+                )
+                output_tokens = _usage_int(
+                    usage,
+                    ("completion_tokens",),
+                    ("output_tokens",),
+                )
+                cached_tokens = _usage_int(
+                    usage,
+                    ("prompt_tokens_details", "cached_tokens"),
+                    ("cached_tokens",),
+                    ("cache_read_input_tokens",),
+                )
+                cache_creation_tokens = _usage_int(
+                    usage,
+                    ("prompt_tokens_details", "cache_creation_input_tokens"),
+                    ("cache_creation_input_tokens",),
+                )
+                stats: Dict[str, Any] = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": _usage_int(usage, ("total_tokens",)) or input_tokens + output_tokens,
+                    "cached_tokens": cached_tokens,
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "finish_reason": finish_reason,
+                    "attempts": attempt,
+                    "duration_ms": int((time.time() - started) * 1000),
+                    "high_resolution_images": bool(high_resolution_images),
+                }
 
+                if finish_reason == "length":
+                    raise RuntimeError(
+                        f"{context}: réponse tronquée (finish_reason=length). "
+                        "Augmente MAX_TOKENS ou réduis la taille de la sortie."
+                    )
+
+                if not text:
+                    preview = json.dumps(message, ensure_ascii=False)[:EMPTY_RESPONSE_LOG_CHARS]
                     if reasoning_text:
                         _log(
-                            f"⚠️ {context}: 'content' vide mais 'reasoning_content' non vide "
-                            f"({len(reasoning_text)} chars, finish_reason={finish_reason}). "
-                            f"message={msg_preview}"
+                            f"⚠️ {context}: content vide mais reasoning_content non vide "
+                            f"({len(reasoning_text)} caractères). message={preview}"
                         )
-                    else:
-                        _log(
-                            f"⚠️ {context}: réponse vide malgré HTTP 200 / out={output_tokens} "
-                            f"(finish_reason={finish_reason}). message={msg_preview}"
-                        )
-
-                    # Fallback ciblé : on garde le raisonnement par défaut.
-                    # On ne coupe le thinking qu'en secours, UNE seule fois,
-                    # uniquement si le modèle n'a pas fourni de réponse finale exploitable.
-                    if reasoning_text and allow_no_think_fallback and enable_thinking is not False and _supports_thinking_toggle(model):
-                        _log(f"↩️ {context}: retry unique avec enable_thinking=False pour récupérer la réponse finale")
-                        fallback_text, fallback_stats = _call_chat(
-                            api_key=api_key,
-                            model=model,
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            context=context + " [final]",
-                            enable_thinking=False,
-                            allow_no_think_fallback=False,
-                            extra_body=extra_body,
-                        )
-                        merged_stats: Dict[str, Any] = _merge_token_stats(stats, fallback_stats)
-                        merged_stats["finish_reason"] = fallback_stats.get("finish_reason")
-                        merged_stats["truncated"] = int(fallback_stats.get("truncated", 0) or 0)
-                        return fallback_text, merged_stats
+                        if (
+                            allow_no_think_fallback
+                            and enable_thinking is not False
+                            and _supports_thinking_toggle(model)
+                        ):
+                            _log(f"↩️ {context}: reprise unique avec enable_thinking=False")
+                            fallback_text, fallback_stats = _call_chat(
+                                api_key=api_key,
+                                model=model,
+                                messages=messages,
+                                max_tokens=max_tokens,
+                                context=context + " [final]",
+                                enable_thinking=False,
+                                allow_no_think_fallback=False,
+                                high_resolution_images=high_resolution_images,
+                            )
+                            merged = _merge_stats(stats, fallback_stats)
+                            merged["used_no_think_fallback"] = True
+                            merged["high_resolution_images"] = bool(high_resolution_images)
+                            return fallback_text, merged
+                    raise RuntimeError(f"{context}: réponse finale vide. message={preview}")
 
                 _log(
-                    f"✅ {context}: OK en {time.time()-t0:.2f}s "
+                    f"✅ {context}: OK en {(time.time()-started):.2f}s "
                     f"(in={input_tokens} out={output_tokens} "
-                    f"cache_hit={stats.get('cached_tokens', 0)} "
-                    f"cache_create={stats.get('cache_creation_input_tokens', 0)})"
+                    f"cache_hit={cached_tokens} cache_create={cache_creation_tokens})"
                 )
                 return text, stats
 
-            # non-200
             try:
-                err_json = r.json()
-                err_msg = json.dumps(err_json, ensure_ascii=False)[:800]
+                error_message = json.dumps(response.json(), ensure_ascii=False)[:800]
             except Exception:
-                err_msg = (r.text or "")[:800]
-
-            retry, delay = _compute_retry_delay(r.status_code, err_msg, attempt)
-            _log(f"⚠️ {context}: HTTP {r.status_code} retry={retry} dans {delay:.1f}s | {err_msg[:200]}")
+                error_message = (response.text or "")[:800]
+            retry, delay = _compute_retry_delay(response.status_code, error_message, attempt)
+            _log(
+                f"⚠️ {context}: HTTP {response.status_code} retry={retry} "
+                f"dans {delay:.1f}s | {error_message[:200]}"
+            )
             if not retry:
-                raise RuntimeError(f"{context}: HTTP {r.status_code} {err_msg}")
-
+                raise RuntimeError(f"{context}: HTTP {response.status_code} {error_message}")
             time.sleep(delay)
 
-        except requests.exceptions.Timeout as e:
-            retry, delay = _compute_retry_delay(None, str(e), attempt)
-            _log(f"⚠️ {context}: timeout retry={retry} dans {delay:.1f}s | {e}")
+        except requests.exceptions.Timeout as exc:
+            retry, delay = _compute_retry_delay(None, str(exc), attempt)
+            _log(f"⚠️ {context}: timeout retry={retry} dans {delay:.1f}s | {exc}")
             if not retry:
                 raise
             time.sleep(delay)
-
-        except requests.exceptions.RequestException as e:
-            retry, delay = _compute_retry_delay(None, str(e), attempt)
-            _log(f"⚠️ {context}: réseau retry={retry} dans {delay:.1f}s | {e}")
+        except requests.exceptions.RequestException as exc:
+            retry, delay = _compute_retry_delay(None, str(exc), attempt)
+            _log(f"⚠️ {context}: réseau retry={retry} dans {delay:.1f}s | {exc}")
             if not retry:
                 raise
             time.sleep(delay)
 
     raise RuntimeError(f"Échec {context} après {MAX_RETRIES} tentatives")
 
-
-
-def _is_probably_blank_image(image_b64: str) -> Optional[bool]:
-    """Retourne True seulement si l'image rendue paraît réellement blanche."""
-    try:
-        from PIL import Image  # type: ignore
-
-        raw = base64.b64decode(image_b64)
-        with Image.open(io.BytesIO(raw)) as image:
-            gray = image.convert("L")
-            gray.thumbnail((256, 256))
-            pixels = list(gray.getdata())
-        if not pixels:
-            return True
-        dark_ratio = sum(1 for pixel in pixels if pixel < 245) / len(pixels)
-        return dark_ratio <= BLANK_PAGE_DARK_PIXEL_RATIO
-    except Exception as exc:
-        _log(f"⚠️ Vérification visuelle de page vide indisponible: {exc}")
-        return None
-
-
 # =====================
-# Pipeline qualité : OCR Qwen validé puis Markdown déterministe
+# 2 étapes Qwen : OCR puis Markdown
 # =====================
-
-def _build_ocr_instruction(page_num: int, attempt: int, previous_errors: List[str]) -> str:
-    if attempt == 0:
-        return (
-            f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut structuré. "
-            "Relis silencieusement chaque tableau avant de répondre et vérifie que chaque ligne "
-            "contient exactement le nombre de cellules déclaré."
-        )
-
-    reasons = "; ".join(previous_errors[:8]) or "sortie vide ou trop courte"
-    return (
-        f"Nouvelle lecture indépendante de la page {page_num}. La sortie précédente a été rejetée "
-        f"par le contrôle automatique pour : {reasons}. "
-        "Repars entièrement de l'image, sans recopier ni corriger de mémoire la réponse précédente. "
-        "Vérifie surtout : une fermeture du bon type pour chaque balise, le nombre exact de cellules "
-        "de chaque ligne, la séparation quantité/conditionnement, la séparation montant/code TVA, "
-        "et la séparation des tableaux TVA et totaux. N'invente rien. Retourne uniquement l'OCR structuré."
-    )
 
 
 def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, Dict[str, Any]]:
     _log(f"➡️ Page {page_num}: rendu image (dpi={RENDER_DPI})")
     image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num, dpi=RENDER_DPI)
-    base64_size_mb = len(image_b64) / (1024.0 * 1024.0)
-    if base64_size_mb > MAX_BASE64_IMAGE_MB:
-        del image_b64
+    base64_mb = len(image_b64.encode("ascii")) / (1024 * 1024)
+    if base64_mb > MAX_BASE64_IMAGE_MB:
         raise RuntimeError(
-            f"Page {page_num}: image PNG encodée trop volumineuse "
-            f"({base64_size_mb:.2f} Mo > {MAX_BASE64_IMAGE_MB:.2f} Mo). "
-            "Ne réduis pas automatiquement la qualité : ajuste le PDF ou RENDER_DPI explicitement."
+            f"Page {page_num}: image Base64 trop volumineuse ({base64_mb:.2f} Mo), "
+            f"limite préventive={MAX_BASE64_IMAGE_MB:.2f} Mo."
         )
     _log(
-        f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB; "
-        f"base64={base64_size_mb:.2f} Mo), appel OCR"
+        f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB; base64={base64_mb:.2f} Mo), "
+        f"appel OCR haute résolution={'oui' if QWEN_HIGH_RES_IMAGES else 'non'}"
     )
     data_url = f"data:image/png;base64,{image_b64}"
-    blank_image_status = _is_probably_blank_image(image_b64)
 
-    aggregate_stats: Dict[str, Any] = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "cached_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "uncached_input_tokens": 0,
-    }
-    attempt_details: List[Dict[str, Any]] = []
-    previous_errors: List[str] = []
-    empty_confirmations = 0
-    accepted_text = ""
+    # Rôle et ordre historique inchangés : un seul message user contenant
+    # prompt OCR, image, puis instruction propre à la page.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                _cacheable_text_block(OCR_PROMPT),
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": f"OCR de la page {page_num}. Retourne uniquement le texte OCR brut."},
+            ],
+        }
+    ]
 
-    max_extra_retries = max(
-        OCR_EMPTY_RETRIES,
-        OCR_QUALITY_RETRIES,
-        OCR_EMPTY_PAGE_CONFIRMATIONS - 1,
-    )
-    max_attempts = 1 + max_extra_retries
-
-    try:
-        for attempt in range(max_attempts):
-            page_instruction = _build_ocr_instruction(page_num, attempt, previous_errors)
-
-            # Même hiérarchie que la version du 28/07 : prompt + image + instruction
-            # dans un seul message user. Le cache éventuel ne modifie pas cette hiérarchie.
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        _cacheable_text_block(OCR_PROMPT),
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                        {"type": "text", "text": page_instruction},
-                    ],
-                }
-            ]
-
-            label = f"OCR page {page_num}" + (f" (qualité {attempt})" if attempt else "")
-            text, stats = _call_chat_with_cache_prime(
-                cache_name="ocr_static_prompt",
-                api_key=api_key,
-                model=MODEL_OCR,
-                messages=messages,
-                max_tokens=MAX_TOKENS_OCR,
-                context=label,
-                enable_thinking=ENABLE_THINKING_OCR,
-                extra_body={"vl_high_resolution_images": True} if QWEN_HIGH_RES_IMAGES else None,
-            )
-            text = _strip_triple_backticks(text)
-            text = _normalize_sans_entete_tokens(text)
-            text = _strip_model_page_tokens(text)
-            if ALLOW_SAFE_STRUCTURE_REPAIR:
-                accepted_candidate, repairs = _repair_unambiguous_ocr_structure(text)
-            else:
-                accepted_candidate, repairs = text, []
-            validation = validate_structured_ocr(accepted_candidate)
-
-            if int(stats.get("truncated", 0) or 0):
-                validation = {
-                    **validation,
-                    "ok": False,
-                    "errors": [
-                        f"réponse Qwen tronquée (finish_reason={stats.get('finish_reason')!r})",
-                        *list(validation.get("errors", [])),
-                    ],
-                }
-
-            if accepted_candidate.strip() == "[PAGE VIDE]":
-                if blank_image_status is False:
-                    validation = {
-                        **validation,
-                        "ok": False,
-                        "errors": ["Qwen a répondu [PAGE VIDE] mais l'image contient des pixels non blancs"],
-                    }
-                elif blank_image_status is True:
-                    empty_confirmations = OCR_EMPTY_PAGE_CONFIRMATIONS
-                else:
-                    empty_confirmations += 1
-                    if empty_confirmations < OCR_EMPTY_PAGE_CONFIRMATIONS:
-                        validation = {
-                            **validation,
-                            "ok": False,
-                            "errors": [
-                                f"[PAGE VIDE] doit être confirmé {OCR_EMPTY_PAGE_CONFIRMATIONS} fois "
-                                "car la vérification visuelle est indisponible"
-                            ],
-                        }
-            else:
-                empty_confirmations = 0
-
-            aggregate_stats = _merge_token_stats(aggregate_stats, stats)
-            previous_errors = list(validation.get("errors", []))
-            attempt_details.append(
-                {
-                    "attempt": attempt + 1,
-                    "text_chars": len(accepted_candidate.strip()),
-                    "valid": bool(validation.get("ok")),
-                    "errors": previous_errors[:10],
-                    "warnings": list(validation.get("warnings", []))[:10],
-                    "repairs": repairs,
-                    **stats,
-                }
-            )
-
-            if repairs:
-                _log(f"🛠️ Page {page_num}: réparations structurelles sûres: {'; '.join(repairs)}")
-
-            if validation.get("ok"):
-                accepted_text = accepted_candidate
-                break
-
-            preview = accepted_candidate.strip().replace("\n", " ")[:160]
-            _log(
-                f"⚠️ Page {page_num}: OCR rejeté par le contrôle qualité "
-                f"({'; '.join(previous_errors[:5])}). Preview='{preview}'"
-            )
-            if attempt + 1 < max_attempts:
-                time.sleep(OCR_EMPTY_RETRY_SLEEP)
-    finally:
-        del data_url
-        del image_b64
-
-    if not accepted_text:
-        reason = "; ".join(previous_errors[:10]) or "aucune sortie exploitable"
-        raise RuntimeError(
-            f"Page {page_num}: OCR Qwen refusé après {max_attempts} tentative(s): {reason}"
+    aggregate: Dict[str, Any] = {}
+    last_text = ""
+    for retry_index in range(OCR_EMPTY_RETRIES + 1):
+        label = f"OCR page {page_num}" + (f" (retry {retry_index})" if retry_index else "")
+        text, stats = _call_chat(
+            api_key=api_key,
+            model=MODEL_OCR,
+            messages=messages,
+            max_tokens=MAX_TOKENS_OCR,
+            context=label,
+            enable_thinking=ENABLE_THINKING_OCR,
+            high_resolution_images=QWEN_HIGH_RES_IMAGES,
         )
+        aggregate = _merge_stats(aggregate, stats)
+        aggregate["high_resolution_images"] = QWEN_HIGH_RES_IMAGES
+        text = _strip_model_page_tokens(
+            _normalize_sans_entete_tokens(_strip_triple_backticks(text))
+        )
+        last_text = text
+        if text.strip() == "[PAGE VIDE]":
+            _log(f"⚠️ Page {page_num}: OCR indique [PAGE VIDE].")
+            break
+        if len(text.strip()) >= OCR_MIN_CHARS:
+            break
+        preview = text.strip().replace("\n", " ")[:120]
+        _log(
+            f"⚠️ Page {page_num}: OCR trop court ({len(text.strip())} caractères). "
+            f"Preview={preview!r}"
+        )
+        if retry_index < OCR_EMPTY_RETRIES:
+            time.sleep(OCR_EMPTY_RETRY_SLEEP)
 
-    aggregate_stats["attempt_count"] = len(attempt_details)
-    aggregate_stats["attempts"] = attempt_details
-    aggregate_stats["quality_validated"] = True
-    aggregate_stats["high_resolution_images"] = QWEN_HIGH_RES_IMAGES
-    aggregate_stats["image_png_kb"] = round(float(size_kb), 2)
-    aggregate_stats["image_base64_mb"] = round(float(base64_size_mb), 4)
-    aggregate_stats["processor_version"] = PROCESSOR_VERSION
+    del image_b64
+    if len(last_text.strip()) < OCR_MIN_CHARS and last_text.strip() != "[PAGE VIDE]":
+        raise RuntimeError(f"Page {page_num}: OCR trop court ou vide.")
+    _log(f"✅ Page {page_num}: OCR OK ({aggregate.get('total_tokens', 0)} tokens cumulés)")
+    return last_text, aggregate
 
-    _log(
-        f"✅ Page {page_num}: OCR validé après {len(attempt_details)} tentative(s) "
-        f"({aggregate_stats.get('total_tokens', 0)} tokens cumulés)"
-    )
-    return accepted_text, aggregate_stats
+
+def _validate_markdown_core(md: str, page_num: int) -> None:
+    if not isinstance(md, str) or not md.strip():
+        raise RuntimeError(f"Page {page_num}: Qwen a produit un Markdown vide.")
+    if ANNEX_HEADING_RE.search(md):
+        raise RuntimeError(f"Page {page_num}: Qwen a ajouté une annexe OCR interdite.")
+    if _extract_html_page_markers_outside_fences(md):
+        raise RuntimeError(f"Page {page_num}: Qwen a ajouté un marqueur PAGE interdit.")
+    if any(_fence_token(line) for line in md.splitlines()):
+        raise RuntimeError(f"Page {page_num}: bloc de code résiduel dans le Markdown Qwen.")
+    forbidden = ["[[BLOCK", "[[TABLE", "[[/BLOCK]]", "[[/TABLE]]", "<TAB>", "<EMPTY>", "<BR>"]
+    leftovers = [token for token in forbidden if token in md]
+    if leftovers:
+        raise RuntimeError(f"Page {page_num}: tokens OCR résiduels dans le Markdown: {leftovers}.")
+    _validate_markdown_tables_outside_fences(md)
 
 
 def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, Dict[str, Any]]:
-    """Convertit l'OCR validé en Markdown sans aucun appel réseau ni modèle génératif."""
-    del api_key  # Signature conservée pour compatibilité avec qwenocr_runner.py.
-    validation = validate_structured_ocr(ocr_text)
-    if not validation["ok"]:
-        raise RuntimeError(
-            f"Page {page_num}: OCR invalide transmis au moteur Markdown Python: "
-            + "; ".join(validation["errors"][:10])
-        )
+    _log(f"➡️ Page {page_num}: appel Qwen Markdown depuis l'OCR brut")
+    ocr_text_for_markdown = _strip_model_page_tokens(ocr_text)
+    user_block = (
+        f"Voici le texte OCR brut de la page physique {page_num} :\n\n"
+        "```text\n"
+        f"{ocr_text_for_markdown}\n"
+        "```\n\n"
+        "Génère uniquement le Markdown structuré pour cette page. "
+        "N'inclus PAS la section '## Annexe - OCR brut'. "
+        "Ne génère jamais de balise HTML <!-- PAGE n -->."
+    )
 
-    _log(f"➡️ Page {page_num}: rendu Markdown Python déterministe")
-    if validation.get("page_empty"):
-        markdown = "[PAGE VIDE]"
-        manifest: Dict[str, Any] = {"tables": []}
-    else:
-        markdown, manifest = _render_markdown_from_items(validation["items"])
-
-    md_validation = _validate_markdown_core(markdown, validation["items"], manifest=manifest)
-    if not md_validation["ok"]:
-        raise RuntimeError(
-            f"Page {page_num}: erreur interne du moteur Markdown Python: "
-            + "; ".join(md_validation["errors"][:10])
-        )
-
-    stats: Dict[str, Any] = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "cached_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "uncached_input_tokens": 0,
-        "mode": "deterministic_python_v4",
-        "quality_validated": True,
-        "model": MODEL_MD,
-        "tables_rendered": len(manifest.get("tables", [])),
-        "visible_atoms": int(md_validation.get("stats", {}).get("visible_atoms", 0)),
-    }
-    _log(f"✅ Page {page_num}: Markdown Python validé")
-    return markdown, stats
+    # Rôle et ordre historique inchangés : prompt Markdown puis OCR dans un
+    # seul message user.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                _cacheable_text_block(SYSTEM_PROMPT_MD),
+                {"type": "text", "text": user_block},
+            ],
+        }
+    ]
+    md, stats = _call_chat(
+        api_key=api_key,
+        model=MODEL_MD,
+        messages=messages,
+        max_tokens=MAX_TOKENS_MD,
+        context=f"Markdown page {page_num}",
+        enable_thinking=ENABLE_THINKING_MD,
+        high_resolution_images=False,
+    )
+    md = _strip_triple_backticks(md)
+    md = _strip_existing_ocr_appendix(md)
+    md = _clean_markdown_losslessly(md, page_num)
+    _validate_markdown_core(md, page_num)
+    stats["markdown_engine"] = "qwen"
+    _log(f"✅ Page {page_num}: Markdown Qwen validé ({stats.get('total_tokens', 0)} tokens)")
+    return md, stats
 
 
-# =====================
-# Fonction attendue par le runner
-# =====================
-
-def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first_page: bool = False) -> Tuple[str, Dict[str, Any]]:
-    """
-    Doit retourner (markdown_page, stats_payload).
-    stats_payload contient :
-      - champs flat (input_tokens/output_tokens/total_tokens)
-      - ET une sous-clé "stats" qui répète ces champs
-    -> compat avec runners qui font payload['stats'].
-    """
+def process_page_with_cache(
+    pdf_path: str,
+    page_num: int,
+    api_key: str,
+    is_first_page: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    del is_first_page  # conservé pour compatibilité avec le runner
     page_num = int(page_num)
 
-    # 1) OCR brut
-    ocr_text, ocr_stats = ocr_page_with_vl(api_key=api_key, pdf_path=pdf_path, page_num=page_num)
+    ocr_text, ocr_stats = ocr_page_with_vl(
+        api_key=api_key,
+        pdf_path=pdf_path,
+        page_num=page_num,
+    )
+    md_core, md_stats = markdown_from_ocr(
+        api_key=api_key,
+        ocr_text=ocr_text,
+        page_num=page_num,
+    )
 
-    # 2) Markdown structuré
-    md_core, md_stats = markdown_from_ocr(api_key=api_key, ocr_text=ocr_text, page_num=page_num)
-
-    # 3) Assemblage (inclut OCR brut en annexe)
+    fence = _choose_code_fence(ocr_text)
     page_md = (
         f"<!-- PAGE {page_num} -->\n\n"
         f"{md_core.strip()}\n\n"
         "## Annexe - OCR brut\n"
-        f"{_ocr_appendix_fence(ocr_text)}text\n"
+        f"{fence}text\n"
         f"[[PAGE {page_num}]]\n\n"
         f"{ocr_text.rstrip()}\n"
-        f"{_ocr_appendix_fence(ocr_text)}"
+        f"{fence}"
     ).strip()
+    _validate_single_page_artifact(page_md, page_num)
 
-    page_markers = _extract_html_page_markers_outside_fences(page_md)
-    if page_markers != [page_num]:
-        raise RuntimeError(
-            f"Structure Markdown invalide pour la page physique {page_num}: "
-            f"marqueurs détectés={page_markers}"
-        )
-
-    assembled_chunks = _extract_page_chunks(page_md)
-    if len(assembled_chunks) != 1 or assembled_chunks[0][0] != page_num:
-        raise RuntimeError(
-            f"Page {page_num}: assemblage final incohérent: "
-            f"chunks={[(number, len(chunk)) for number, chunk in assembled_chunks]}"
-        )
-    assembly_errors, assembly_warnings = _validate_page_chunk(page_num, assembled_chunks[0][1])
-    if assembly_errors:
-        raise RuntimeError(
-            f"Page {page_num}: artefact final refusé: " + "; ".join(assembly_errors[:10])
-        )
-    if assembly_warnings:
-        _log(f"⚠️ Page {page_num}: avertissements artefact: {'; '.join(assembly_warnings[:5])}")
-
-    input_tokens = int(ocr_stats.get("input_tokens", 0)) + int(md_stats.get("input_tokens", 0))
-    output_tokens = int(ocr_stats.get("output_tokens", 0)) + int(md_stats.get("output_tokens", 0))
-    total_tokens = int(ocr_stats.get("total_tokens", 0)) + int(md_stats.get("total_tokens", 0))
-    cached_tokens = int(ocr_stats.get("cached_tokens", 0)) + int(md_stats.get("cached_tokens", 0))
-    cache_creation_input_tokens = int(ocr_stats.get("cache_creation_input_tokens", 0)) + int(
-        md_stats.get("cache_creation_input_tokens", 0)
-    )
-    uncached_input_tokens = int(ocr_stats.get("uncached_input_tokens", 0)) + int(
-        md_stats.get("uncached_input_tokens", 0)
-    )
-
-    ocr_validation_summary = validate_structured_ocr(ocr_text)
-    integrity = {
-        "ocr_sha256": hashlib.sha256(ocr_text.encode("utf-8")).hexdigest(),
-        "markdown_core_sha256": hashlib.sha256(md_core.encode("utf-8")).hexdigest(),
-        "page_artifact_sha256": hashlib.sha256(page_md.encode("utf-8")).hexdigest(),
-        "ocr_elements": len(ocr_validation_summary.get("items", [])),
-        "ocr_tables": sum(1 for item in ocr_validation_summary.get("items", []) if item.get("kind") == "TABLE"),
-    }
-
-    stats_core = {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-        "cached_tokens": cached_tokens,
-        "cache_creation_input_tokens": cache_creation_input_tokens,
-        "uncached_input_tokens": uncached_input_tokens,
-        "details": {"ocr": ocr_stats, "md": md_stats},
-        "models": {"ocr": MODEL_OCR, "md": MODEL_MD},
-        "markdown_mode": md_stats.get("mode", "deterministic_python_v4"),
-        "quality_validated": bool(ocr_stats.get("quality_validated") and md_stats.get("quality_validated")),
+    combined = _merge_stats(ocr_stats, md_stats)
+    stats_core: Dict[str, Any] = {
+        **combined,
+        "details": {"ocr": ocr_stats, "markdown": md_stats},
+        "models": {"ocr": MODEL_OCR, "markdown": MODEL_MD},
+        "markdown_engine": "qwen",
         "render_dpi": RENDER_DPI,
-        "processor_version": PROCESSOR_VERSION,
-        "integrity": integrity,
+        "qwen_high_resolution_images": QWEN_HIGH_RES_IMAGES,
+        "explicit_cache_active": _EXPLICIT_CACHE_ACTIVE,
+        "pipeline_version": PIPELINE_VERSION,
+        "pipeline_fingerprint": get_pipeline_fingerprint(),
     }
-
     stats_payload: Dict[str, Any] = dict(stats_core)
     stats_payload["stats"] = dict(stats_core)
-
-    # Libération immédiate de la référence locale, sans gc.collect() global.
-    del ocr_text
-
     return page_md, stats_payload
-
 
 # =====================
 # Attendu: calculate_costs
 # =====================
 
+
 def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Compat runner : renvoie des coûts à 0.0 mais garde les totaux tokens.
-    Supporte 2 formats :
-      - dict flat
-      - dict wrapper avec sous-clé 'stats'
-    """
     stats_list = stats_list or []
-
-    total_input = 0
-    total_output = 0
-    total_tokens = 0
-
-    for s in stats_list:
-        if not isinstance(s, dict):
+    totals = {
+        "total_input": 0,
+        "total_output": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    for value in stats_list:
+        if not isinstance(value, dict):
             continue
-        core = s.get("stats") if isinstance(s.get("stats"), dict) else s
-        total_input += int(core.get("input_tokens", 0) or 0)
-        total_output += int(core.get("output_tokens", 0) or 0)
-        tt = core.get("total_tokens")
-        if tt is None:
-            tt = (int(core.get("input_tokens", 0) or 0) + int(core.get("output_tokens", 0) or 0))
-        total_tokens += int(tt or 0)
-
-    pages = max(len(stats_list), 1)
-
+        core = value.get("stats") if isinstance(value.get("stats"), dict) else value
+        totals["total_input"] += int(core.get("input_tokens", 0) or 0)
+        totals["total_output"] += int(core.get("output_tokens", 0) or 0)
+        totals["total_tokens"] += int(
+            core.get("total_tokens", int(core.get("input_tokens", 0) or 0) + int(core.get("output_tokens", 0) or 0)) or 0
+        )
+        totals["cached_tokens"] += int(core.get("cached_tokens", 0) or 0)
+        totals["cache_creation_input_tokens"] += int(core.get("cache_creation_input_tokens", 0) or 0)
+    pages = len(stats_list)
     return {
-        "total_input": total_input,
-        "total_output": total_output,
-        "total_tokens": total_tokens,
+        **totals,
         "cost_input": 0.0,
         "cost_output": 0.0,
         "cost_total": 0.0,
         "cost_per_page": 0.0,
         "pages": pages,
-        "stats": {  # compat éventuelle
-            "total_input": total_input,
-            "total_output": total_output,
-            "total_tokens": total_tokens,
-            "pages": pages,
-        },
+        "stats": {**totals, "pages": pages},
     }
 
 
@@ -2902,133 +2307,46 @@ def calculate_costs(stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Attendu: validate_markdown_quality
 # =====================
 
-def _scan_fences(text: str) -> Tuple[bool, List[str]]:
-    """Vérifie les fences Markdown, y compris les fences dynamiques de l'annexe OCR."""
-    active: Optional[str] = None
-    errors: List[str] = []
-    for line in (text or "").splitlines():
-        new_state, boundary = _fence_state_after_line(line, active)
-        if boundary:
-            active = new_state
-    if active is not None:
-        errors.append(f"bloc de code non fermé ({active})")
-    return not errors, errors
-
-
-def _extract_page_chunks(final_markdown: str) -> List[Tuple[int, str]]:
-    markers: List[Tuple[int, int, int]] = []
-    active_fence: Optional[str] = None
-    offset = 0
-    for line in (final_markdown or "").splitlines(keepends=True):
-        new_state, boundary = _fence_state_after_line(line, active_fence)
-        if boundary:
-            active_fence = new_state
-        elif active_fence is None:
-            marker = HTML_PAGE_MARKER_RE.match(line)
-            if marker:
-                markers.append((int(marker.group(1)), offset, offset + len(line)))
-        offset += len(line)
-
-    chunks: List[Tuple[int, str]] = []
-    for index, (page_num, _start, content_start) in enumerate(markers):
-        content_end = markers[index + 1][1] if index + 1 < len(markers) else len(final_markdown)
-        chunk = final_markdown[content_start:content_end]
-        chunk = re.sub(r"\n?\s*---\s*\n?\s*$", "", chunk).strip()
-        chunks.append((page_num, chunk))
-    return chunks
-
-
-_APPENDIX_PATTERN = re.compile(
-    r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$\s*"
-    r"(?P<fence>`{3,}|~{3,})text\s*\n\[\[PAGE\s+(?P<page>\d+)\]\]\s*\n"
-    r"(?P<ocr>.*?)\n(?P=fence)\s*$",
-    flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
-)
-
-
-
-def _validate_page_chunk(page_num: int, chunk: str) -> Tuple[List[str], List[str]]:
-    errors: List[str] = []
-    warnings: List[str] = []
-    _, fence_errors = _scan_fences(chunk)
-    errors.extend(f"Page {page_num}: {error}" for error in fence_errors)
-
-    appendix_headings = re.findall(
-        r"^##\s+Annexe\s*-\s*OCR\s+brut\s*$",
-        chunk or "",
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    if len(appendix_headings) != 1:
-        errors.append(
-            f"Page {page_num}: une seule rubrique 'Annexe - OCR brut' attendue, trouvé={len(appendix_headings)}"
-        )
-
-    matches = list(_APPENDIX_PATTERN.finditer(chunk or ""))
-    if len(matches) != 1:
-        errors.append(f"Page {page_num}: une seule annexe OCR complète attendue, trouvé={len(matches)}")
-        return errors, warnings
-
-    match = matches[0]
-    trailing = chunk[match.end():].strip()
-    if trailing:
-        errors.append(f"Page {page_num}: contenu interdit après la clôture de l'annexe OCR")
-
-    appendix_page = int(match.group("page"))
-    if appendix_page != page_num:
-        errors.append(f"Page {page_num}: l'annexe annonce [[PAGE {appendix_page}]]")
-
-    ocr_text = match.group("ocr").strip()
-    ocr_validation = validate_structured_ocr(ocr_text)
-    errors.extend(f"Page {page_num} OCR: {error}" for error in ocr_validation.get("errors", []))
-    warnings.extend(f"Page {page_num} OCR: {warning}" for warning in ocr_validation.get("warnings", []))
-
-    md_core = chunk[:match.start()].strip()
-    if not md_core:
-        errors.append(f"Page {page_num}: cœur Markdown absent avant l'annexe")
-        return errors, warnings
-
-    md_validation = _validate_markdown_core(md_core, ocr_validation.get("items", []))
-    errors.extend(f"Page {page_num} Markdown: {error}" for error in md_validation.get("errors", []))
-    warnings.extend(f"Page {page_num} Markdown: {warning}" for warning in md_validation.get("warnings", []))
-    return errors, warnings
-
 
 def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str, Any]:
-    """Contrôle strict et complet du document final, OCR annexé compris."""
     errors: List[str] = []
     warnings: List[str] = []
-    expected_count = int(page_count or 0)
+    try:
+        validate_canonical_markdown_structure(final_markdown, page_count)
+    except Exception as exc:
+        errors.append(str(exc))
 
-    if not isinstance(final_markdown, str) or not final_markdown.strip():
-        errors.append("Markdown final vide.")
-        chunks: List[Tuple[int, str]] = []
-    else:
-        _, fence_errors = _scan_fences(final_markdown)
-        errors.extend(fence_errors)
-        chunks = _extract_page_chunks(final_markdown)
-        if final_markdown.rstrip().splitlines() and final_markdown.rstrip().splitlines()[-1].strip() == "---":
-            errors.append("Le document final ne doit pas se terminer par un séparateur ---")
+    pages_found: List[int] = []
+    annexes = 0
+    tables = 0
+    table_rows = 0
+    if isinstance(final_markdown, str) and final_markdown.strip():
+        try:
+            pages_found = _extract_html_page_markers_outside_fences(final_markdown)
+            annexes = sum(
+                1 for _index, line in _outside_fence_lines(final_markdown) if ANNEX_HEADING_RE.match(line)
+            )
+            # Ne compte que la partie hors annexes pour les statistiques métier.
+            outside_text = "\n".join(line for _index, line in _outside_fence_lines(final_markdown))
+            tables, table_rows = _validate_markdown_tables_outside_fences(outside_text)
+        except Exception as exc:
+            if str(exc) not in errors:
+                errors.append(str(exc))
 
-    actual_pages = [page_num for page_num, _ in chunks]
-    expected_pages = list(range(1, expected_count + 1)) if expected_count else actual_pages
-    if actual_pages != expected_pages:
-        errors.append(f"Pagination physique invalide: attendu={expected_pages}, obtenu={actual_pages}")
-
-    for page_num, chunk in chunks:
-        page_errors, page_warnings = _validate_page_chunk(page_num, chunk)
-        errors.extend(page_errors)
-        warnings.extend(page_warnings)
-
-    if expected_count and len(chunks) != expected_count:
-        errors.append(f"Nombre de pages contrôlables: {len(chunks)}, attendu: {expected_count}")
-
-    errors = list(dict.fromkeys(errors))[:200]
-    warnings = list(dict.fromkeys(warnings))[:200]
+    amount_pattern = re.compile(
+        r"(?<!\w)[-+−]?\(?\d{1,3}(?:[ .\u00A0']\d{3})*(?:[,.]\d+)?\)?\s*(?:€|EUR|USD|CHF|GBP|£|\$)?",
+        flags=re.IGNORECASE,
+    )
+    amounts = len(amount_pattern.findall(final_markdown or ""))
     ok = not errors
-    score = 1.0 if ok else max(0.0, 1.0 - min(len(errors), 25) / 25.0)
+    score = 1.0 if ok else 0.0
     stats = {
-        "page_count": expected_count,
-        "pages_checked": len(chunks),
+        "page_count": int(page_count or 0),
+        "pages_detectees": len(pages_found),
+        "annexes_ocr": annexes,
+        "tableaux": tables,
+        "lignes_tableaux": table_rows,
+        "montants_detectes": amounts,
         "warnings_count": len(warnings),
         "errors_count": len(errors),
         "score": score,
@@ -3042,29 +2360,26 @@ def validate_markdown_quality(final_markdown: str, page_count: int) -> Dict[str,
         "errors": errors,
         "warnings": warnings,
         "stats": stats,
-        "summary": ("OK" if ok else "KO") + ("" if not warnings else f" (warnings={len(warnings)})"),
+        "summary": "OK" if ok else "KO: " + " | ".join(errors),
     }
+
 
 __all__ = [
     "API_URL",
-    "PROCESSOR_VERSION",
     "MODEL",
     "MODEL_OCR",
     "MODEL_MD",
+    "PIPELINE_VERSION",
+    "ENABLE_EXPLICIT_CACHE",
+    "QWEN_HIGH_RES_IMAGES",
+    "ENABLE_HEURISTIC_HEADER_REORDER",
     "INTER_REQUEST_DELAY",
     "STOP_ON_CRITICAL",
     "RENDER_DPI",
-    "ENABLE_EXPLICIT_CACHE",
-    "QWEN_HIGH_RES_IMAGES",
-    "MAX_BASE64_IMAGE_MB",
-    "USE_QWEN_MARKDOWN",
-    "ALLOW_SAFE_STRUCTURE_REPAIR",
-    "PIPELINE_VERSION",
-    "PIPELINE_FINGERPRINT",
-    "get_pipeline_fingerprint",
-    "get_progress_path",
     "validate_api_configuration",
     "configure_explicit_cache_for_batch",
+    "get_pipeline_fingerprint",
+    "get_progress_path",
     "get_pdf_info",
     "load_progress",
     "save_progress",
@@ -3072,15 +2387,8 @@ __all__ = [
     "process_page_with_cache",
     "calculate_costs",
     "validate_markdown_quality",
-    "validate_structured_ocr",
-    "render_markdown_deterministic",
     "validate_canonical_markdown_structure",
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
-
-
-
-
-
 
