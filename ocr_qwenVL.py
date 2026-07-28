@@ -26,7 +26,8 @@ Robustesse :
 - DPI par défaut = 300 (configurable via env RENDER_DPI)
 - Conversion PDF->PNG low-memory (pdf2image paths_only + fichiers temporaires)
 - Retry court + logs en cas de 429/overloaded
-- Retry spécifique si OCR invalide ou trop court (jusqu'à 3 reprises qualité par défaut)
+- Réparation Python des seules erreurs techniques certaines, sans modifier les valeurs visibles
+- Une seule reprise OCR complète par défaut lorsqu'une erreur critique subsiste
 - Payload stats contient des clés "flat" + sous-clé "stats" (compat runner)
 """
 
@@ -114,10 +115,10 @@ else:
     API_URL = ""
 
 MODEL_OCR = os.getenv("QWEN_MODEL_OCR", "qwen3.7-plus")
-MODEL_MD = "python-deterministic-v4"
+MODEL_MD = "python-deterministic-v4.2"
 
 # Isole les checkpoints et les statistiques des anciennes versions du processeur.
-PROCESSOR_VERSION = "python-markdown-v4-20260727"
+PROCESSOR_VERSION = "python-markdown-v4.2-balanced-20260728"
 _PROCESSOR_VERSION_SAFE = re.sub(r"[^A-Za-z0-9_.-]+", "-", PROCESSOR_VERSION).strip(".-")
 
 # Attendu par le runner (affiché au démarrage)
@@ -152,15 +153,35 @@ VERBOSE = _env_bool("VERBOSE", True)
 # Rate-limit behavior
 FAIL_FAST_ON_429 = _env_bool("FAIL_FAST_ON_429", False)  # False = retry court; True = fail vite
 
-# Contrôles qualité OCR. Une page n'est acceptée que si la sortie structurée est valide.
+# Contrôles qualité OCR.
+#
+# Stratégie équilibrée :
+# - Python répare les seules métadonnées techniques dont la correction est certaine ;
+# - une erreur touchant potentiellement une donnée comptable déclenche au maximum UNE
+#   nouvelle lecture complète de la page par défaut ;
+# - les anciennes variables Cloud Run OCR_QUALITY_RETRIES=3 / OCR_EMPTY_RETRIES=2
+#   ne peuvent plus provoquer quatre lectures, car elles sont plafonnées par
+#   OCR_MAX_FULL_PAGE_RETRIES (1 par défaut).
 OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 40)
-OCR_EMPTY_RETRIES = max(0, _env_int("OCR_EMPTY_RETRIES", 2))
-OCR_QUALITY_RETRIES = max(0, _env_int("OCR_QUALITY_RETRIES", 3))
+OCR_MAX_FULL_PAGE_RETRIES = max(0, _env_int("OCR_MAX_FULL_PAGE_RETRIES", 1))
+_REQUESTED_OCR_EMPTY_RETRIES = max(0, _env_int("OCR_EMPTY_RETRIES", 1))
+_REQUESTED_OCR_QUALITY_RETRIES = max(0, _env_int("OCR_QUALITY_RETRIES", 1))
+OCR_EMPTY_RETRIES = min(_REQUESTED_OCR_EMPTY_RETRIES, OCR_MAX_FULL_PAGE_RETRIES)
+OCR_QUALITY_RETRIES = min(_REQUESTED_OCR_QUALITY_RETRIES, OCR_MAX_FULL_PAGE_RETRIES)
 OCR_EMPTY_RETRY_SLEEP = _env_float("OCR_EMPTY_RETRY_SLEEP", 1.5)
-OCR_EMPTY_PAGE_CONFIRMATIONS = max(1, _env_int("OCR_EMPTY_PAGE_CONFIRMATIONS", 2))
+_REQUESTED_OCR_EMPTY_PAGE_CONFIRMATIONS = max(1, _env_int("OCR_EMPTY_PAGE_CONFIRMATIONS", 2))
+OCR_EMPTY_PAGE_CONFIRMATIONS = min(
+    _REQUESTED_OCR_EMPTY_PAGE_CONFIRMATIONS,
+    OCR_MAX_FULL_PAGE_RETRIES + 1,
+)
 STRICT_OCR_STRUCTURE = _env_bool("STRICT_OCR_STRUCTURE", True)
 STRICT_FUSED_CELL_HEURISTICS = _env_bool("STRICT_FUSED_CELL_HEURISTICS", True)
-ALLOW_SAFE_STRUCTURE_REPAIR = _env_bool("ALLOW_SAFE_STRUCTURE_REPAIR", False)
+
+# La réparation sûre fait partie du mode équilibré. L'ancienne variable
+# ALLOW_SAFE_STRUCTURE_REPAIR est volontairement ignorée pour éviter qu'une valeur
+# historique "false" dans Cloud Run réactive les reprises inutiles. Pour diagnostic
+# uniquement, DISABLE_SAFE_STRUCTURE_REPAIR=true permet de la couper explicitement.
+ALLOW_SAFE_STRUCTURE_REPAIR = not _env_bool("DISABLE_SAFE_STRUCTURE_REPAIR", False)
 BLANK_PAGE_DARK_PIXEL_RATIO = max(0.0, _env_float("BLANK_PAGE_DARK_PIXEL_RATIO", 0.001))
 
 # Le mode haute résolution est explicitement demandé à Qwen-VL pour préserver les petits caractères.
@@ -190,6 +211,28 @@ def _log(msg: str) -> None:
 
 if os.getenv("USE_QWEN_MARKDOWN", "").strip().lower() not in {"", "0", "false", "no", "off"}:
     _log("⚠️ USE_QWEN_MARKDOWN est ignoré : cette version impose le rendu Markdown Python.")
+
+if _REQUESTED_OCR_QUALITY_RETRIES > OCR_MAX_FULL_PAGE_RETRIES:
+    _log(
+        f"ℹ️ OCR_QUALITY_RETRIES={_REQUESTED_OCR_QUALITY_RETRIES} plafonné à "
+        f"{OCR_MAX_FULL_PAGE_RETRIES} par OCR_MAX_FULL_PAGE_RETRIES."
+    )
+if _REQUESTED_OCR_EMPTY_RETRIES > OCR_MAX_FULL_PAGE_RETRIES:
+    _log(
+        f"ℹ️ OCR_EMPTY_RETRIES={_REQUESTED_OCR_EMPTY_RETRIES} plafonné à "
+        f"{OCR_MAX_FULL_PAGE_RETRIES} par OCR_MAX_FULL_PAGE_RETRIES."
+    )
+if _REQUESTED_OCR_EMPTY_PAGE_CONFIRMATIONS > OCR_MAX_FULL_PAGE_RETRIES + 1:
+    _log(
+        f"ℹ️ OCR_EMPTY_PAGE_CONFIRMATIONS={_REQUESTED_OCR_EMPTY_PAGE_CONFIRMATIONS} "
+        f"plafonné à {OCR_MAX_FULL_PAGE_RETRIES + 1} pour respecter le plafond global."
+    )
+if os.getenv("ALLOW_SAFE_STRUCTURE_REPAIR") is not None:
+    _log(
+        "ℹ️ ALLOW_SAFE_STRUCTURE_REPAIR est une ancienne variable ignorée ; "
+        "la réparation sûre est active. Utiliser DISABLE_SAFE_STRUCTURE_REPAIR=true "
+        "uniquement pour un diagnostic."
+    )
 
 
 def validate_api_configuration() -> None:
@@ -692,7 +735,7 @@ CONTRÔLE FINAL SILENCIEUX AVANT SORTIE
 # Progress (attendu par le runner)
 # =====================
 
-PIPELINE_VERSION = "qwen-vl-ocr-python-markdown-v4"
+PIPELINE_VERSION = "qwen-vl-ocr-python-markdown-v4.2-balanced"
 
 
 def _pipeline_fingerprint() -> str:
@@ -707,8 +750,16 @@ def _pipeline_fingerprint() -> str:
         "strict_ocr_structure": STRICT_OCR_STRUCTURE,
         "strict_fused_cell_heuristics": STRICT_FUSED_CELL_HEURISTICS,
         "allow_safe_structure_repair": ALLOW_SAFE_STRUCTURE_REPAIR,
+        "ocr_max_full_page_retries": OCR_MAX_FULL_PAGE_RETRIES,
+        "ocr_empty_retries": OCR_EMPTY_RETRIES,
+        "ocr_quality_retries": OCR_QUALITY_RETRIES,
+        "ocr_empty_page_confirmations": OCR_EMPTY_PAGE_CONFIRMATIONS,
+        "ocr_min_chars": OCR_MIN_CHARS,
+        "max_tokens_ocr": MAX_TOKENS_OCR,
+        "temperature": TEMPERATURE,
+        "enable_thinking_ocr": ENABLE_THINKING_OCR,
         "ocr_prompt_sha256": hashlib.sha256(OCR_PROMPT.encode("utf-8")).hexdigest(),
-        "renderer_contract": "exact-atom-roundtrip-v4",
+        "renderer_contract": "exact-atom-roundtrip-v4.2-balanced",
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -718,9 +769,14 @@ PIPELINE_FINGERPRINT = _pipeline_fingerprint()
 
 
 def _progress_path(pdf_path: str) -> str:
-    # Un nouveau processeur ne doit jamais reprendre des pages produites par une
-    # ancienne logique OCR/Markdown.
-    return str(Path(pdf_path).with_suffix(f".{_PROCESSOR_VERSION_SAFE}.progress.json"))
+    """Chemin imposé par qwenocr_runner.py pour le checkpoint local.
+
+    Le runner télécharge, téléverse et vérifie explicitement le fichier
+    ``<pdf>.progress.json``. Le nom ne doit donc jamais être versionné.
+    L'isolation entre versions est assurée à l'intérieur du JSON par
+    ``processor_version`` et ``pipeline_fingerprint``.
+    """
+    return str(Path(pdf_path).with_suffix(".progress.json"))
 
 def load_progress(
     pdf_path: str,
@@ -774,6 +830,9 @@ def save_progress(
     page_count: Optional[int] = None,
 ) -> None:
     p = _progress_path(pdf_path)
+    parent = os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = p + ".tmp"
     payload = {
         "version": 3,
@@ -1589,22 +1648,44 @@ def validate_structured_ocr(text: str) -> Dict[str, Any]:
 
 
 def _repair_unambiguous_ocr_structure(text: str) -> Tuple[str, List[str]]:
-    """
-    Répare uniquement des métadonnées techniques, jamais une valeur visible.
-    Désactivé par défaut. Une table dont les lignes n'ont pas toutes la même largeur
-    n'est jamais réparée.
+    """Répare seulement des erreurs techniques dont la correction est certaine.
+
+    La fonction ne modifie jamais un mot, un nombre, un montant, une référence, un
+    taux ou le contenu d'une cellule non vide. Elle peut uniquement :
+
+    1. remplacer une fermeture [[/BLOCK]] / [[/TABLE]] par le type réellement ouvert ;
+    2. corriger ``cols=N`` lorsque toutes les lignes ont déjà exactement la même largeur ;
+    3. supprimer une colonne sans en-tête entièrement vide dans toutes les lignes de
+       données, puis mettre ``cols=N`` à jour.
+
+    Une table aux largeurs hétérogènes, une cellule potentiellement fusionnée ou une
+    ambiguïté sémantique n'est jamais réparée ici : elle reste critique et peut
+    déclencher l'unique nouvelle lecture Qwen autorisée.
     """
     lines = (text or "").splitlines()
     repairs: List[str] = []
     output = list(lines)
 
+    # 1) Fermeture du mauvais type, uniquement quand une seule structure est ouverte.
     active_kind: Optional[str] = None
+    nested_ambiguity = False
     for index, line in enumerate(output):
         open_match = OCR_OPEN_TAG_RE.match(line)
         close_match = OCR_CLOSE_TAG_RE.match(line)
-        if open_match and active_kind is None:
-            active_kind = open_match.group(1).upper()
-        elif close_match and active_kind is not None:
+        if open_match:
+            if active_kind is None:
+                active_kind = open_match.group(1).upper()
+                nested_ambiguity = False
+            else:
+                # Une seconde ouverture avant fermeture est ambiguë. On ne touche
+                # à aucune balise de cette zone ; le validateur la rejettera.
+                nested_ambiguity = True
+            continue
+        if close_match and active_kind is not None:
+            if nested_ambiguity:
+                active_kind = None
+                nested_ambiguity = False
+                continue
             close_kind = close_match.group(1).upper()
             if close_kind != active_kind:
                 output[index] = f"[[/{active_kind}]]"
@@ -1612,35 +1693,152 @@ def _repair_unambiguous_ocr_structure(text: str) -> Tuple[str, List[str]]:
                     f"ligne {index + 1}: fermeture [[/{close_kind}]] remplacée par [[/{active_kind}]]"
                 )
             active_kind = None
+            nested_ambiguity = False
 
+    # Une unique structure restée ouverte jusqu'à la fin peut être fermée sans
+    # interpréter ni déplacer son contenu. Une zone imbriquée n'est jamais complétée.
+    if active_kind is not None and not nested_ambiguity:
+        output.append(f"[[/{active_kind}]]")
+        repairs.append(f"fin de réponse: fermeture [[/{active_kind}]] ajoutée")
+
+    # 2) Tables : correction de cols et retrait d'une colonne réellement vide.
     index = 0
     while index < len(output):
         match = OCR_OPEN_TAG_RE.match(output[index])
         if not match or match.group(1).upper() != "TABLE":
             index += 1
             continue
-        attrs, _ = _parse_tag_attributes_strict(match.group(2), index + 1)
+
+        attrs, attr_errors = _parse_tag_attributes_strict(match.group(2), index + 1)
+        if attr_errors:
+            index += 1
+            continue
+
         end = index + 1
-        widths: List[int] = []
         while end < len(output):
             close = OCR_CLOSE_TAG_RE.match(output[end])
             if close and close.group(1).upper() == "TABLE":
                 break
-            if output[end].strip():
-                widths.append(output[end].count("<TAB>") + 1)
+            # Une nouvelle ouverture avant la fermeture rend la zone ambiguë.
+            if OCR_OPEN_TAG_RE.match(output[end]):
+                break
             end += 1
-        if end < len(output) and widths and len(set(widths)) == 1:
-            actual = widths[0]
-            try:
-                declared = int(attrs.get("cols", "0"))
-            except ValueError:
-                declared = 0
-            if declared > 0 and declared != actual:
-                output[index] = re.sub(r"\bcols=\d+\b", f"cols={actual}", output[index], count=1, flags=re.IGNORECASE)
-                repairs.append(
-                    f"table ligne {index + 1}: cols={declared} remplacé par cols={actual}; toutes les lignes concordent"
+
+        if end >= len(output) or not (
+            OCR_CLOSE_TAG_RE.match(output[end])
+            and OCR_CLOSE_TAG_RE.match(output[end]).group(1).upper() == "TABLE"
+        ):
+            index += 1
+            continue
+
+        content_indexes = [
+            line_index
+            for line_index in range(index + 1, end)
+            if output[line_index].strip()
+        ]
+        rows = [output[line_index].split("<TAB>") for line_index in content_indexes]
+        if not rows:
+            index = end + 1
+            continue
+
+        widths = {len(row) for row in rows}
+        if len(widths) != 1:
+            # Largeurs différentes : aucune hypothèse de padding ou de fusion.
+            index = end + 1
+            continue
+
+        width = len(rows[0])
+        if width <= 0:
+            index = end + 1
+            continue
+
+        # Une colonne est supprimable uniquement si son en-tête est explicitement vide
+        # ou générique ET si toutes les lignes de données sont vides à cet index.
+        removable: List[int] = []
+        if len(rows) >= 2:
+            header = rows[0]
+            data_rows = rows[1:]
+            for cell_index, header_cell in enumerate(header):
+                header_value = (header_cell or "").strip()
+                header_is_unnamed = (
+                    header_value in {"", "<EMPTY>"}
+                    or bool(_GENERIC_HEADER_RE.fullmatch(header_value))
                 )
-        index = max(index + 1, end + 1)
+                if not header_is_unnamed:
+                    continue
+                if all(
+                    (row[cell_index] or "").strip() in {"", "<EMPTY>"}
+                    for row in data_rows
+                ):
+                    removable.append(cell_index)
+
+        if removable and len(removable) < width:
+            removed_display = ", ".join(str(position + 1) for position in removable)
+            new_rows = [
+                [cell for cell_index, cell in enumerate(row) if cell_index not in removable]
+                for row in rows
+            ]
+            # Les marqueurs [SANS_ENTETE_n] sont purement techniques : après
+            # suppression d'une colonne vide, les renuméroter de gauche à droite
+            # ne touche aucune valeur visible.
+            generic_counter = 1
+            for cell_index, header_cell in enumerate(new_rows[0]):
+                if _GENERIC_HEADER_RE.fullmatch((header_cell or "").strip()):
+                    new_rows[0][cell_index] = f"[SANS_ENTETE_{generic_counter}]"
+                    generic_counter += 1
+
+            for line_index, row in zip(content_indexes, new_rows):
+                output[line_index] = "<TAB>".join(row)
+            rows = new_rows
+            width = len(new_rows[0])
+            repairs.append(
+                f"table ligne {index + 1}: colonne(s) sans en-tête entièrement vide(s) "
+                f"supprimée(s): {removed_display}"
+            )
+
+        raw_cols = attrs.get("cols", "")
+        try:
+            declared = int(raw_cols)
+        except (TypeError, ValueError):
+            declared = 0
+
+        if declared <= 0:
+            # Les lignes concordent toutes : ajouter ou remplacer cols ne modifie
+            # aucune cellule et évite un nouvel OCR pour une simple métadonnée.
+            if re.search(r"\bcols=[^\s\]]+", output[index], flags=re.IGNORECASE):
+                output[index] = re.sub(
+                    r"\bcols=[^\s\]]+",
+                    f"cols={width}",
+                    output[index],
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                output[index] = re.sub(
+                    r"\]\]\s*$",
+                    f" cols={width}]]",
+                    output[index],
+                    count=1,
+                )
+            repairs.append(
+                f"table ligne {index + 1}: cols={width} ajouté/corrigé; "
+                "toutes les lignes concordent"
+            )
+        elif declared != width:
+            output[index] = re.sub(
+                r"\bcols=\d+\b",
+                f"cols={width}",
+                output[index],
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            repairs.append(
+                f"table ligne {index + 1}: cols={declared} remplacé par cols={width}; "
+                "toutes les lignes concordent"
+            )
+
+        index = end + 1
+
     return "\n".join(output).strip(), repairs
 
 
@@ -2687,6 +2885,9 @@ def ocr_page_with_vl(api_key: str, pdf_path: str, page_num: int) -> Tuple[str, D
         )
 
     aggregate_stats["attempt_count"] = len(attempt_details)
+    aggregate_stats["max_attempts_allowed"] = max_attempts
+    aggregate_stats["max_full_page_retries"] = OCR_MAX_FULL_PAGE_RETRIES
+    aggregate_stats["safe_structure_repair"] = ALLOW_SAFE_STRUCTURE_REPAIR
     aggregate_stats["attempts"] = attempt_details
     aggregate_stats["quality_validated"] = True
     aggregate_stats["high_resolution_images"] = QWEN_HIGH_RES_IMAGES
@@ -2732,7 +2933,7 @@ def markdown_from_ocr(api_key: str, ocr_text: str, page_num: int) -> Tuple[str, 
         "cached_tokens": 0,
         "cache_creation_input_tokens": 0,
         "uncached_input_tokens": 0,
-        "mode": "deterministic_python_v4",
+        "mode": "deterministic_python_v4.2",
         "quality_validated": True,
         "model": MODEL_MD,
         "tables_rendered": len(manifest.get("tables", [])),
@@ -2823,7 +3024,7 @@ def process_page_with_cache(pdf_path: str, page_num: int, api_key: str, is_first
         "uncached_input_tokens": uncached_input_tokens,
         "details": {"ocr": ocr_stats, "md": md_stats},
         "models": {"ocr": MODEL_OCR, "md": MODEL_MD},
-        "markdown_mode": md_stats.get("mode", "deterministic_python_v4"),
+        "markdown_mode": md_stats.get("mode", "deterministic_python_v4.2"),
         "quality_validated": bool(ocr_stats.get("quality_validated") and md_stats.get("quality_validated")),
         "render_dpi": RENDER_DPI,
         "processor_version": PROCESSOR_VERSION,
@@ -3048,6 +3249,10 @@ __all__ = [
     "MAX_BASE64_IMAGE_MB",
     "USE_QWEN_MARKDOWN",
     "ALLOW_SAFE_STRUCTURE_REPAIR",
+    "OCR_MAX_FULL_PAGE_RETRIES",
+    "OCR_EMPTY_RETRIES",
+    "OCR_QUALITY_RETRIES",
+    "OCR_EMPTY_PAGE_CONFIRMATIONS",
     "PIPELINE_VERSION",
     "PIPELINE_FINGERPRINT",
     "validate_api_configuration",
@@ -3065,3 +3270,10 @@ __all__ = [
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
+
+
+
+
+
+
+
