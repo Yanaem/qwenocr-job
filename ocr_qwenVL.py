@@ -717,10 +717,21 @@ def _pipeline_fingerprint() -> str:
 PIPELINE_FINGERPRINT = _pipeline_fingerprint()
 
 
-def _progress_path(pdf_path: str) -> str:
+def get_pipeline_fingerprint() -> str:
+    """Retourne l'empreinte publique du pipeline attendue par le runner."""
+    return PIPELINE_FINGERPRINT
+
+
+def get_progress_path(pdf_path: str) -> str:
+    """Retourne le chemin public du checkpoint attendu par le runner."""
     # Un nouveau processeur ne doit jamais reprendre des pages produites par une
     # ancienne logique OCR/Markdown.
     return str(Path(pdf_path).with_suffix(f".{_PROCESSOR_VERSION_SAFE}.progress.json"))
+
+
+def _progress_path(pdf_path: str) -> str:
+    """Alias interne conservé pour éviter toute régression dans le module."""
+    return get_progress_path(pdf_path)
 
 def load_progress(
     pdf_path: str,
@@ -3050,6 +3061,8 @@ __all__ = [
     "ALLOW_SAFE_STRUCTURE_REPAIR",
     "PIPELINE_VERSION",
     "PIPELINE_FINGERPRINT",
+    "get_pipeline_fingerprint",
+    "get_progress_path",
     "validate_api_configuration",
     "configure_explicit_cache_for_batch",
     "get_pdf_info",
@@ -3065,7 +3078,6 @@ __all__ = [
     "ocr_page_with_vl",
     "markdown_from_ocr",
 ]
-
 
 
 
