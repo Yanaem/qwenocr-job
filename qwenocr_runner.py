@@ -250,7 +250,7 @@ def run_for_pdf(
     print(f"📄 Fichier PDF      : {pdf_path}")
     print(f"🧩 Module OCR       : {OCR_MODULE_NAME} ({ocr.PIPELINE_VERSION})")
     print(f"💰 Modèle OCR       : {ocr.MODEL}")
-    print(f"📝 Markdown         : Qwen ({getattr(ocr, 'MODEL_MD', ocr.MODEL)})")
+    print(f"📝 Modèle Markdown  : {getattr(ocr, 'MODEL_MD', ocr.MODEL)} (Qwen)")
     print(f"⚙️  PAGE_WORKERS     : {PAGE_WORKERS} (valeur reçue : {PAGE_WORKERS_RAW!r})")
     print(f"🧠 Cache explicite   : {'configuré' if ocr.ENABLE_EXPLICIT_CACHE else 'désactivé'}")
     print(f"🔎 Haute résolution : {'activée' if ocr.QWEN_HIGH_RES_IMAGES else 'désactivée'}")
