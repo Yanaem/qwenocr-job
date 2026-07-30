@@ -9,19 +9,18 @@ Contrat principal utilisé par qwenocr_runner.py :
 - process_page_with_cache(pdf_path, page_num, api_key, is_first_page=False) ;
 - calculate_costs et validate_markdown_quality.
 
-Pipeline par page :
-1) rendu unique du PDF en image PNG ;
-2) OCR brut : image -> transcription layout-aware ;
-3) Markdown : image originale (source principale) + OCR brut (inventaire de contrôle)
-   -> Markdown structuré ;
-4) assainissement technique du contenant, ajout de l'annexe OCR et validation
-   de l'enveloppe physique de la page.
+Architecture à deux files :
+1) rendu unique de la page vers un PNG local persistant ;
+2) file OCR : image -> inventaire OCR ;
+3) sauvegarde durable de l'OCR avant tout appel Markdown ;
+4) file Markdown : même image + OCR sauvegardé -> Markdown structuré ;
+5) récupération ciblée d'une seule phase en cas d'échec local ;
+6) assemblage, validation de l'enveloppe et sauvegarde finale.
 
-Le chemin nominal comporte exactement une génération OCR et une génération
-Markdown par page. Python ne modifie jamais les tableaux, les cellules, les
-colonnes, les valeurs ou l'ordre documentaire produits par Qwen. Les anomalies
-de structure interne sont signalées comme avertissements sans réparation ni
-nouvelle génération automatique.
+Le chemin nominal comporte une génération OCR et une génération Markdown par
+page. Une récupération technique ciblée peut relancer uniquement la phase
+échouée, sans refaire un OCR déjà sauvegardé. Python ne modifie jamais les
+tableaux, les cellules, les colonnes, les valeurs ou l'ordre documentaire.
 """
 
 from __future__ import annotations
@@ -98,9 +97,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =====================
 
-PIPELINE_VERSION = "qwen-ocr-image-first-markdown-v3.6.1-final-20260730"
-CHECKPOINT_VERSION = 3
-CLEANER_VERSION = "transport-only-markdown-sanitizer-v3.6.1"
+PIPELINE_VERSION = "qwen-ocr-two-queues-v3.7.0-20260730"
+CHECKPOINT_VERSION = 4
+CLEANER_VERSION = "transport-only-markdown-sanitizer-v3.7.0"
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
@@ -147,12 +146,19 @@ OCR_EMPTY_RETRIES = 0
 ENABLE_THINKING_OCR = _env_bool("ENABLE_THINKING_OCR", True)
 ENABLE_THINKING_MD = _env_bool("ENABLE_THINKING_MD", True)
 
-# Verrous d'efficience : aucun second appel sans thinking et aucune régénération
-# structurelle. Ces constantes restent exportées pour le contrat du runner.
+# Aucun fallback sans thinking et aucune réparation structurelle du Markdown.
 ALLOW_NO_THINK_FALLBACK_OCR = False
 ALLOW_NO_THINK_FALLBACK_MD = False
 MARKDOWN_FORMAT_RETRIES = 0
-STRICT_TWO_GENERATIONS = True
+
+# Contrat du pipeline à deux files. Deux générations dans le chemin nominal ;
+# une récupération ciblée peut relancer uniquement la phase techniquement échouée.
+TWO_QUEUE_PIPELINE = True
+NOMINAL_TWO_GENERATIONS = True
+TARGETED_RECOVERY_ENABLED = True
+STRICT_TWO_GENERATIONS = False  # conservé uniquement pour compatibilité explicite
+OCR_RECOVERY_ATTEMPTS = 1
+MARKDOWN_RECOVERY_ATTEMPTS = 1
 EMPTY_RESPONSE_LOG_CHARS = max(200, _env_int("EMPTY_RESPONSE_LOG_CHARS", 1500))
 
 # Cache explicite : seul le long prompt système statique reçoit le marqueur.
@@ -1084,8 +1090,19 @@ Avant de répondre, vérifie :
 
 
 # =====================
-# Progress / checkpoints (contrat runner)
+# Progress / checkpoints (deux étapes persistantes)
 # =====================
+
+
+CHECKPOINT_SCHEMA = "two-stage-page-state-v1"
+CHECKPOINT_STATUSES = {
+    "pending_ocr",
+    "ocr_retry_pending",
+    "ocr_done",
+    "markdown_retry_pending",
+    "markdown_done",
+    "failed_final",
+}
 
 
 def _sha256_text(value: str) -> str:
@@ -1096,6 +1113,7 @@ def get_pipeline_fingerprint() -> str:
     payload = {
         "pipeline_version": PIPELINE_VERSION,
         "cleaner_version": CLEANER_VERSION,
+        "checkpoint_schema": CHECKPOINT_SCHEMA,
         "api_url": API_URL,
         "model_ocr": MODEL_OCR,
         "model_md": MODEL_MD,
@@ -1111,6 +1129,11 @@ def get_pipeline_fingerprint() -> str:
         "markdown_format_retries": MARKDOWN_FORMAT_RETRIES,
         "markdown_uses_image": MARKDOWN_USES_IMAGE,
         "markdown_structural_cleanup": MARKDOWN_STRUCTURAL_CLEANUP,
+        "two_queue_pipeline": TWO_QUEUE_PIPELINE,
+        "nominal_two_generations": NOMINAL_TWO_GENERATIONS,
+        "targeted_recovery_enabled": TARGETED_RECOVERY_ENABLED,
+        "ocr_recovery_attempts": OCR_RECOVERY_ATTEMPTS,
+        "markdown_recovery_attempts": MARKDOWN_RECOVERY_ATTEMPTS,
         "ocr_prompt_sha256": _sha256_text(OCR_PROMPT),
         "md_prompt_sha256": _sha256_text(SYSTEM_PROMPT_MD),
     }
@@ -1126,15 +1149,33 @@ def _progress_path(pdf_path: str) -> str:
     return get_progress_path(pdf_path)
 
 
+def _checkpoint_record_hash(record: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _checkpoint_page_hashes(pages: Dict[str, Dict]) -> Dict[str, str]:
     hashes: Dict[str, str] = {}
     for page_key, record in (pages or {}).items():
-        if isinstance(record, dict) and isinstance(record.get("markdown"), str):
-            hashes[str(page_key)] = _sha256_text(record["markdown"])
+        if isinstance(record, dict):
+            hashes[str(page_key)] = _checkpoint_record_hash(record)
     return hashes
 
 
-def _valid_checkpoint_page_record(page_key: str, value: Any, page_count: Optional[int]) -> bool:
+def _valid_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_checkpoint_page_record(
+    page_key: str,
+    value: Any,
+    page_count: Optional[int],
+) -> bool:
     try:
         page_num = int(page_key)
     except Exception:
@@ -1143,15 +1184,47 @@ def _valid_checkpoint_page_record(page_key: str, value: Any, page_count: Optiona
         return False
     if not isinstance(value, dict):
         return False
-    markdown = value.get("markdown")
-    stats = value.get("stats")
-    if not isinstance(markdown, str) or not markdown.strip() or not isinstance(stats, dict):
+
+    status = str(value.get("status", "") or "")
+    if status not in CHECKPOINT_STATUSES:
         return False
-    try:
-        _validate_single_page_artifact(markdown, page_num)
-    except Exception as exc:
-        _log(f"⚠️ Checkpoint: page {page_num} ignorée ({exc}).")
+
+    if not _valid_nonnegative_int(value.get("ocr_attempts", 0)):
         return False
+    if not _valid_nonnegative_int(value.get("markdown_attempts", 0)):
+        return False
+
+    ocr_ready_statuses = {
+        "ocr_done",
+        "markdown_retry_pending",
+        "markdown_done",
+    }
+    if status in ocr_ready_statuses:
+        if not isinstance(value.get("ocr_text"), str):
+            return False
+        if not isinstance(value.get("ocr_stats"), dict):
+            return False
+
+    if status == "markdown_done":
+        markdown = value.get("markdown")
+        stats = value.get("stats")
+        if not isinstance(markdown, str) or not markdown.strip():
+            return False
+        if not isinstance(stats, dict):
+            return False
+        try:
+            _validate_single_page_artifact(markdown, page_num)
+        except Exception as exc:
+            _log(f"⚠️ Checkpoint: page {page_num} ignorée ({exc}).")
+            return False
+
+    last_error = value.get("last_error")
+    if last_error is not None and not isinstance(last_error, str):
+        return False
+    last_error_phase = value.get("last_error_phase")
+    if last_error_phase is not None and last_error_phase not in {"ocr", "markdown"}:
+        return False
+
     return True
 
 
@@ -1172,12 +1245,13 @@ def load_progress(
         return {}
 
     if not isinstance(data, dict) or not isinstance(data.get("pages"), dict):
-        _log("⚠️ Ancien checkpoint ignoré : format sans métadonnées vérifiables.")
+        _log("⚠️ Checkpoint ignoré : format sans états de pages.")
         return {}
 
     current_fingerprint = expected_pipeline_fingerprint or get_pipeline_fingerprint()
     checks = [
         (data.get("checkpoint_version") == CHECKPOINT_VERSION, "version de checkpoint"),
+        (data.get("checkpoint_schema") == CHECKPOINT_SCHEMA, "schéma de checkpoint"),
         (data.get("pipeline_version") == PIPELINE_VERSION, "version de pipeline"),
         (data.get("pipeline_fingerprint") == current_fingerprint, "empreinte du pipeline"),
     ]
@@ -1196,26 +1270,30 @@ def load_progress(
         return {}
 
     pages = data["pages"]
-    stored_hashes = data.get("page_markdown_sha256")
+    stored_hashes = data.get("page_record_sha256")
     if not isinstance(stored_hashes, dict):
-        _log("⚠️ Checkpoint ignoré : empreintes des pages absentes.")
+        _log("⚠️ Checkpoint ignoré : empreintes des états de pages absentes.")
         return {}
     actual_hashes = _checkpoint_page_hashes(pages)
-    normalized_stored_hashes = {str(key): str(value) for key, value in stored_hashes.items()}
+    normalized_stored_hashes = {
+        str(key): str(value) for key, value in stored_hashes.items()
+    }
     if actual_hashes != normalized_stored_hashes:
-        _log("⚠️ Checkpoint ignoré : contenu d'une page altéré ou incomplet.")
+        _log("⚠️ Checkpoint ignoré : état d'une page altéré ou incomplet.")
         return {}
 
     validated: Dict[str, Dict] = {}
     for page_key, value in pages.items():
         if _valid_checkpoint_page_record(page_key, value, expected_page_count):
             validated[str(int(page_key))] = value
+        else:
+            _log(f"⚠️ Checkpoint: état de page ignoré ({page_key}).")
     return validated
 
 
 def save_progress(
     pdf_path: str,
-    completed_pages: Dict[str, Dict],
+    page_states: Dict[str, Dict],
     source_id: Optional[str] = None,
     page_count: Optional[int] = None,
     pipeline_fingerprint: Optional[str] = None,
@@ -1225,6 +1303,7 @@ def save_progress(
     temp_path = path + ".tmp"
     payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
+        "checkpoint_schema": CHECKPOINT_SCHEMA,
         "pipeline_version": PIPELINE_VERSION,
         "pipeline_fingerprint": pipeline_fingerprint or get_pipeline_fingerprint(),
         "source_id": source_id,
@@ -1234,14 +1313,15 @@ def save_progress(
         "qwen_high_resolution_images": QWEN_HIGH_RES_IMAGES,
         "markdown_uses_image": MARKDOWN_USES_IMAGE,
         "markdown_structural_cleanup": MARKDOWN_STRUCTURAL_CLEANUP,
-        "markdown_format_retries": MARKDOWN_FORMAT_RETRIES,
+        "two_queue_pipeline": TWO_QUEUE_PIPELINE,
+        "targeted_recovery_enabled": TARGETED_RECOVERY_ENABLED,
         "prompt_sha256": {
             "ocr": _sha256_text(OCR_PROMPT),
             "markdown": _sha256_text(SYSTEM_PROMPT_MD),
         },
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "page_markdown_sha256": _checkpoint_page_hashes(completed_pages),
-        "pages": completed_pages,
+        "page_record_sha256": _checkpoint_page_hashes(page_states),
+        "pages": page_states,
     }
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
@@ -1450,13 +1530,38 @@ def _sanitize_markdown_response(
 
 
 # =====================
-# Rendu PDF -> PNG base64 (low memory)
+# Rendu PDF -> PNG local persistant + Base64 à la demande
 # =====================
 
-def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER_DPI) -> Tuple[str, float]:
-    """Rend une page en PNG Base64 avec une empreinte mémoire limitée."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        images = None
+
+def get_page_image_path(image_dir: str, page_num: int) -> str:
+    directory = Path(image_dir)
+    return str(directory / f"page_{int(page_num):06d}.png")
+
+
+def render_single_page_to_file(
+    pdf_path: str,
+    page_num: int,
+    image_dir: str,
+    dpi: int = RENDER_DPI,
+) -> Tuple[str, float, bool]:
+    """
+    Rend une page vers un PNG local stable.
+
+    Retourne (chemin, taille_kb, image_nouvellement_rendue). Si le PNG existe
+    déjà et n'est pas vide, il est réutilisé.
+    """
+    directory = Path(image_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = Path(get_page_image_path(str(directory), page_num))
+
+    if target.exists() and target.stat().st_size > 0:
+        return str(target), target.stat().st_size / 1024.0, False
+    if target.exists():
+        target.unlink(missing_ok=True)
+
+    images = None
+    with tempfile.TemporaryDirectory(dir=str(directory)) as tmpdir:
         try:
             try:
                 paths = convert_from_path(
@@ -1471,9 +1576,13 @@ def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER
                 )
                 if not paths:
                     raise ValueError(f"Aucune image générée pour la page {page_num}")
-                png_path = paths[0]
+                source = Path(paths[0])
+                if not source.exists() or source.stat().st_size <= 0:
+                    raise RuntimeError(
+                        f"Page {page_num}: PNG temporaire absent ou vide."
+                    )
+                os.replace(source, target)
             except TypeError:
-                # Compatibilité avec une ancienne version de pdf2image.
                 images = convert_from_path(
                     pdf_path,
                     dpi=dpi,
@@ -1485,11 +1594,9 @@ def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER
                 )
                 if not images:
                     raise ValueError(f"Aucune image générée pour la page {page_num}")
-                png_path = os.path.join(tmpdir, f"page_{page_num}.png")
-                images[0].save(png_path, format="PNG")
-
-            with open(png_path, "rb") as handle:
-                image_bytes = handle.read()
+                temporary_target = target.with_suffix(".png.tmp")
+                images[0].save(temporary_target, format="PNG")
+                os.replace(temporary_target, target)
         finally:
             if images:
                 for image in images:
@@ -1498,26 +1605,80 @@ def render_single_page_to_base64(pdf_path: str, page_num: int, dpi: int = RENDER
                     except Exception:
                         pass
 
+    if not target.exists() or target.stat().st_size <= 0:
+        raise RuntimeError(f"Page {page_num}: échec du rendu PNG.")
+    return str(target), target.stat().st_size / 1024.0, True
+
+
+def image_file_to_data_url(image_path: str) -> Tuple[str, float, float]:
+    path = Path(image_path)
+    if not path.exists() or path.stat().st_size <= 0:
+        raise FileNotFoundError(f"Image de page introuvable ou vide : {image_path}")
+    image_bytes = path.read_bytes()
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
-    return image_b64, len(image_bytes) / 1024.0
-
-
-def prepare_page_image(pdf_path: str, page_num: int) -> Tuple[str, float, float]:
-    """Rend la page une seule fois et prépare le data URL réutilisé par OCR et Markdown."""
-    _log(f"➡️ Page {page_num}: rendu image unique (dpi={RENDER_DPI})")
-    image_b64, size_kb = render_single_page_to_base64(pdf_path, page_num, dpi=RENDER_DPI)
     base64_mb = len(image_b64.encode("ascii")) / (1024 * 1024)
     if base64_mb > MAX_BASE64_IMAGE_MB:
         raise RuntimeError(
-            f"Page {page_num}: image Base64 trop volumineuse ({base64_mb:.2f} Mo), "
+            f"Image Base64 trop volumineuse ({base64_mb:.2f} Mo), "
             f"limite préventive={MAX_BASE64_IMAGE_MB:.2f} Mo."
         )
-    data_url = f"data:image/png;base64,{image_b64}"
-    _log(
-        f"➡️ Page {page_num}: image prête ({size_kb:.0f} KB; base64={base64_mb:.2f} Mo), "
-        "réutilisée pour OCR et Markdown"
+    return (
+        f"data:image/png;base64,{image_b64}",
+        len(image_bytes) / 1024.0,
+        base64_mb,
     )
-    return data_url, size_kb, base64_mb
+
+
+def prepare_page_image_file(
+    pdf_path: str,
+    page_num: int,
+    image_dir: str,
+) -> Tuple[str, float, bool]:
+    _log(f"➡️ Page {page_num}: préparation du PNG local (dpi={RENDER_DPI})")
+    image_path, size_kb, rendered = render_single_page_to_file(
+        pdf_path=pdf_path,
+        page_num=page_num,
+        image_dir=image_dir,
+        dpi=RENDER_DPI,
+    )
+    _log(
+        f"➡️ Page {page_num}: image {'rendue' if rendered else 'réutilisée'} "
+        f"({size_kb:.0f} KB) : {image_path}"
+    )
+    return image_path, size_kb, rendered
+
+
+def cleanup_page_image(image_path: str) -> None:
+    try:
+        Path(image_path).unlink(missing_ok=True)
+    except Exception as exc:
+        _log(f"⚠️ Impossible de supprimer l'image temporaire {image_path}: {exc}")
+
+
+# Compatibilité avec l'ancien point d'entrée séquentiel.
+def render_single_page_to_base64(
+    pdf_path: str,
+    page_num: int,
+    dpi: int = RENDER_DPI,
+) -> Tuple[str, float]:
+    with tempfile.TemporaryDirectory() as image_dir:
+        image_path, size_kb, _rendered = render_single_page_to_file(
+            pdf_path=pdf_path,
+            page_num=page_num,
+            image_dir=image_dir,
+            dpi=dpi,
+        )
+        data_url, _size_kb, _base64_mb = image_file_to_data_url(image_path)
+        return data_url.split(",", 1)[1], size_kb
+
+
+def prepare_page_image(pdf_path: str, page_num: int) -> Tuple[str, float, float]:
+    """Compatibilité : rend une fois dans un répertoire temporaire."""
+    with tempfile.TemporaryDirectory() as image_dir:
+        image_path, _size_kb, _rendered = prepare_page_image_file(
+            pdf_path, page_num, image_dir
+        )
+        return image_file_to_data_url(image_path)
 
 
 # =====================
@@ -2068,48 +2229,33 @@ def markdown_from_ocr(*args: Any, **kwargs: Any) -> Tuple[str, Dict[str, Any]]:
     )
 
 
-def process_page_with_cache(
-    pdf_path: str,
+def assemble_page_artifact(
+    md_core: str,
+    ocr_text: str,
     page_num: int,
-    api_key: str,
-    is_first_page: bool = False,
-) -> Tuple[str, Dict[str, Any]]:
-    del is_first_page  # conservé pour compatibilité avec le runner
-    page_num = int(page_num)
-
-    image_data_url, image_size_kb, image_base64_mb = prepare_page_image(pdf_path, page_num)
-    try:
-        ocr_text, ocr_stats = ocr_page_with_vl(
-            api_key=api_key,
-            pdf_path=pdf_path,
-            page_num=page_num,
-            image_data_url=image_data_url,
-            image_size_kb=image_size_kb,
-            image_base64_mb=image_base64_mb,
-        )
-        md_core, md_stats = markdown_from_image_and_ocr(
-            api_key=api_key,
-            image_data_url=image_data_url,
-            ocr_text=ocr_text,
-            page_num=page_num,
-            ocr_audit_status=str(ocr_stats.get("ocr_audit_status", "unknown")),
-        )
-    finally:
-        # Libère la référence Base64 dès la fin des deux appels de la page.
-        del image_data_url
-
+) -> str:
     fence = _choose_code_fence(ocr_text)
     page_md = (
-        f"<!-- PAGE {page_num} -->\n\n"
+        f"<!-- PAGE {int(page_num)} -->\n\n"
         f"{md_core.strip(chr(10))}\n\n"
         "## Annexe - OCR brut\n"
         f"{fence}text\n"
-        f"[[PAGE {page_num}]]\n\n"
+        f"[[PAGE {int(page_num)}]]\n\n"
         f"{ocr_text.rstrip(chr(10))}\n"
         f"{fence}"
     ).strip("\n")
-    _validate_single_page_artifact(page_md, page_num)
+    _validate_single_page_artifact(page_md, int(page_num))
+    return page_md
 
+
+def _build_final_page_stats(
+    ocr_stats: Dict[str, Any],
+    md_stats: Dict[str, Any],
+    *,
+    image_size_kb: float,
+    image_base64_mb: float,
+    recovered: bool,
+) -> Dict[str, Any]:
     combined = _merge_stats(ocr_stats, md_stats)
     stats_core: Dict[str, Any] = {
         **combined,
@@ -2117,15 +2263,30 @@ def process_page_with_cache(
         "models": {"ocr": MODEL_OCR, "markdown": MODEL_MD},
         "markdown_engine": "qwen-image-first+ocr-audit",
         "markdown_input": "image_then_ocr_audit",
-        "technical_sanitizations": dict(md_stats.get("technical_sanitizations", {}) or {}),
-        "technical_sanitization_count": int(md_stats.get("technical_sanitization_count", 0) or 0),
+        "technical_sanitizations": dict(
+            md_stats.get("technical_sanitizations", {}) or {}
+        ),
+        "technical_sanitization_count": int(
+            md_stats.get("technical_sanitization_count", 0) or 0
+        ),
         "markdown_warnings": list(md_stats.get("markdown_warnings", []) or []),
-        "markdown_warning_count": int(md_stats.get("markdown_warning_count", 0) or 0),
+        "markdown_warning_count": int(
+            md_stats.get("markdown_warning_count", 0) or 0
+        ),
         "ocr_generations": int(ocr_stats.get("ocr_generations", 1) or 1),
-        "ocr_audit_status": str(ocr_stats.get("ocr_audit_status", "unknown")),
-        "markdown_generations": int(md_stats.get("markdown_generations", 1) or 1),
-        "markdown_format_attempts": int(md_stats.get("format_attempts", 1) or 1),
-        "strict_two_generations": STRICT_TWO_GENERATIONS,
+        "ocr_audit_status": str(
+            ocr_stats.get("ocr_audit_status", "unknown")
+        ),
+        "markdown_generations": int(
+            md_stats.get("markdown_generations", 1) or 1
+        ),
+        "markdown_format_attempts": int(
+            md_stats.get("format_attempts", 1) or 1
+        ),
+        "two_queue_pipeline": TWO_QUEUE_PIPELINE,
+        "nominal_two_generations": NOMINAL_TWO_GENERATIONS,
+        "targeted_recovery_enabled": TARGETED_RECOVERY_ENABLED,
+        "recovered": bool(recovered),
         "render_dpi": RENDER_DPI,
         "image_size_kb": image_size_kb,
         "image_base64_mb": image_base64_mb,
@@ -2136,7 +2297,137 @@ def process_page_with_cache(
     }
     stats_payload: Dict[str, Any] = dict(stats_core)
     stats_payload["stats"] = dict(stats_core)
-    return page_md, stats_payload
+    return stats_payload
+
+
+def run_ocr_stage(
+    pdf_path: str,
+    page_num: int,
+    api_key: str,
+    image_dir: str,
+    *,
+    recovery: bool = False,
+) -> Dict[str, Any]:
+    """Rend/réutilise le PNG et exécute uniquement la phase OCR."""
+    page_num = int(page_num)
+    image_path, _render_size_kb, rendered = prepare_page_image_file(
+        pdf_path=pdf_path,
+        page_num=page_num,
+        image_dir=image_dir,
+    )
+    image_data_url, image_size_kb, image_base64_mb = image_file_to_data_url(
+        image_path
+    )
+    try:
+        ocr_text, ocr_stats = ocr_page_with_vl(
+            api_key=api_key,
+            pdf_path=pdf_path,
+            page_num=page_num,
+            image_data_url=image_data_url,
+            image_size_kb=image_size_kb,
+            image_base64_mb=image_base64_mb,
+        )
+    finally:
+        del image_data_url
+
+    ocr_stats["stage_recovery"] = bool(recovery)
+    ocr_stats["image_rendered_in_stage"] = bool(rendered)
+    return {
+        "page_num": page_num,
+        "image_path": image_path,
+        "image_size_kb": image_size_kb,
+        "image_base64_mb": image_base64_mb,
+        "ocr_text": ocr_text,
+        "ocr_stats": ocr_stats,
+    }
+
+
+def run_markdown_stage(
+    pdf_path: str,
+    page_num: int,
+    api_key: str,
+    image_dir: str,
+    ocr_text: str,
+    ocr_stats: Dict[str, Any],
+    *,
+    recovery: bool = False,
+) -> Dict[str, Any]:
+    """
+    Exécute uniquement la phase Markdown.
+
+    Le PNG local est réutilisé s'il existe. Après un redémarrage, il est rendu
+    à nouveau, mais l'OCR sauvegardé n'est pas recalculé.
+    """
+    page_num = int(page_num)
+    image_path, _render_size_kb, rendered = prepare_page_image_file(
+        pdf_path=pdf_path,
+        page_num=page_num,
+        image_dir=image_dir,
+    )
+    image_data_url, image_size_kb, image_base64_mb = image_file_to_data_url(
+        image_path
+    )
+    try:
+        md_core, md_stats = markdown_from_image_and_ocr(
+            api_key=api_key,
+            image_data_url=image_data_url,
+            ocr_text=ocr_text,
+            page_num=page_num,
+            ocr_audit_status=str(
+                ocr_stats.get("ocr_audit_status", "unknown")
+            ),
+        )
+    finally:
+        del image_data_url
+
+    md_stats["stage_recovery"] = bool(recovery)
+    md_stats["image_rendered_in_stage"] = bool(rendered)
+    page_md = assemble_page_artifact(md_core, ocr_text, page_num)
+    stats = _build_final_page_stats(
+        ocr_stats,
+        md_stats,
+        image_size_kb=image_size_kb,
+        image_base64_mb=image_base64_mb,
+        recovered=recovery,
+    )
+    return {
+        "page_num": page_num,
+        "image_path": image_path,
+        "markdown": page_md,
+        "stats": stats,
+        "markdown_stats": md_stats,
+    }
+
+
+def process_page_with_cache(
+    pdf_path: str,
+    page_num: int,
+    api_key: str,
+    is_first_page: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Point d'entrée séquentiel conservé pour compatibilité et tests.
+
+    Le runner v3.7 utilise directement run_ocr_stage() et run_markdown_stage().
+    """
+    del is_first_page
+    with tempfile.TemporaryDirectory(prefix="qwen_page_") as image_dir:
+        ocr_result = run_ocr_stage(
+            pdf_path=pdf_path,
+            page_num=page_num,
+            api_key=api_key,
+            image_dir=image_dir,
+        )
+        md_result = run_markdown_stage(
+            pdf_path=pdf_path,
+            page_num=page_num,
+            api_key=api_key,
+            image_dir=image_dir,
+            ocr_text=ocr_result["ocr_text"],
+            ocr_stats=ocr_result["ocr_stats"],
+        )
+        cleanup_page_image(md_result["image_path"])
+        return md_result["markdown"], md_result["stats"]
 
 
 # =====================
@@ -2277,6 +2568,7 @@ __all__ = [
     "MODEL_OCR",
     "MODEL_MD",
     "PIPELINE_VERSION",
+    "CHECKPOINT_SCHEMA",
     "ENABLE_EXPLICIT_CACHE",
     "QWEN_HIGH_RES_IMAGES",
     "MARKDOWN_USES_IMAGE",
@@ -2285,9 +2577,14 @@ __all__ = [
     "ENABLE_THINKING_MD",
     "ALLOW_NO_THINK_FALLBACK_OCR",
     "ALLOW_NO_THINK_FALLBACK_MD",
+    "NOMINAL_TWO_GENERATIONS",
+    "TWO_QUEUE_PIPELINE",
+    "TARGETED_RECOVERY_ENABLED",
     "STRICT_TWO_GENERATIONS",
     "MARKDOWN_FORMAT_RETRIES",
     "OCR_EMPTY_RETRIES",
+    "OCR_RECOVERY_ATTEMPTS",
+    "MARKDOWN_RECOVERY_ATTEMPTS",
     "STOP_ON_CRITICAL",
     "RENDER_DPI",
     "validate_api_configuration",
@@ -2298,6 +2595,12 @@ __all__ = [
     "load_progress",
     "save_progress",
     "clear_progress",
+    "get_page_image_path",
+    "prepare_page_image_file",
+    "cleanup_page_image",
+    "run_ocr_stage",
+    "run_markdown_stage",
+    "assemble_page_artifact",
     "process_page_with_cache",
     "calculate_costs",
     "validate_markdown_quality",
