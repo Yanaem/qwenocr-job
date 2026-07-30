@@ -38,7 +38,7 @@ def _validate_ocr_contract() -> None:
     required_attributes = [
         "API_URL", "MODEL", "MODEL_MD", "STOP_ON_CRITICAL",
         "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "MARKDOWN_USES_IMAGE",
-        "MARKDOWN_STRUCTURAL_CLEANUP",
+        "MARKDOWN_INDEPENDENT_FROM_OCR", "MARKDOWN_STRUCTURAL_CLEANUP",
         "ENABLE_THINKING_OCR", "ENABLE_THINKING_MD",
         "ALLOW_NO_THINK_FALLBACK_OCR", "ALLOW_NO_THINK_FALLBACK_MD",
         "MARKDOWN_FORMAT_RETRIES", "TWO_QUEUE_PIPELINE",
@@ -70,6 +70,10 @@ def _validate_ocr_contract() -> None:
     if ocr.MARKDOWN_USES_IMAGE is not True:
         raise RuntimeError(
             "Contrat incompatible : la phase Markdown doit recevoir l'image."
+        )
+    if ocr.MARKDOWN_INDEPENDENT_FROM_OCR is not True:
+        raise RuntimeError(
+            "Contrat incompatible : aucun texte OCR ne doit être transmis au modèle Markdown."
         )
     if ocr.MARKDOWN_STRUCTURAL_CLEANUP is not False:
         raise RuntimeError(
@@ -388,7 +392,8 @@ def run_for_pdf(
     Pipeline à deux files et quatre slots globaux.
 
     - file OCR et file Markdown séparées ;
-    - OCR durablement sauvegardé avant la mise en file Markdown ;
+    - OCR durablement sauvegardé avant l'assemblage final ;
+    - génération Markdown depuis l'image seule, sans texte OCR ;
     - erreurs locales isolées ;
     - une récupération ciblée maximum par phase ;
     - aucun faux Markdown partiel.
@@ -414,7 +419,7 @@ def run_for_pdf(
     print(f"🩹 Récupération         : {RECOVERY_CONCURRENCY} slot(s), ciblée")
     print(f"🧠 Cache explicite      : {'configuré' if ocr.ENABLE_EXPLICIT_CACHE else 'désactivé'}")
     print(f"🔎 Haute résolution     : {'activée' if ocr.QWEN_HIGH_RES_IMAGES else 'désactivée'}")
-    print("🖼️  Markdown             : image originale, puis audit OCR")
+    print("🔒 Markdown indépendant : image seule, aucun OCR transmis")
     print("🧽 Python               : enveloppe uniquement, aucune restructuration")
     print("=" * 78)
 
@@ -548,11 +553,12 @@ def run_for_pdf(
         state = page_states[str(page_num)]
         if not isinstance(state.get("ocr_text"), str):
             raise RuntimeError(
-                f"Page {page_num}: Markdown interdit avant la sauvegarde de l'OCR."
+                f"Page {page_num}: OCR absent pour l'annexe finale. "
+                "Le modèle Markdown resterait indépendant, mais l'artefact complet exige les deux sorties."
             )
         if not isinstance(state.get("ocr_stats"), dict):
             raise RuntimeError(
-                f"Page {page_num}: statistiques OCR absentes avant Markdown."
+                f"Page {page_num}: statistiques OCR absentes pour le rapport final."
             )
         state["markdown_attempts"] = int(
             state.get("markdown_attempts", 0) or 0
@@ -697,8 +703,8 @@ def run_for_pdf(
             if checkpoint_reasons:
                 persist_checkpoint("; ".join(checkpoint_reasons))
 
-            # Aucun Markdown n'est mis en file avant la persistance effective
-            # de tous les OCR terminés dans ce lot de résultats.
+            # L'OCR est persisté avant l'assemblage final. Il n'est jamais
+            # transmis au modèle Markdown ; la mise en file reste une règle de reprise.
             for page_num in ocr_pages_ready_after_checkpoint:
                 ready_markdown.append(page_num)
                 print(
@@ -772,7 +778,8 @@ def run_for_pdf(
             persist_checkpoint(f"OCR page {page_num} échec final")
             print(f"         ❌ OCR page {page_num} échec final: {error}")
 
-    # Récupération Markdown : OCR sauvegardé réutilisé, jamais recalculé.
+    # Récupération Markdown : image seule. L'OCR sauvegardé sert uniquement
+    # à l'annexe et au rapport, jamais au contexte du modèle Markdown.
     def recover_markdown(page_num: int) -> Tuple[int, Optional[Dict[str, Any]], Optional[BaseException]]:
         state = page_states[str(page_num)]
         try:
@@ -935,13 +942,13 @@ def run_for_pdf(
         int(stats.get("markdown_warning_count", 0) or 0)
         for stats in all_stats
     )
-    degraded_ocr_audits = sum(
+    degraded_ocr_outputs = sum(
         1 for stats in all_stats
-        if str(stats.get("ocr_audit_status", "unknown")) != "ok"
+        if str(stats.get("ocr_output_status", stats.get("ocr_audit_status", "unknown"))) != "ok"
     )
     quality_status = (
         "warning"
-        if markdown_warnings or degraded_ocr_audits
+        if markdown_warnings or degraded_ocr_outputs
         else "ok"
     )
 
@@ -1086,13 +1093,13 @@ def main():
                             if warning_type:
                                 warning_type_counts[warning_type] += 1
 
-                    audit_status_counts: Counter[str] = Counter(
-                        str(item.get("ocr_audit_status", "unknown") or "unknown")
+                    ocr_status_counts: Counter[str] = Counter(
+                        str(item.get("ocr_output_status", item.get("ocr_audit_status", "unknown")) or "unknown")
                         for item in all_stats
                     )
-                    degraded_audit_pages = sum(
+                    degraded_ocr_pages = sum(
                         count
-                        for status, count in audit_status_counts.items()
+                        for status, count in ocr_status_counts.items()
                         if status != "ok"
                     )
                     total_markdown_warnings = sum(
@@ -1106,7 +1113,7 @@ def main():
                     )
                     callback_quality_status = (
                         "warning"
-                        if total_markdown_warnings or degraded_audit_pages
+                        if total_markdown_warnings or degraded_ocr_pages
                         else "ok"
                     )
 
@@ -1118,7 +1125,8 @@ def main():
                         "envelopeValid": True,
                         "warningPages": warning_pages,
                         "warningTypes": dict(sorted(warning_type_counts.items())),
-                        "ocrAuditStatus": dict(sorted(audit_status_counts.items())),
+                        "ocrOutputStatus": dict(sorted(ocr_status_counts.items())),
+                        "ocrAuditStatus": dict(sorted(ocr_status_counts.items())),  # compatibilité
                         "recoveredPages": recovered_pages,
                         "pageCount": page_count,
                         "durationSeconds": duration,
@@ -1145,8 +1153,10 @@ def main():
                             "recoveryConcurrency": RECOVERY_CONCURRENCY,
                             "workerCountEffective": worker_count,
                             "markdownWarnings": total_markdown_warnings,
-                            "ocrAuditDegradedPages": degraded_audit_pages,
+                            "ocrOutputDegradedPages": degraded_ocr_pages,
+                            "ocrAuditDegradedPages": degraded_ocr_pages,  # compatibilité
                             "twoQueuePipeline": True,
+                            "markdownIndependentFromOcr": True,
                             "targetedRecovery": True,
                             "pipelineVersion": ocr.PIPELINE_VERSION,
                             "models": {
@@ -1186,4 +1196,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
