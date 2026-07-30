@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import traceback
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +36,10 @@ def _validate_ocr_contract() -> None:
     required_attributes = [
         "API_URL", "MODEL", "MODEL_MD", "STOP_ON_CRITICAL",
         "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "MARKDOWN_USES_IMAGE",
+        "MARKDOWN_STRUCTURAL_CLEANUP",
         "ENABLE_THINKING_OCR", "ENABLE_THINKING_MD",
-        "ALLOW_NO_THINK_FALLBACK_MD", "MARKDOWN_FORMAT_RETRIES",
+        "ALLOW_NO_THINK_FALLBACK_OCR", "ALLOW_NO_THINK_FALLBACK_MD",
+        "MARKDOWN_FORMAT_RETRIES", "STRICT_TWO_GENERATIONS",
         "PIPELINE_VERSION",
     ]
     required_callables = [
@@ -59,6 +62,24 @@ def _validate_ocr_contract() -> None:
     if ocr.MARKDOWN_USES_IMAGE is not True:
         raise RuntimeError(
             "Contrat OCR incompatible : la génération Markdown doit recevoir l'image originale."
+        )
+    if ocr.MARKDOWN_STRUCTURAL_CLEANUP is not False:
+        raise RuntimeError(
+            "Contrat OCR incompatible : Python ne doit pas restructurer le Markdown."
+        )
+    if ocr.STRICT_TWO_GENERATIONS is not True:
+        raise RuntimeError(
+            "Contrat OCR incompatible : le pipeline doit rester verrouillé à une "
+            "génération OCR et une génération Markdown par page."
+        )
+    if bool(ocr.ALLOW_NO_THINK_FALLBACK_OCR) or bool(ocr.ALLOW_NO_THINK_FALLBACK_MD):
+        raise RuntimeError(
+            "Contrat OCR incompatible : aucun second appel sans thinking n'est autorisé."
+        )
+    if int(ocr.MARKDOWN_FORMAT_RETRIES) != 0:
+        raise RuntimeError(
+            "Contrat OCR incompatible : aucune régénération Markdown structurelle "
+            "n'est autorisée. MARKDOWN_FORMAT_RETRIES doit rester à 0."
         )
 
 
@@ -271,7 +292,10 @@ def run_for_pdf(
             else ""
         )
     )
-    print(f"🔁 Reprises format   : {ocr.MARKDOWN_FORMAT_RETRIES}")
+    print("📞 Générations/page  : 1 OCR + 1 Markdown (verrouillées)")
+    print("🔁 Relance sémantique: aucune")
+    print("ℹ️  OCR court/vide   : accepté comme audit dégradé, sans nouvel appel")
+    print("🧽 Python Markdown   : assainissement du contenant uniquement, aucune restructuration")
     print(f"🔐 Empreinte        : {ocr.get_pipeline_fingerprint()[:16]}…")
     print(f"💾 Checkpoint        : toutes les {PROGRESS_SAVE_EVERY} page(s)")
     print("=" * 70)
@@ -475,7 +499,7 @@ def run_for_pdf(
     print("=" * 70)
     print("\n   🔗 Fusion des pages...")
 
-    final_markdown = "\n\n---\n\n".join(page.strip() for page in all_markdown)
+    final_markdown = "\n\n".join(page.strip() for page in all_markdown)
     ocr.validate_canonical_markdown_structure(final_markdown, page_count)
     validation = ocr.validate_markdown_quality(final_markdown, page_count)
     if not validation.get("ok"):
@@ -497,6 +521,31 @@ def run_for_pdf(
 
     md_size_kb = len(final_markdown.encode("utf-8")) / 1024
     costs = ocr.calculate_costs(all_stats)
+    sanitized_pages = sum(
+        1 for stats in all_stats
+        if int(stats.get("technical_sanitization_count", 0) or 0) > 0
+    )
+    technical_sanitizations = sum(
+        int(stats.get("technical_sanitization_count", 0) or 0)
+        for stats in all_stats
+    )
+    warned_pages = sum(
+        1 for stats in all_stats
+        if int(stats.get("markdown_warning_count", 0) or 0) > 0
+    )
+    markdown_warnings = sum(
+        int(stats.get("markdown_warning_count", 0) or 0)
+        for stats in all_stats
+    )
+    ocr_audit_status_counts: Dict[str, int] = {}
+    for stats in all_stats:
+        status = str(stats.get("ocr_audit_status", "unknown") or "unknown")
+        ocr_audit_status_counts[status] = ocr_audit_status_counts.get(status, 0) + 1
+    degraded_ocr_audits = sum(
+        count for status, count in ocr_audit_status_counts.items()
+        if status != "ok"
+    )
+    quality_status = "warning" if (markdown_warnings or degraded_ocr_audits) else "ok"
 
     if progress_gcs_uri:
         print("   💾 Checkpoint GCS conservé jusqu'à l'upload du Markdown final")
@@ -516,6 +565,39 @@ def run_for_pdf(
         print(f"💵 Coût total       : ${costs['cost_total']:.4f}")
     else:
         print("💵 Coût total       : non calculé (tarifs non configurés)")
+    print(
+        f"🧽 Assainissement   : {sanitized_pages} page(s), "
+        f"{technical_sanitizations} ajustement(s) de contenant, "
+        "aucune restructuration"
+    )
+    if markdown_warnings:
+        print(
+            f"⚠️  Markdown        : {markdown_warnings} avertissement(s) non bloquant(s) "
+            f"sur {warned_pages} page(s), contenu conservé tel quel"
+        )
+    else:
+        print("✅ Markdown        : aucun avertissement structurel détecté")
+    if degraded_ocr_audits:
+        detail = ", ".join(
+            f"{status}={count}" for status, count in sorted(ocr_audit_status_counts.items())
+            if status != "ok"
+        )
+        print(
+            f"⚠️  Audit OCR dégradé: {degraded_ocr_audits} page(s) ({detail}); "
+            "Markdown construit depuis l'image"
+        )
+    else:
+        print("🔎 Audit OCR        : complet sur toutes les pages")
+    if validation.get("warnings"):
+        print(
+            f"ℹ️  Contrôle final  : {len(validation['warnings'])} avertissement(s) "
+            "non bloquant(s)"
+        )
+    print(
+        "✅ Qualité finale    : OK"
+        if quality_status == "ok"
+        else "⚠️  Qualité finale : WARNING — fichier produit, contrôle recommandé"
+    )
     if validation["stats"]:
         stats = validation["stats"]
         print(
@@ -616,28 +698,94 @@ def main():
 
             if callback_url and ocr_job_id:
                 try:
-                    total_in = sum(s.get("input_tokens", 0) for s in all_stats)
-                    total_out = sum(s.get("output_tokens", 0) for s in all_stats)
-                    total_cached = sum(s.get("cached_tokens", 0) for s in all_stats)
+                    total_in = sum(int(item.get("input_tokens", 0) or 0) for item in all_stats)
+                    total_out = sum(int(item.get("output_tokens", 0) or 0) for item in all_stats)
+                    total_cached = sum(int(item.get("cached_tokens", 0) or 0) for item in all_stats)
                     total_cache_created = sum(
-                        s.get("cache_creation_input_tokens", 0) for s in all_stats
+                        int(item.get("cache_creation_input_tokens", 0) or 0)
+                        for item in all_stats
+                    )
+                    total_reasoning = sum(
+                        int(item.get("reasoning_tokens", 0) or 0) for item in all_stats
+                    )
+                    total_image_tokens = sum(
+                        int(item.get("image_tokens", 0) or 0) for item in all_stats
+                    )
+                    total_partial_responses = sum(
+                        int(item.get("partial_response_count", 0) or 0)
+                        for item in all_stats
+                    )
+
+                    warning_pages = sorted(
+                        index + 1
+                        for index, item in enumerate(all_stats)
+                        if int(item.get("markdown_warning_count", 0) or 0) > 0
+                    )
+                    warning_type_counts: Counter[str] = Counter()
+                    for item in all_stats:
+                        for warning in item.get("markdown_warnings", []) or []:
+                            warning_type = str(warning).split(":", 1)[0].strip()
+                            if warning_type:
+                                warning_type_counts[warning_type] += 1
+
+                    audit_status_counts: Counter[str] = Counter(
+                        str(item.get("ocr_audit_status", "unknown") or "unknown")
+                        for item in all_stats
+                    )
+                    degraded_audit_pages = sum(
+                        count for status, count in audit_status_counts.items()
+                        if status != "ok"
+                    )
+                    total_markdown_warnings = sum(
+                        int(item.get("markdown_warning_count", 0) or 0)
+                        for item in all_stats
+                    )
+                    callback_quality_status = (
+                        "warning"
+                        if total_markdown_warnings or degraded_audit_pages
+                        else "ok"
                     )
 
                     payload = {
                         "ocrJobId": ocr_job_id,
                         "gcsOutputPath": gcs_output,
                         "status": "success",
+                        "qualityStatus": callback_quality_status,
+                        "envelopeValid": True,
+                        "warningPages": warning_pages,
+                        "warningTypes": dict(sorted(warning_type_counts.items())),
+                        "ocrAuditStatus": dict(sorted(audit_status_counts.items())),
                         "pageCount": page_count,
                         "durationSeconds": duration,
                         "markdownSizeKb": md_size_kb,
                         "stats": {
                             "inputTokens": total_in,
                             "outputTokens": total_out,
+                            "reasoningTokens": total_reasoning,
+                            "imageTokens": total_image_tokens,
                             "cachedTokens": total_cached,
                             "cacheCreationInputTokens": total_cache_created,
-                            "cost": costs["cost_total"],
+                            "partialResponses": total_partial_responses,
+                            "cost": (
+                                costs["cost_total"]
+                                if costs.get("cost_available")
+                                else None
+                            ),
+                            "costAvailable": bool(costs.get("cost_available")),
                             "pageWorkersRequested": PAGE_WORKERS,
                             "pageWorkersEffective": worker_count,
+                            "markdownWarnings": total_markdown_warnings,
+                            "technicalSanitizations": sum(
+                                int(item.get("technical_sanitization_count", 0) or 0)
+                                for item in all_stats
+                            ),
+                            "ocrAuditDegradedPages": degraded_audit_pages,
+                            "strictTwoGenerations": True,
+                            "pipelineVersion": ocr.PIPELINE_VERSION,
+                            "models": {
+                                "ocr": getattr(ocr, "MODEL_OCR", ocr.MODEL),
+                                "markdown": getattr(ocr, "MODEL_MD", ocr.MODEL),
+                            },
                         },
                     }
 
