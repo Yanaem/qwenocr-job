@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v6.4.1, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v6.5.0, une seule sortie Markdown.
 
 Par page :
-    trois vues JPEG de la même page -> un flux SSE Qwen nominal -> source canonique
+    quatre vues JPEG ciblées de la même page -> un flux SSE Qwen nominal -> source canonique
     -> Markdown Python déterministe
 
 La source canonique et la qualité sont conservées uniquement dans le checkpoint
@@ -84,8 +84,13 @@ def _validate_ocr_contract() -> None:
         "OCR_SEED",
         "RENDER_DPI",
         "DETAIL_DPI",
-        "DETAIL_UPPER_END",
-        "DETAIL_LOWER_START",
+        "CRITICAL_DPI",
+        "BODY_VIEW_TOP",
+        "BODY_VIEW_BOTTOM",
+        "FOOTER_VIEW_TOP",
+        "CRITICAL_VIEW_LEFT",
+        "CRITICAL_VIEW_TOP",
+        "CRITICAL_VIEW_BOTTOM",
         "VIEW_JPEG_QUALITY",
         "MAX_VIEW_PIXELS",
         "MAX_REQUEST_BODY_MB",
@@ -110,7 +115,7 @@ def _validate_ocr_contract() -> None:
     ]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.4.1. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.5.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
@@ -334,6 +339,37 @@ def _quality_status(page_qualities: Iterable[Dict[str, Any]]) -> str:
     return "ok"
 
 
+def _document_reference_conflicts(page_results: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    groups: Dict[Tuple[str, str], list[Dict[str, Any]]] = {}
+    for result in page_results:
+        page_num = int(result.get("page_num", 0) or 0)
+        quality = dict(result.get("quality") or {})
+        for record in quality.get("reference_records", []) or []:
+            suffix = str(record.get("suffix", ""))
+            designation_key = str(record.get("designation_key", ""))
+            reference = str(record.get("reference", ""))
+            if not suffix or len(designation_key) < 6 or not reference:
+                continue
+            groups.setdefault((suffix, designation_key), []).append(
+                {**dict(record), "page_num": page_num}
+            )
+
+    conflicts: list[Dict[str, Any]] = []
+    for (suffix, designation_key), records in groups.items():
+        references = sorted({str(record["reference"]) for record in records})
+        if len(references) <= 1:
+            continue
+        conflicts.append(
+            {
+                "suffix": suffix,
+                "designation_key": designation_key,
+                "references": references,
+                "pages": sorted({int(record["page_num"]) for record in records}),
+            }
+        )
+    return conflicts
+
+
 def run_for_pdf(
     pdf_path: str,
     api_key: str,
@@ -366,9 +402,14 @@ def run_for_pdf(
     print(f"🧵 Workers             : {effective_workers}")
     print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
     print(
-        f"🔎 Vues détaillées     : JPEG {ocr.DETAIL_DPI} DPI — "
-        f"0-{int(round(ocr.DETAIL_UPPER_END * 100))}% / "
-        f"{int(round(ocr.DETAIL_LOWER_START * 100))}-100%"
+        f"🔎 Corps / pied        : JPEG {ocr.DETAIL_DPI} DPI — "
+        f"{int(round(ocr.BODY_VIEW_TOP * 100))}-{int(round(ocr.BODY_VIEW_BOTTOM * 100))}% / "
+        f"{int(round(ocr.FOOTER_VIEW_TOP * 100))}-100%"
+    )
+    print(
+        f"🎯 Vue numérique droite: JPEG {ocr.CRITICAL_DPI} DPI — "
+        f"x={int(round(ocr.CRITICAL_VIEW_LEFT * 100))}-100%, "
+        f"y={int(round(ocr.CRITICAL_VIEW_TOP * 100))}-{int(round(ocr.CRITICAL_VIEW_BOTTOM * 100))}%"
     )
     print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
     print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
@@ -448,7 +489,13 @@ def run_for_pdf(
         shutil.rmtree(image_dir, ignore_errors=True)
 
     page_results = [results_by_page[page] for page in range(1, page_count + 1)]
-    final_markdown = "\n\n".join(
+    reference_conflicts = _document_reference_conflicts(page_results)
+    document_comment = (
+        "<!-- DOCUMENT_QUALITY "
+        f"reference_conflicts={len(reference_conflicts)} "
+        f"critical={'failed' if reference_conflicts else 'passed'} -->"
+    )
+    final_markdown = document_comment + "\n\n" + "\n\n".join(
         item["markdown"].rstrip("\n") for item in page_results
     ) + "\n"
 
@@ -464,6 +511,8 @@ def run_for_pdf(
     page_qualities = [dict(item["quality"]) for item in page_results]
     status_counts = Counter(str(item.get("status", "unknown")) for item in page_qualities)
     quality_status = _quality_status(page_qualities)
+    if reference_conflicts and quality_status == "ok":
+        quality_status = "warning"
     all_stats = [dict(item["stats"]) for item in page_results]
     costs = ocr.calculate_costs(all_stats)
 
@@ -473,6 +522,7 @@ def run_for_pdf(
     print(f"📝 Markdown            : {output_md_path}")
     print(f"📊 Qualité globale     : {quality_status}")
     print(f"📊 Statuts pages       : {dict(sorted(status_counts.items()))}")
+    print(f"🔎 Conflits références : {len(reference_conflicts)}")
     print(f"⏱️ Durée               : {duration:.1f}s ({duration / page_count:.1f}s/page)")
     print("=" * 78 + "\n")
 
@@ -489,6 +539,7 @@ def run_for_pdf(
         "source_id": source_id,
         "markdown_structure_valid": bool(validation.get("ok")),
         "markdown_structure_errors": list(validation.get("errors", []) or []),
+        "reference_conflicts": reference_conflicts,
     }
 
 
@@ -574,6 +625,7 @@ def main() -> None:
                         "workerCountEffective": result["worker_count"],
                         "generationsPerPage": 1,
                         "semanticRetries": 0,
+                        "referenceConflicts": len(result.get("reference_conflicts", []) or []),
                         "ocrSeed": ocr.OCR_SEED,
                         "thinkingBudget": ocr.THINKING_BUDGET_OCR,
                         "maxCompletionTokens": ocr.MAX_COMPLETION_TOKENS_OCR,
