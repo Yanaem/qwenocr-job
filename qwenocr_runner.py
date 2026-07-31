@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run / local pour l'extraction canonique v5.
+qwenocr_runner.py — runner Cloud Run/local, une seule sortie Markdown.
 
-Chemin nominal par page :
-    images -> un appel Qwen -> source canonique -> Markdown Python déterministe
+Par page :
+    plusieurs vues de la même page -> un appel Qwen -> source canonique
+    -> Markdown Python déterministe
 
-Aucun second modèle ne reformule la première lecture. Une page dégradée reste
-publiée avec son rapport qualité ; une erreur locale n'efface pas les autres
-pages ni les totaux déjà extraits.
+La source canonique et la qualité sont conservées uniquement dans le checkpoint
+technique temporaire afin de permettre une reprise. Après succès, le seul
+artefact documentaire publié est le fichier Markdown final.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import requests
 
@@ -55,7 +56,7 @@ except Exception:
 
 
 # =============================================================================
-# Contrat et configuration runner
+# Contrat et configuration
 # =============================================================================
 
 
@@ -67,10 +68,12 @@ def _validate_ocr_contract() -> None:
         "PIPELINE_VERSION",
         "CANONICAL_OCR_ONLY",
         "DETERMINISTIC_MARKDOWN",
+        "SINGLE_MARKDOWN_OUTPUT",
         "NOMINAL_GENERATIONS_PER_PAGE",
         "SEMANTIC_RETRIES",
         "STOP_ON_CRITICAL",
         "PUBLISH_PARTIAL_DOCUMENT",
+        "PUBLISH_DEGRADED_MARKDOWN",
         "ENABLE_EXPLICIT_CACHE",
         "QWEN_HIGH_RES_IMAGES",
         "RENDER_DPI",
@@ -96,13 +99,15 @@ def _validate_ocr_contract() -> None:
     ]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v5. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.1. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
-        raise RuntimeError("Contrat invalide : la lecture LLM doit être canonique uniquement.")
+        raise RuntimeError("Contrat invalide : Qwen doit produire uniquement la source canonique.")
     if ocr.DETERMINISTIC_MARKDOWN is not True:
         raise RuntimeError("Contrat invalide : le Markdown doit être rendu par Python.")
+    if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
+        raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
     if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1:
         raise RuntimeError("Contrat invalide : une seule génération Qwen est autorisée par page.")
     if int(ocr.SEMANTIC_RETRIES) != 0:
@@ -135,10 +140,7 @@ def _read_int_env(
     return value
 
 
-_workers_raw = os.getenv(
-    "PAGE_WORKERS",
-    os.getenv("PIPELINE_CONCURRENCY", "4"),
-).strip()
+_workers_raw = os.getenv("PAGE_WORKERS", os.getenv("PIPELINE_CONCURRENCY", "4")).strip()
 try:
     PAGE_WORKERS = int(_workers_raw)
 except ValueError as exc:
@@ -148,12 +150,11 @@ if not 1 <= PAGE_WORKERS <= 8:
 
 PROGRESS_SAVE_EVERY = _read_int_env("PROGRESS_SAVE_EVERY", 10, minimum=1)
 QWEN_BUCKET = os.getenv("QWEN_BUCKET", "qwenvl").strip() or "qwenvl"
-
 _GCS_CLIENT: Optional[Any] = None
 
 
 # =============================================================================
-# Utilitaires généraux
+# Utilitaires
 # =============================================================================
 
 
@@ -181,30 +182,6 @@ def _atomic_write_text(path: str | Path, content: str) -> str:
     return str(target)
 
 
-def _atomic_write_json(path: str | Path, payload: Dict[str, Any]) -> str:
-    return _atomic_write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
-    )
-
-
-def _derive_local_sidecars(
-    markdown_path: str,
-    *,
-    summary_path: Optional[str] = None,
-    canonical_path: Optional[str] = None,
-    quality_path: Optional[str] = None,
-) -> Dict[str, str]:
-    md = Path(markdown_path)
-    base = md.with_suffix("")
-    return {
-        "markdown": str(md),
-        "summary": summary_path or str(base) + ".summary.md",
-        "canonical": canonical_path or str(base) + ".ocr.txt",
-        "quality": quality_path or str(base) + ".quality.json",
-    }
-
-
 def _is_global_failure(error: BaseException) -> bool:
     message = str(error).lower()
     markers = (
@@ -229,16 +206,14 @@ def _is_global_failure(error: BaseException) -> bool:
 def _get_gcs_client():
     global _GCS_CLIENT
     if storage is None:
-        raise RuntimeError(
-            "google-cloud-storage n'est pas installé. Il est requis uniquement en mode GCS."
-        )
+        raise RuntimeError("google-cloud-storage n'est pas installé.")
     if _GCS_CLIENT is None:
         _GCS_CLIENT = storage.Client()
     return _GCS_CLIENT
 
 
 def parse_gs_uri(path: str) -> Tuple[str, str]:
-    """Compatibilité historique : tous les objets utilisent QWEN_BUCKET."""
+    """Compatibilité historique : les objets sont routés vers QWEN_BUCKET."""
     if path.startswith("gs://"):
         rest = path[5:]
         parts = rest.split("/", 1)
@@ -297,7 +272,7 @@ def delete_from_gcs(gs_uri: str, *, quiet: bool = False) -> None:
     if blob.exists(client=client):
         blob.delete(client=client)
         if not quiet:
-            print(f"🗑️  Objet supprimé : gs://{bucket_name}/{blob_name}")
+            print(f"🗑️ Objet supprimé : gs://{bucket_name}/{blob_name}")
 
 
 def derive_progress_gcs_uri(gcs_input: str) -> str:
@@ -307,25 +282,18 @@ def derive_progress_gcs_uri(gcs_input: str) -> str:
     return f"gs://{bucket_name}/progress/{base}.progress.json"
 
 
-def _derive_gcs_sidecar(primary_uri: str, suffix: str) -> str:
-    bucket, blob = parse_gs_uri(primary_uri)
-    if blob.lower().endswith(".md"):
-        blob = blob[:-3]
-    return f"gs://{bucket}/{blob}{suffix}"
-
-
 # =============================================================================
-# Traitement du PDF
+# Traitement
 # =============================================================================
 
 
 def _checkpoint_record(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Le canonique reste interne au checkpoint et n'est jamais publié."""
     return {
         "status": "done",
         "page_num": int(result["page_num"]),
         "canonical": str(result["canonical"]),
         "markdown": str(result["markdown"]),
-        "summary_markdown": str(result["summary_markdown"]),
         "quality": dict(result["quality"]),
         "stats": dict(result["stats"]),
         "updated_at_utc": _utc_now(),
@@ -337,7 +305,6 @@ def _record_to_result(record: Dict[str, Any]) -> Dict[str, Any]:
         "page_num": int(record["page_num"]),
         "canonical": str(record["canonical"]),
         "markdown": str(record["markdown"]),
-        "summary_markdown": str(record["summary_markdown"]),
         "quality": dict(record["quality"]),
         "stats": dict(record["stats"]),
     }
@@ -352,46 +319,11 @@ def _quality_status(page_qualities: Iterable[Dict[str, Any]]) -> str:
     return "ok"
 
 
-def _build_quality_report(
-    *,
-    source_id: str,
-    pdf_info: Dict[str, Any],
-    page_results: List[Dict[str, Any]],
-    validation: Dict[str, Any],
-    duration_seconds: float,
-    effective_workers: int,
-) -> Dict[str, Any]:
-    page_qualities = [dict(item["quality"]) for item in page_results]
-    status_counts = Counter(str(item.get("status", "unknown")) for item in page_qualities)
-    return {
-        "schema": "qwen-canonical-ocr-quality-v1",
-        "pipeline_version": ocr.PIPELINE_VERSION,
-        "pipeline_fingerprint": ocr.get_pipeline_fingerprint(),
-        "created_at_utc": _utc_now(),
-        "source_id": source_id,
-        "source_filename": pdf_info.get("filename"),
-        "page_count": int(pdf_info["page_count"]),
-        "quality_status": _quality_status(page_qualities),
-        "status_counts": dict(sorted(status_counts.items())),
-        "one_qwen_generation_per_page": True,
-        "semantic_retries": 0,
-        "deterministic_markdown": True,
-        "markdown_structure_valid": bool(validation.get("ok")),
-        "markdown_structure_errors": list(validation.get("errors", []) or []),
-        "duration_seconds": round(float(duration_seconds), 3),
-        "workers_effective": int(effective_workers),
-        "pages": page_qualities,
-    }
-
-
 def run_for_pdf(
     pdf_path: str,
     api_key: str,
     *,
     output_md_path: Optional[str] = None,
-    output_summary_path: Optional[str] = None,
-    output_canonical_path: Optional[str] = None,
-    output_quality_path: Optional[str] = None,
     progress_gcs_uri: Optional[str] = None,
     source_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -404,7 +336,7 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 EXTRACTION CANONIQUE QWEN → MARKDOWN PYTHON")
+    print("🔬 EXTRACTION CANONIQUE QWEN → MARKDOWN DÉTERMINISTE")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
@@ -412,12 +344,9 @@ def run_for_pdf(
     print(f"🤖 Modèle              : {ocr.MODEL_OCR}")
     print(f"📞 Générations/page    : {ocr.NOMINAL_GENERATIONS_PER_PAGE}")
     print(f"🧵 Workers             : {effective_workers}")
-    print(
-        f"🖼️  Rendu source        : "
-        f"{max(ocr.RENDER_DPI, ocr.DETAIL_DPI if getattr(ocr, 'ENABLE_DETAIL_VIEWS', False) else ocr.RENDER_DPI)} DPI"
-    )
-    print(f"🔎 Vues détaillées     : {bool(getattr(ocr, 'ENABLE_DETAIL_VIEWS', False))}")
-    print("📝 Markdown            : déterministe, aucun second LLM")
+    print(f"🖼️ Rendu complet       : {ocr.RENDER_DPI} DPI")
+    print(f"🔎 Rendu détaillé      : {ocr.DETAIL_DPI} DPI")
+    print("📝 Sortie documentaire : un seul fichier Markdown")
     print("=" * 78)
 
     checkpoint_pages = ocr.load_progress(
@@ -469,13 +398,14 @@ def run_for_pdf(
                         result = future.result()
                     except BaseException as error:
                         if _is_global_failure(error) or (
-                            bool(ocr.STOP_ON_CRITICAL) and not bool(ocr.PUBLISH_PARTIAL_DOCUMENT)
+                            bool(ocr.STOP_ON_CRITICAL)
+                            and not bool(ocr.PUBLISH_PARTIAL_DOCUMENT)
                         ):
                             global_failure = (page_num, error)
                             for pending in futures:
                                 pending.cancel()
                             break
-                        print(f"⚠️ Page {page_num}: extraction indisponible, page de secours publiée : {error}")
+                        print(f"⚠️ Page {page_num}: page de secours publiée : {error}")
                         result = ocr.build_unavailable_page(page_num, error)
                     results_by_page[page_num] = result
                     persist_checkpoint()
@@ -491,74 +421,52 @@ def run_for_pdf(
         shutil.rmtree(image_dir, ignore_errors=True)
 
     page_results = [results_by_page[page] for page in range(1, page_count + 1)]
-    final_markdown = "\n\n".join(item["markdown"].rstrip("\n") for item in page_results) + "\n"
-    final_summary = "\n\n".join(
-        item["summary_markdown"].rstrip("\n") for item in page_results
-    ) + "\n"
-    final_canonical = "\n\n".join(
-        item["canonical"].rstrip("\n") for item in page_results
+    final_markdown = "\n\n".join(
+        item["markdown"].rstrip("\n") for item in page_results
     ) + "\n"
 
     validation = ocr.validate_markdown_quality(final_markdown, page_count)
     if not validation.get("ok"):
-        # Le rendu Python ne doit normalement jamais échouer. En cas de défaut
-        # technique, on conserve néanmoins tout le contenu et on le signale.
-        print("⚠️ Validation Markdown déterministe : " + " | ".join(validation.get("errors", [])))
+        # Une anomalie de rendu technique est signalée sans supprimer le contenu.
+        print("⚠️ Validation Markdown : " + " | ".join(validation.get("errors", [])))
+
+    output_md_path = output_md_path or str(Path(pdf_path).with_suffix(".md"))
+    _atomic_write_text(output_md_path, final_markdown)
 
     duration = time.time() - started
-    output_md_path = output_md_path or str(Path(pdf_path).with_suffix(".md"))
-    paths = _derive_local_sidecars(
-        output_md_path,
-        summary_path=output_summary_path,
-        canonical_path=output_canonical_path,
-        quality_path=output_quality_path,
-    )
-    quality_report = _build_quality_report(
-        source_id=source_id,
-        pdf_info=pdf_info,
-        page_results=page_results,
-        validation=validation,
-        duration_seconds=duration,
-        effective_workers=effective_workers,
-    )
-
-    _atomic_write_text(paths["markdown"], final_markdown)
-    _atomic_write_text(paths["summary"], final_summary)
-    _atomic_write_text(paths["canonical"], final_canonical)
-    _atomic_write_json(paths["quality"], quality_report)
-
+    page_qualities = [dict(item["quality"]) for item in page_results]
+    status_counts = Counter(str(item.get("status", "unknown")) for item in page_qualities)
+    quality_status = _quality_status(page_qualities)
     all_stats = [dict(item["stats"]) for item in page_results]
     costs = ocr.calculate_costs(all_stats)
-    sizes_kb = {
-        name: Path(path).stat().st_size / 1024.0 for name, path in paths.items()
-    }
 
     print("\n" + "=" * 78)
     print("✅ EXTRACTION TERMINÉE")
     print("=" * 78)
-    print(f"📝 Markdown complet    : {paths['markdown']}")
-    print(f"🧾 Markdown synthèse   : {paths['summary']}")
-    print(f"🔐 Source canonique    : {paths['canonical']}")
-    print(f"🩺 Rapport qualité     : {paths['quality']}")
-    print(f"📊 Qualité globale     : {quality_report['quality_status']}")
-    print(f"⏱️  Durée               : {duration:.1f}s ({duration / page_count:.1f}s/page)")
+    print(f"📝 Markdown            : {output_md_path}")
+    print(f"📊 Qualité globale     : {quality_status}")
+    print(f"📊 Statuts pages       : {dict(sorted(status_counts.items()))}")
+    print(f"⏱️ Durée               : {duration:.1f}s ({duration / page_count:.1f}s/page)")
     print("=" * 78 + "\n")
 
     return {
-        "paths": paths,
+        "path": output_md_path,
         "page_count": page_count,
         "duration_seconds": duration,
-        "sizes_kb": sizes_kb,
+        "size_kb": Path(output_md_path).stat().st_size / 1024.0,
         "stats": all_stats,
         "costs": costs,
-        "quality": quality_report,
+        "quality_status": quality_status,
+        "status_counts": dict(sorted(status_counts.items())),
         "worker_count": effective_workers,
         "source_id": source_id,
+        "markdown_structure_valid": bool(validation.get("ok")),
+        "markdown_structure_errors": list(validation.get("errors", []) or []),
     }
 
 
 # =============================================================================
-# Main Cloud Run / local
+# Main
 # =============================================================================
 
 
@@ -590,9 +498,7 @@ def main() -> None:
         if gcs_input:
             local_pdf = "/tmp/input.pdf"
             source_id = download_from_gcs(gcs_input, local_pdf)
-            progress_gcs_uri = (
-                os.getenv("GCS_PROGRESS_URI") or derive_progress_gcs_uri(gcs_input)
-            )
+            progress_gcs_uri = os.getenv("GCS_PROGRESS_URI") or derive_progress_gcs_uri(gcs_input)
             local_progress = ocr.get_progress_path(local_pdf)
             Path(local_progress).unlink(missing_ok=True)
             if download_from_gcs_if_exists(progress_gcs_uri, local_progress):
@@ -607,69 +513,41 @@ def main() -> None:
                 gcs_output = f"gs://{bucket}/out/{base}.md"
             gcs_output = _canonical_gs_uri(gcs_output)
 
-            gcs_summary = _canonical_gs_uri(
-                os.getenv("GCS_SUMMARY_OUTPUT_URI")
-                or _derive_gcs_sidecar(gcs_output, ".summary.md")
-            )
-            gcs_canonical = _canonical_gs_uri(
-                os.getenv("GCS_OCR_OUTPUT_URI")
-                or _derive_gcs_sidecar(gcs_output, ".ocr.txt")
-            )
-            gcs_quality = _canonical_gs_uri(
-                os.getenv("GCS_QUALITY_OUTPUT_URI")
-                or _derive_gcs_sidecar(gcs_output, ".quality.json")
-            )
-
             result = run_for_pdf(
                 local_pdf,
                 api_key,
                 output_md_path="/tmp/output.md",
-                output_summary_path="/tmp/output.summary.md",
-                output_canonical_path="/tmp/output.ocr.txt",
-                output_quality_path="/tmp/output.quality.json",
                 progress_gcs_uri=progress_gcs_uri,
                 source_id=source_id,
             )
-            upload_to_gcs(result["paths"]["markdown"], gcs_output)
-            upload_to_gcs(result["paths"]["summary"], gcs_summary)
-            upload_to_gcs(result["paths"]["canonical"], gcs_canonical)
-            upload_to_gcs(result["paths"]["quality"], gcs_quality)
+            upload_to_gcs(result["path"], gcs_output)
             delete_from_gcs(progress_gcs_uri, quiet=True)
             ocr.clear_progress(local_pdf)
 
             print("=" * 78)
             print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
-            print(f"🔗 CANONICAL_OCR_GCS={gcs_canonical}")
-            print(f"🔗 SUMMARY_MARKDOWN_GCS={gcs_summary}")
-            print(f"🔗 QUALITY_REPORT_GCS={gcs_quality}")
             print("=" * 78)
 
             if callback_url and ocr_job_id:
                 stats = result["stats"]
-                total_in = sum(int(item.get("input_tokens", 0) or 0) for item in stats)
-                total_out = sum(int(item.get("output_tokens", 0) or 0) for item in stats)
-                total_reasoning = sum(int(item.get("reasoning_tokens", 0) or 0) for item in stats)
-                total_image = sum(int(item.get("image_tokens", 0) or 0) for item in stats)
                 callback_payload = {
                     "ocrJobId": ocr_job_id,
                     "gcsOutputPath": gcs_output,
-                    "summaryGcsPath": gcs_summary,
-                    "canonicalOcrGcsPath": gcs_canonical,
-                    "qualityGcsPath": gcs_quality,
                     "status": "success",
-                    "qualityStatus": result["quality"]["quality_status"],
+                    "qualityStatus": result["quality_status"],
                     "pageCount": result["page_count"],
                     "durationSeconds": result["duration_seconds"],
-                    "markdownSizeKb": result["sizes_kb"]["markdown"],
+                    "markdownSizeKb": result["size_kb"],
                     "stats": {
-                        "inputTokens": total_in,
-                        "outputTokens": total_out,
-                        "reasoningTokens": total_reasoning,
-                        "imageTokens": total_image,
+                        "inputTokens": sum(int(item.get("input_tokens", 0) or 0) for item in stats),
+                        "outputTokens": sum(int(item.get("output_tokens", 0) or 0) for item in stats),
+                        "reasoningTokens": sum(int(item.get("reasoning_tokens", 0) or 0) for item in stats),
+                        "imageTokens": sum(int(item.get("image_tokens", 0) or 0) for item in stats),
                         "workerCountEffective": result["worker_count"],
                         "generationsPerPage": 1,
                         "semanticRetries": 0,
                         "deterministicMarkdown": True,
+                        "singleMarkdownOutput": True,
                         "pipelineVersion": ocr.PIPELINE_VERSION,
                         "models": {"ocr": ocr.MODEL_OCR},
                     },
@@ -683,7 +561,7 @@ def main() -> None:
             output_md = (os.getenv("OUTPUT_MD_PATH") or "").strip() or None
             result = run_for_pdf(local_input, api_key, output_md_path=output_md)
             ocr.clear_progress(local_input)
-            print(json.dumps(result["paths"], ensure_ascii=False, indent=2))
+            print(result["path"])
         else:
             raise RuntimeError("Ni GCS_INPUT_URI ni INPUT_PDF_PATH définis.")
 
