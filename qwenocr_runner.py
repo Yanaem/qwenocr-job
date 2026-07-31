@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v6.4.1, une seule sortie Markdown.
 
 Par page :
-    plusieurs vues de la même page -> un appel Qwen -> source canonique
+    trois vues JPEG de la même page -> un flux SSE Qwen nominal -> source canonique
     -> Markdown Python déterministe
 
 La source canonique et la qualité sont conservées uniquement dans le checkpoint
@@ -69,6 +69,7 @@ def _validate_ocr_contract() -> None:
         "CANONICAL_OCR_ONLY",
         "DETERMINISTIC_MARKDOWN",
         "SINGLE_MARKDOWN_OUTPUT",
+        "OCR_PROMPT_IN_USER_MESSAGE",
         "NOMINAL_GENERATIONS_PER_PAGE",
         "SEMANTIC_RETRIES",
         "STOP_ON_CRITICAL",
@@ -76,8 +77,18 @@ def _validate_ocr_contract() -> None:
         "PUBLISH_DEGRADED_MARKDOWN",
         "ENABLE_EXPLICIT_CACHE",
         "QWEN_HIGH_RES_IMAGES",
+        "STREAMING_OCR",
+        "STREAM_INCLUDE_USAGE",
+        "THINKING_BUDGET_OCR",
+        "MAX_COMPLETION_TOKENS_OCR",
+        "OCR_SEED",
         "RENDER_DPI",
         "DETAIL_DPI",
+        "DETAIL_UPPER_END",
+        "DETAIL_LOWER_START",
+        "VIEW_JPEG_QUALITY",
+        "MAX_VIEW_PIXELS",
+        "MAX_REQUEST_BODY_MB",
     ]
     required_callables = [
         "validate_api_configuration",
@@ -99,7 +110,7 @@ def _validate_ocr_contract() -> None:
     ]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.1. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.4.1. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
@@ -108,10 +119,14 @@ def _validate_ocr_contract() -> None:
         raise RuntimeError("Contrat invalide : le Markdown doit être rendu par Python.")
     if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
         raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
+    if ocr.OCR_PROMPT_IN_USER_MESSAGE is not True:
+        raise RuntimeError("Contrat invalide : le prompt OCR doit être placé dans le message utilisateur multimodal.")
     if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1:
         raise RuntimeError("Contrat invalide : une seule génération Qwen est autorisée par page.")
     if int(ocr.SEMANTIC_RETRIES) != 0:
         raise RuntimeError("Contrat invalide : aucune relance sémantique n'est autorisée.")
+    if ocr.STREAMING_OCR is not True or ocr.STREAM_INCLUDE_USAGE is not True:
+        raise RuntimeError("Contrat invalide : le flux SSE avec usage final est obligatoire.")
 
 
 def _loaded_ocr_path() -> str:
@@ -342,10 +357,22 @@ def run_for_pdf(
     print(f"📄 Pages               : {page_count}")
     print(f"🧩 Module              : {_loaded_ocr_path()}")
     print(f"🤖 Modèle              : {ocr.MODEL_OCR}")
-    print(f"📞 Générations/page    : {ocr.NOMINAL_GENERATIONS_PER_PAGE}")
+    print(f"📞 Générations/page    : {ocr.NOMINAL_GENERATIONS_PER_PAGE} nominale")
+    print("🌊 Streaming OCR       : SSE activé, usage dans le dernier événement")
+    print(f"🧠 Budget thinking     : {ocr.THINKING_BUDGET_OCR} tokens")
+    print(f"🧾 Budget total sortie : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
+    print(f"🎯 Graine déterministe : {ocr.OCR_SEED}")
+    print("🧭 Prompt OCR          : message utilisateur multimodal")
     print(f"🧵 Workers             : {effective_workers}")
-    print(f"🖼️ Rendu complet       : {ocr.RENDER_DPI} DPI")
-    print(f"🔎 Rendu détaillé      : {ocr.DETAIL_DPI} DPI")
+    print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
+    print(
+        f"🔎 Vues détaillées     : JPEG {ocr.DETAIL_DPI} DPI — "
+        f"0-{int(round(ocr.DETAIL_UPPER_END * 100))}% / "
+        f"{int(round(ocr.DETAIL_LOWER_START * 100))}-100%"
+    )
+    print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
+    print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
+    print("🛟 Repli 413            : compression/résolution seulement, aucune réanalyse")
     print("📝 Sortie documentaire : un seul fichier Markdown")
     print("=" * 78)
 
@@ -543,11 +570,16 @@ def main() -> None:
                         "outputTokens": sum(int(item.get("output_tokens", 0) or 0) for item in stats),
                         "reasoningTokens": sum(int(item.get("reasoning_tokens", 0) or 0) for item in stats),
                         "imageTokens": sum(int(item.get("image_tokens", 0) or 0) for item in stats),
+                        "payloadFallbacks": sum(int(item.get("payload_fallback_count", 0) or 0) for item in stats),
                         "workerCountEffective": result["worker_count"],
                         "generationsPerPage": 1,
                         "semanticRetries": 0,
+                        "ocrSeed": ocr.OCR_SEED,
+                        "thinkingBudget": ocr.THINKING_BUDGET_OCR,
+                        "maxCompletionTokens": ocr.MAX_COMPLETION_TOKENS_OCR,
                         "deterministicMarkdown": True,
                         "singleMarkdownOutput": True,
+                        "ocrPromptInUserMessage": True,
                         "pipelineVersion": ocr.PIPELINE_VERSION,
                         "models": {"ocr": ocr.MODEL_OCR},
                     },
