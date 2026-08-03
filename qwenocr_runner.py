@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v7.1.0, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v7.2.0, une seule sortie Markdown.
 
-Par page : trois vues JPEG -> une génération Qwen en SSE -> source canonique
+Par page : trois vues JPEG -> une génération Qwen en SSE -> OCR canonique indépendant
 -> rendu Markdown déterministe par Python. Python ne réalise aucun contrôle
 comptable ou sémantique et ne corrige aucune donnée documentaire.
 """
@@ -78,7 +78,7 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.1.0. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.2.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
@@ -317,7 +317,7 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 EXTRACTION CANONIQUE QWEN → MARKDOWN DÉTERMINISTE")
+    print("🔬 OCR CANONIQUE INDÉPENDANT → MARKDOWN DÉTERMINISTE")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
