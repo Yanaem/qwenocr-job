@@ -95,9 +95,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =============================================================================
 
-PIPELINE_VERSION = "qwen-canonical-prompt-phase-b-v7.3.0-20260803"
-CHECKPOINT_VERSION = 22
-CHECKPOINT_SCHEMA = "canonical-three-view-prompt-phase-b-renderer-fidelity-v17"
+PIPELINE_VERSION = "qwen-canonical-printed-grid-phase-b-v7.3.1-20260803"
+CHECKPOINT_VERSION = 23
+CHECKPOINT_SCHEMA = "canonical-three-view-printed-grid-phase-b-renderer-fidelity-v18"
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
@@ -297,7 +297,7 @@ Tu reçois, dans cet ordre :
 3. la partie inférieure __LOWER_START__–100 %.
 Les vues détaillées se chevauchent sur __OVERLAP_START__–__OVERLAP_END__ %. Elles sont des recadrages de la page complète, pas des pages supplémentaires.
 - La page complète est l'autorité pour les limites physiques, l'ordre global, le périmètre des tableaux et les troncatures.
-- Les vues détaillées sont l'autorité pour lire les petits caractères et confirmer les alignements.
+- Les vues détaillées sont l'autorité pour lire les petits caractères et préciser les alignements de l'imprimé.
 - Toute donnée lue dans un recadrage doit pouvoir être localisée dans la zone correspondante de la page complète.
 - Une occurrence visible dans plusieurs vues est transcrite une seule fois.
 
@@ -318,39 +318,40 @@ Sépare avant toute construction de tableau :
 - source=printed : imprimé ;
 - source=handwritten : manuscrit ;
 - source=stamp : texte de tampon.
-Le manuscrit et le tampon ne définissent jamais une ligne ou une colonne imprimée et n'entrent jamais dans une cellule imprimée. Chaque groupe manuscrit ou tamponné spatialement distinct devient un BLOCK séparé, section=annotations. Si une partie imprimée est masquée, transcris les caractères visibles et remplace seulement la partie cachée par [ILLISIBLE]. Pour un manuscrit, n'émets un caractère que si sa forme est identifiable ; sinon utilise [ILLISIBLE], même si un mot courant paraît probable.
+Pour construire la géométrie d'un tableau imprimé, considère temporairement les couches handwritten et stamp comme transparentes. Leurs traits, coches, boucles, soulignements ou contours ne relient jamais deux groupes imprimés, ne réduisent jamais l'espace entre eux et ne créent jamais une piste. Après fixation de la grille imprimée, transcris chaque groupe manuscrit ou tamponné spatialement distinct dans un BLOCK séparé, section=annotations. Si une partie imprimée est masquée, transcris les caractères visibles et remplace seulement la partie cachée par [ILLISIBLE]. Pour un manuscrit, n'émets un caractère que si sa forme est identifiable ; sinon utilise [ILLISIBLE], même si un mot courant paraît probable.
 
 MÉTHODE INTERNE OBLIGATOIRE — NE PAS L'EXPOSER
 N'écris aucune sortie avant d'avoir terminé les trois passes suivantes.
 
-PASSE 1 — CARTE DE LA PAGE ET GÉOMÉTRIE DES TABLEAUX
-1. Balaye la page complète de haut en bas et de gauche à droite, y compris les marges, les quatre bords, l'extrême droite, le bas de page et les petits caractères. Repère les BLOCK, TABLE et KV, sans encore les transcrire.
-2. Pour chaque tableau, détermine d'abord son périmètre physique ou son périmètre d'alignement. Un élément dont le centre se trouve hors de ce périmètre reste un élément séparé et ne devient pas une colonne du tableau.
-3. Distingue les lignes ordinaires des lignes clairsemées. Les contributions, frais, remises, acomptes, retenues, sous-totaux, notes et autres lignes partielles ne déterminent pas la grille initiale.
-4. Sur chaque ligne ordinaire, repère de gauche à droite les groupes appartenant à des zones visuelles distinctes. Les mots d'une désignation, un séparateur de milliers, une unité accolée, une devise, un pourcentage ou un signe interne ne créent pas à eux seuls une colonne.
-5. Superpose les lignes ordinaires et crée une piste verticale lorsqu'elle est confirmée par au moins deux lignes imprimées concordantes, ou par une bordure, ou par un en-tête distinct. Dans un tableau à une seule ligne, utilise les bordures, l'en-tête et les limites visuelles des cellules.
-6. Une occurrence isolée sans preuve de piste ne crée pas une colonne globale. Elle reste dans la cellule visuelle qui la contient ; si elle se trouve hors du tableau, elle devient un élément séparé. Elle n'est jamais déplacée vers une cellule voisine pour conserver une grille supposée.
-7. Fige ensuite cols=N et l'ordre physique C1..CN. Une ligne moins complète ne peut ni réduire N ni décaler les colonnes.
-8. Associe les en-têtes seulement après la fixation de C1..CN, selon leur recouvrement horizontal réel. Un en-tête large couvrant plusieurs pistes place son texte dans la piste de gauche ; chaque autre piste sans libellé propre reçoit [SANS_ENTETE_n], où n est le numéro physique de la colonne.
+PASSE 1 — PÉRIMÈTRE ET PISTES DE LA COUCHE IMPRIMÉE
+1. Balaye la page complète de haut en bas et de gauche à droite, y compris les marges, les quatre bords, l'extrême droite, le bas de page et les petits caractères. Repère les BLOCK, TABLE et KV sans encore les transcrire.
+2. Pour chaque tableau, détermine d'abord son périmètre imprimé : bordures visibles ou enveloppe stable des alignements imprimés. Un élément dont le centre se trouve hors de ce périmètre reste séparé et ne devient jamais une colonne du tableau.
+3. Ignore provisoirement tous les manuscrits et tampons. Mesure les espaces, centres et alignements uniquement à partir des glyphes imprimés.
+4. Distingue les lignes ordinaires imprimées des lignes clairsemées. Les contributions, frais, remises, acomptes, retenues, sous-totaux, notes et autres lignes partielles ne déterminent pas la grille initiale.
+5. Sur chaque ligne ordinaire, inventorie de gauche à droite les groupes imprimés et leur centre horizontal. Un groupe est le contenu d'une même cellule visuelle. Les espaces internes d'une désignation, d'un nombre, d'une unité, d'une devise, d'un pourcentage ou d'une expression imprimée ne créent pas une nouvelle piste sans alignement indépendant répété.
+6. Superpose les lignes ordinaires et regroupe les centres concordants en pistes verticales. Une piste est confirmée par au moins deux lignes ordinaires imprimées, ou par une bordure imprimée, ou par une cellule d'en-tête distincte. Dans un tableau à une seule ligne, utilise les bordures, l'en-tête et les limites visibles des cellules.
+7. Avant de figer la grille, examine toute cellule candidate contenant plusieurs groupes. Si leurs centres appartiennent à des pistes confirmées différentes, sépare cette cellule en plusieurs colonnes. S'ils ne correspondent pas à des pistes indépendantes, conserve-les dans une seule cellule avec leurs espaces imprimés.
+8. Fige alors cols=N et l'ordre physique C1..CN. Une ligne moins complète ne peut ni réduire N ni décaler les colonnes.
+9. Associe les en-têtes seulement après la fixation de C1..CN, selon leur recouvrement horizontal réel. Un en-tête large couvrant plusieurs pistes place son texte dans la piste de gauche ; chaque autre piste sans libellé propre reçoit [SANS_ENTETE_n], où n est le numéro physique de la colonne.
 
-PASSE 2 — TRANSCRIPTION LITTÉRALE
-1. Transcris l'imprimé, puis les manuscrits et les tampons dans des éléments séparés.
-2. Dans chaque TABLE, chaque ligne physique utile devient une ROW contenant exactement les indices 1 à N, dans l'ordre croissant. Une position vide devient <EMPTY>. Place chaque valeur selon sa position horizontale, jamais dans la première cellule libre.
-3. Une ligne clairsemée utilise exactement C1..CN déjà figé. Elle ne crée, ne supprime et ne réordonne aucune colonne.
+PASSE 2 — TRANSCRIPTION DANS LA GRILLE FIGÉE
+1. Transcris d'abord l'imprimé, puis les manuscrits et les tampons dans des éléments séparés.
+2. Dans chaque TABLE, chaque ligne physique utile devient une ROW contenant exactement les indices 1 à N, dans l'ordre croissant. Une position vide devient <EMPTY>. Place chaque valeur selon son centre horizontal et les limites de sa cellule imprimée, jamais dans la première cellule libre.
+3. Une ligne clairsemée utilise exactement C1..CN déjà figé. Elle ne crée, ne supprime et ne réordonne aucune colonne. Une expression imprimée composée de plusieurs caractères ou mots reste dans une seule cellule, sauf si ses parties correspondent réellement à plusieurs pistes confirmées.
 4. Une continuation certaine dans la même cellule utilise <BR>. N'utilise pas ROW kind=continuation. Un en-tête répété au milieu d'un tableau reste ROW kind=header.
 5. Une cellule visuelle couvrant plusieurs colonnes place son texte dans la colonne de gauche et <EMPTY> dans les colonnes suivantes qu'elle couvre, sans duplication.
 6. Deux grilles ayant des bordures, des en-têtes ou des systèmes de colonnes distincts restent deux TABLE, même si elles se touchent. Une grille réellement continue reste une seule TABLE.
 7. Les codes courts, taux, zéros, montants et devises restent dans leur cellule propre. Ne copie ni ne déduis une valeur depuis une autre ligne, un total ou un taux global.
 
-PASSE 3 — AUDIT VISUEL AVANT ÉMISSION
+PASSE 3 — AUDIT CIBLÉ AVANT ÉMISSION
 Compare la sortie préparée aux trois vues et vérifie :
-1. chaque ligne et chaque piste de chaque tableau, notamment la première ligne, la dernière ligne et la dernière colonne ;
-2. les lignes clairsemées, afin qu'aucune valeur ne soit tassée ou décalée ;
-3. chaque référence, identifiant, code fiscal, taux, montant et devise caractère par caractère ;
-4. chaque montant comptable visible : montant de ligne, contribution, droit, taxe, remise, acompte, retenue, total hors taxes, total de taxe, total toutes taxes comprises, net ou solde à payer ;
-5. les bords physiques et l'usage local de [TRONQUE] ;
-6. la séparation imprimé/manuscrit/tampon ;
-7. l'absence de doublon dans la zone de chevauchement.
+1. le périmètre de chaque tableau : aucun élément extérieur n'est devenu une colonne ;
+2. les pistes imprimées : chaque piste confirmée possède une colonne et aucune cellule ne contient des groupes appartenant à deux pistes confirmées ;
+3. les lignes clairsemées : elles utilisent la grille figée sans tassement, et aucune expression unique n'est découpée sans preuve de pistes distinctes ;
+4. les couches : aucun trait manuscrit ou tamponné n'a influencé les espaces, centres, lignes ou colonnes de l'imprimé ;
+5. la première ligne, la dernière ligne et la dernière colonne de chaque tableau ;
+6. chaque référence, identifiant, code fiscal, taux, montant, contribution, total et devise caractère par caractère ;
+7. les bords physiques, l'usage local de [TRONQUE] et l'absence de doublon dans la zone de chevauchement.
 Si l'image ne permet pas de trancher, conserve [ILLISIBLE]. N'ajoute aucun champ qui n'est pas visible.
 
 CHOIX DU TYPE D'ÉLÉMENT
@@ -422,7 +423,6 @@ La dernière ligne est exactement [[END_PAGE coverage=complete]] si toute la pag
         .replace("__OVERLAP_END__", str(upper))
         .strip()
     )
-
 
 OCR_PROMPT = _build_ocr_prompt()
 
@@ -1273,10 +1273,12 @@ def _build_ocr_messages(page_num: int, views: Sequence[Dict[str, Any]]) -> List[
     user_content.append({
         "type": "text",
         "text": (
-            "Applique les trois passes du contrat : carte géométrique, transcription littérale, puis audit "
-            "visuel. La page complète fixe les limites et l’ordre ; les vues détaillées confirment les "
-            "caractères et alignements. Retourne uniquement la source canonique BLOCK/TABLE à cellules "
-            "indexées/KV, suivie de l’unique END_PAGE final."
+            "Applique strictement les trois passes du contrat. Pour chaque tableau : fixe d’abord son périmètre "
+            "sur la page complète ; ignore manuscrits et tampons pour mesurer la couche imprimée ; "
+            "regroupe les centres imprimés récurrents en pistes ; sépare une cellule candidate seulement "
+            "si ses groupes appartiennent à des pistes confirmées distinctes ; fige cols=N ; puis projette "
+            "toutes les lignes, y compris clairsemées, dans cette grille. Retourne uniquement la source "
+            "canonique BLOCK/TABLE à cellules indexées/KV, suivie de l’unique END_PAGE final."
         ),
     })
     return [{"role": "user", "content": user_content}]
