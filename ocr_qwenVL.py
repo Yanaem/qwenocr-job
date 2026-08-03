@@ -4,7 +4,7 @@
 """
 ocr_qwenVL.py — transcription visuelle canonique Qwen puis Markdown déterministe.
 
-Contrat v7.2 :
+Contrat v7.2.1 — phase A, fidélité du rendu Python :
 1. une seule génération Qwen nominale par page ;
 2. trois vues JPEG de la même page : complète, supérieure et inférieure ;
 3. Qwen effectue seul l’inventaire, la lecture, la géométrie et l’audit visuel ;
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -94,9 +95,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =============================================================================
 
-PIPELINE_VERSION = "qwen-canonical-independent-accounting-census-v7.2.0-20260803"
-CHECKPOINT_VERSION = 20
-CHECKPOINT_SCHEMA = "canonical-independent-band-census-three-view-stream-v15"
+PIPELINE_VERSION = "qwen-canonical-renderer-fidelity-v7.2.1-20260803"
+CHECKPOINT_VERSION = 21
+CHECKPOINT_SCHEMA = "canonical-independent-band-census-three-view-stream-renderer-fidelity-v16"
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
@@ -1528,7 +1529,13 @@ def _parse_table_content(
 
     emitted_row_count = len(rows)
     emitted_cell_count = sum(len(row.get("cells_map", {}) or {}) for row in rows)
-    max_row_index = max((max(row["cells_map"].keys(), default=0) for row in rows), default=0)
+    max_row_index = max(
+        (
+            max((cell_index for cell_index in row["cells_map"].keys() if cell_index >= 1), default=0)
+            for row in rows
+        ),
+        default=0,
+    )
     effective_cols = max(int(declared_cols or 0), max_row_index)
     if effective_cols <= 0:
         warnings.append(f"{element_id}: tableau_sans_colonne")
@@ -1540,54 +1547,79 @@ def _parse_table_content(
 
     normalized: List[Dict[str, Any]] = []
     for row in rows:
-        cells_map = dict(row["cells_map"])
+        raw_cells_map = dict(row["cells_map"])
+        invalid_cells = [
+            {"index": cell_index, "value": value}
+            for cell_index, value in sorted(raw_cells_map.items())
+            if cell_index < 1
+        ]
+        if invalid_cells:
+            warnings.append(
+                f"{row['row_id']}: indice_cellule_invalide="
+                + ",".join(str(item["index"]) for item in invalid_cells)
+                + "; contenu_conserve_hors_grille"
+            )
+        cells_map = {
+            cell_index: value
+            for cell_index, value in raw_cells_map.items()
+            if cell_index >= 1
+        }
         missing = [position for position in range(1, effective_cols + 1) if position not in cells_map]
         if missing and row.get("source") == "indexed":
             warnings.append(f"{row['row_id']}: indices_cellules_absents={','.join(map(str, missing))}; cellules_vides_ajoutees")
         cells = [cells_map.get(position, "<EMPTY>") for position in range(1, effective_cols + 1)]
-        if all(value.strip() in {"", "<EMPTY>"} for value in cells):
-            warnings.append(f"{row['row_id']}: ligne_entierement_vide_ignoree")
-            continue
-        normalized.append({"kind": row["kind"], "cells": cells, "row_id": row["row_id"]})
+        # Une ROW entièrement vide reste une ROW : Python ne supprime plus une
+        # structure explicitement émise par Qwen.
+        normalized.append(
+            {
+                "kind": row["kind"],
+                "cells": cells,
+                "row_id": row["row_id"],
+                "invalid_cells": invalid_cells,
+            }
+        )
 
-    if normalized and normalized[0]["kind"] == "header":
-        first_header = normalized[0]
-        data_rows = normalized[1:]
+    # Markdown ne possède qu'une ligne d'en-tête. Les lignes kind=header
+    # consécutives au début sont donc réunies colonne par colonne avec <BR>.
+    # Tous les textes restent présents ; aucune ligne de données n'est reclassée.
+    leading_headers: List[Dict[str, Any]] = []
+    while normalized and normalized[0]["kind"] == "header":
+        leading_headers.append(normalized.pop(0))
+
+    header_invalid_cells: List[Dict[str, Any]] = []
+    if leading_headers:
         header: List[str] = []
-        missing_counter = 0
-        for column, value in enumerate(first_header["cells"], start=1):
-            if value.strip() not in {"", "<EMPTY>"}:
-                header.append(value)
+        for column in range(1, effective_cols + 1):
+            parts = [
+                row["cells"][column - 1]
+                for row in leading_headers
+                if row["cells"][column - 1].strip() not in {"", "<EMPTY>"}
+            ]
+            if parts:
+                header.append("<BR>".join(parts))
             else:
-                missing_counter += 1
-                token = f"[SANS_ENTETE_{missing_counter}]"
+                token = f"[SANS_ENTETE_{column}]"
                 header.append(token)
                 warnings.append(f"{element_id}: en_tete_vide_colonne={column}, token={token}")
+        for row in leading_headers:
+            header_invalid_cells.extend(row.get("invalid_cells", []) or [])
+        data_rows = normalized
     else:
         header = [f"[SANS_ENTETE_{i}]" for i in range(1, effective_cols + 1)]
         data_rows = normalized
         warnings.append(f"{element_id}: en_tete_technique_ajoute")
 
-    # Python obéit exclusivement au type de ligne émis par Qwen. Une continuation
-    # explicite est fusionnée cellule par cellule avec la ligne précédente sans
-    # analyser sa signification ; tout le contenu est conservé.
-    rendered_rows: List[Dict[str, Any]] = []
-    for row in data_rows:
-        if row.get("kind") == "continuation" and rendered_rows:
-            previous = rendered_rows[-1]
-            for column, value in enumerate(row["cells"]):
-                if value.strip() in {"", "<EMPTY>"}:
-                    continue
-                current = previous["cells"][column]
-                if current.strip() in {"", "<EMPTY>"}:
-                    previous["cells"][column] = value
-                else:
-                    previous["cells"][column] = f"{current}<BR>{value}"
-            continue
-        rendered_rows.append(row)
-
-    output_rows = [{"kind": "header", "cells": header, "row_id": f"{element_id}.HEADER"}]
-    output_rows.extend(rendered_rows)
+    # Une continuation reste une ligne distincte. La fusion changerait la
+    # structure émise par Qwen et pourrait absorber une ligne mal typée.
+    output_rows = [
+        {
+            "kind": "header",
+            "cells": header,
+            "row_id": f"{element_id}.HEADER",
+            "invalid_cells": header_invalid_cells,
+        }
+    ]
+    output_rows.extend(data_rows)
     return output_rows, effective_cols, emitted_row_count, emitted_cell_count, [], legacy_column_count
 
 
@@ -1840,7 +1872,7 @@ def parse_canonical_page(
         "fermeture_", "cellule_dupliquee=", "ligne_sans_indice_",
         "contenu_sans_cellule_", "ligne_legacy_TSV_", "row_kind_invalide=",
         "tableau_sans_colonne", "cols_absent_derive=", "cols_declare=",
-        "indices_cellules_absents=", "ligne_entierement_vide_ignoree",
+        "indices_cellules_absents=", "indice_cellule_invalide=",
         "texte_hors_balise_preserve", "block_vide_ignore", "table_vide_ignoree",
         "kv_vide_ignore", "item_legacy_salvage=", "cle_dupliquee=",
         "ligne_sans_cle_preservee", "cle_label_absente", "cle_value_absente",
@@ -1919,17 +1951,61 @@ def _display_tokens(text: str) -> str:
     return (text or "").replace("[TRONQUE]", "[TRONQUÉ]")
 
 
+_CANONICAL_DISPLAY_TOKEN_RE = re.compile(
+    r"\[(?:ILLISIBLE|TRONQUÉ|SANS_ENTETE_\d+)\]"
+)
+
+
+def _escape_markdown_literal_fragment(text: str) -> str:
+    """Échappe un fragment documentaire tout en gardant les tokens canoniques."""
+    value = _display_tokens(text)
+    protected: Dict[str, str] = {}
+
+    def protect(match: re.Match[str]) -> str:
+        placeholder = f"OCRDISPLAYTOKEN{len(protected)}XYZ"
+        protected[placeholder] = match.group(0)
+        return placeholder
+
+    value = _CANONICAL_DISPLAY_TOKEN_RE.sub(protect, value)
+    value = html.escape(value, quote=False)
+    value = value.replace("\\", "\\\\")
+    for marker in ("`", "*", "_", "[", "]", "#", "~", "|"):
+        value = value.replace(marker, "\\" + marker)
+    for placeholder, token in protected.items():
+        value = value.replace(placeholder, token)
+    return value
+
+
 def _escape_markdown_cell(text: str) -> str:
     value = _display_tokens(text)
     if value == "<EMPTY>":
         return ""
-    value = value.replace("<BR>", "<br>").replace("\n", "<br>")
-    value = value.replace("\\", "\\\\").replace("|", "\\|")
+    fragments = re.split(r"<BR>|\n", value)
+    return "<br>".join(_escape_markdown_literal_fragment(fragment) for fragment in fragments)
+
+
+def _escape_markdown_block_fragment(text: str) -> str:
+    """Protège un texte documentaire contre toute interprétation Markdown."""
+    value = _escape_markdown_literal_fragment(text)
+    # Les marqueurs de listes et règles horizontales n'ont un effet spécial
+    # qu'en début de ligne. Ils sont échappés sans modifier le texte affiché.
+    value = re.sub(r"^(\s*)([-+])(?=\s)", r"\1\\\2", value)
+    value = re.sub(r"^(\s*)(\d+)([.)])(?=\s)", r"\1\2\\\3", value)
+    if re.fullmatch(r"\s*-{3,}\s*", value):
+        value = value.replace("-", "\\-", 1)
     return value
 
 
+def _escape_markdown_block_line(text: str) -> str:
+    # <BR> est un token canonique interne. Les fragments documentaires sont
+    # échappés séparément, puis le saut de ligne HTML généré est réintroduit.
+    return "<br>".join(
+        _escape_markdown_block_fragment(fragment) for fragment in str(text).split("<BR>")
+    )
+
+
 def _render_block(element: Dict[str, Any]) -> str:
-    lines = [_display_tokens(str(line)) for line in element.get("lines", [])]
+    lines = [_escape_markdown_block_line(str(line)) for line in element.get("lines", [])]
     content = "<br>\n".join(lines).strip()
     source = element.get("source")
     if source == "handwritten":
@@ -1948,9 +2024,26 @@ def _render_table(element: Dict[str, Any]) -> str:
         "| " + " | ".join(_escape_markdown_cell(cell) for cell in header) + " |",
         "| " + " | ".join("---" for _ in header) + " |",
     ]
+    residues: List[str] = []
+    for row in rows:
+        for invalid in row.get("invalid_cells", []) or []:
+            residues.append(
+                f"{row.get('row_id', 'ROW')} {invalid.get('index')}={_display_tokens(str(invalid.get('value', '')))}"
+            )
     for row in rows[1:]:
         output.append(
             "| " + " | ".join(_escape_markdown_cell(cell) for cell in row["cells"]) + " |"
+        )
+    if residues:
+        # Un indice hors contrat ne peut être positionné honnêtement dans la
+        # grille. Son contenu est conservé littéralement, sans déplacement.
+        output.extend(
+            [
+                "",
+                '<pre data-ocr-residue="out-of-grid">',
+                *(html.escape(item, quote=False) for item in residues),
+                "</pre>",
+            ]
         )
     return "\n".join(output)
 
@@ -2021,6 +2114,8 @@ def render_canonical_page(parsed: Dict[str, Any]) -> str:
             )
             for row in element.get("rows", []) or []:
                 output.append(f"[[ROW kind={row.get('kind', 'data')}]]")
+                for invalid in row.get("invalid_cells", []) or []:
+                    output.append(f"{invalid.get('index')}={invalid.get('value', '')}")
                 for index, cell in enumerate(row.get("cells", []) or [], start=1):
                     output.append(f"{index}={cell}")
                 output.append("[[/ROW]]")
