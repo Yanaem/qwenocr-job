@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v7.3.0 phase B, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v7.3.1 phase B — grille imprimée, une seule sortie Markdown.
 
 Par page : trois vues JPEG -> une génération Qwen en SSE -> OCR canonique indépendant
 -> rendu Markdown déterministe par Python. Python ne réalise aucun contrôle
@@ -78,7 +78,7 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.3.0 phase B. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.3.1 phase B — grille imprimée. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
