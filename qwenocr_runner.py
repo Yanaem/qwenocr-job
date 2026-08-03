@@ -2,15 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v6.5.0, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v7.0.0, une seule sortie Markdown.
 
-Par page :
-    quatre vues JPEG ciblées de la même page -> un flux SSE Qwen nominal -> source canonique
-    -> Markdown Python déterministe
-
-La source canonique et la qualité sont conservées uniquement dans le checkpoint
-technique temporaire afin de permettre une reprise. Après succès, le seul
-artefact documentaire publié est le fichier Markdown final.
+Par page : trois vues JPEG -> une génération Qwen en SSE -> source canonique
+-> rendu Markdown déterministe par Python. Python ne réalise aucun contrôle
+comptable ou sémantique et ne corrige aucune donnée documentaire.
 """
 
 from __future__ import annotations
@@ -62,60 +58,27 @@ except Exception:
 
 def _validate_ocr_contract() -> None:
     required_attributes = [
-        "API_URL",
-        "MODEL",
-        "MODEL_OCR",
-        "PIPELINE_VERSION",
-        "CANONICAL_OCR_ONLY",
-        "DETERMINISTIC_MARKDOWN",
-        "SINGLE_MARKDOWN_OUTPUT",
-        "OCR_PROMPT_IN_USER_MESSAGE",
-        "NOMINAL_GENERATIONS_PER_PAGE",
-        "SEMANTIC_RETRIES",
-        "STOP_ON_CRITICAL",
-        "PUBLISH_PARTIAL_DOCUMENT",
-        "PUBLISH_DEGRADED_MARKDOWN",
-        "ENABLE_EXPLICIT_CACHE",
-        "QWEN_HIGH_RES_IMAGES",
-        "STREAMING_OCR",
-        "STREAM_INCLUDE_USAGE",
-        "THINKING_BUDGET_OCR",
-        "MAX_COMPLETION_TOKENS_OCR",
-        "OCR_SEED",
-        "RENDER_DPI",
-        "DETAIL_DPI",
-        "CRITICAL_DPI",
-        "BODY_VIEW_TOP",
-        "BODY_VIEW_BOTTOM",
-        "FOOTER_VIEW_TOP",
-        "CRITICAL_VIEW_LEFT",
-        "CRITICAL_VIEW_TOP",
-        "CRITICAL_VIEW_BOTTOM",
-        "VIEW_JPEG_QUALITY",
-        "MAX_VIEW_PIXELS",
+        "API_URL", "MODEL", "MODEL_OCR", "PIPELINE_VERSION",
+        "CANONICAL_OCR_ONLY", "DETERMINISTIC_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
+        "OCR_PROMPT_IN_USER_MESSAGE", "NOMINAL_GENERATIONS_PER_PAGE", "SEMANTIC_RETRIES",
+        "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT", "PUBLISH_DEGRADED_MARKDOWN",
+        "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "STREAMING_OCR",
+        "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_OCR", "MAX_COMPLETION_TOKENS_OCR",
+        "OCR_SEED", "RENDER_DPI", "DETAIL_DPI", "DETAIL_UPPER_END",
+        "DETAIL_LOWER_START", "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS",
         "MAX_REQUEST_BODY_MB",
     ]
     required_callables = [
-        "validate_api_configuration",
-        "configure_explicit_cache_for_batch",
-        "get_pipeline_fingerprint",
-        "get_progress_path",
-        "get_pdf_info",
-        "load_progress",
-        "save_progress",
-        "clear_progress",
-        "process_page",
-        "build_unavailable_page",
-        "validate_markdown_quality",
-        "calculate_costs",
+        "validate_api_configuration", "configure_explicit_cache_for_batch",
+        "get_pipeline_fingerprint", "get_progress_path", "get_pdf_info",
+        "load_progress", "save_progress", "clear_progress", "process_page",
+        "build_unavailable_page", "validate_markdown_quality", "calculate_costs",
     ]
     missing = [name for name in required_attributes if not hasattr(ocr, name)]
-    missing += [
-        name for name in required_callables if not callable(getattr(ocr, name, None))
-    ]
+    missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v6.5.0. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.0.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.CANONICAL_OCR_ONLY is not True:
@@ -125,11 +88,9 @@ def _validate_ocr_contract() -> None:
     if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
         raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
     if ocr.OCR_PROMPT_IN_USER_MESSAGE is not True:
-        raise RuntimeError("Contrat invalide : le prompt OCR doit être placé dans le message utilisateur multimodal.")
-    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1:
-        raise RuntimeError("Contrat invalide : une seule génération Qwen est autorisée par page.")
-    if int(ocr.SEMANTIC_RETRIES) != 0:
-        raise RuntimeError("Contrat invalide : aucune relance sémantique n'est autorisée.")
+        raise RuntimeError("Contrat invalide : le prompt OCR doit être dans le message utilisateur.")
+    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1 or int(ocr.SEMANTIC_RETRIES) != 0:
+        raise RuntimeError("Contrat invalide : une génération nominale et aucune relance sémantique.")
     if ocr.STREAMING_OCR is not True or ocr.STREAM_INCLUDE_USAGE is not True:
         raise RuntimeError("Contrat invalide : le flux SSE avec usage final est obligatoire.")
 
@@ -339,37 +300,6 @@ def _quality_status(page_qualities: Iterable[Dict[str, Any]]) -> str:
     return "ok"
 
 
-def _document_reference_conflicts(page_results: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
-    groups: Dict[Tuple[str, str], list[Dict[str, Any]]] = {}
-    for result in page_results:
-        page_num = int(result.get("page_num", 0) or 0)
-        quality = dict(result.get("quality") or {})
-        for record in quality.get("reference_records", []) or []:
-            suffix = str(record.get("suffix", ""))
-            designation_key = str(record.get("designation_key", ""))
-            reference = str(record.get("reference", ""))
-            if not suffix or len(designation_key) < 6 or not reference:
-                continue
-            groups.setdefault((suffix, designation_key), []).append(
-                {**dict(record), "page_num": page_num}
-            )
-
-    conflicts: list[Dict[str, Any]] = []
-    for (suffix, designation_key), records in groups.items():
-        references = sorted({str(record["reference"]) for record in records})
-        if len(references) <= 1:
-            continue
-        conflicts.append(
-            {
-                "suffix": suffix,
-                "designation_key": designation_key,
-                "references": references,
-                "pages": sorted({int(record["page_num"]) for record in records}),
-            }
-        )
-    return conflicts
-
-
 def run_for_pdf(
     pdf_path: str,
     api_key: str,
@@ -402,14 +332,9 @@ def run_for_pdf(
     print(f"🧵 Workers             : {effective_workers}")
     print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
     print(
-        f"🔎 Corps / pied        : JPEG {ocr.DETAIL_DPI} DPI — "
-        f"{int(round(ocr.BODY_VIEW_TOP * 100))}-{int(round(ocr.BODY_VIEW_BOTTOM * 100))}% / "
-        f"{int(round(ocr.FOOTER_VIEW_TOP * 100))}-100%"
-    )
-    print(
-        f"🎯 Vue numérique droite: JPEG {ocr.CRITICAL_DPI} DPI — "
-        f"x={int(round(ocr.CRITICAL_VIEW_LEFT * 100))}-100%, "
-        f"y={int(round(ocr.CRITICAL_VIEW_TOP * 100))}-{int(round(ocr.CRITICAL_VIEW_BOTTOM * 100))}%"
+        f"🔎 Vues détaillées     : JPEG {ocr.DETAIL_DPI} DPI — "
+        f"0-{int(round(ocr.DETAIL_UPPER_END * 100))}% / "
+        f"{int(round(ocr.DETAIL_LOWER_START * 100))}-100%"
     )
     print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
     print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
@@ -465,10 +390,7 @@ def run_for_pdf(
                     try:
                         result = future.result()
                     except BaseException as error:
-                        if _is_global_failure(error) or (
-                            bool(ocr.STOP_ON_CRITICAL)
-                            and not bool(ocr.PUBLISH_PARTIAL_DOCUMENT)
-                        ):
+                        if _is_global_failure(error) or not bool(ocr.PUBLISH_PARTIAL_DOCUMENT):
                             global_failure = (page_num, error)
                             for pending in futures:
                                 pending.cancel()
@@ -489,20 +411,11 @@ def run_for_pdf(
         shutil.rmtree(image_dir, ignore_errors=True)
 
     page_results = [results_by_page[page] for page in range(1, page_count + 1)]
-    reference_conflicts = _document_reference_conflicts(page_results)
-    document_comment = (
-        "<!-- DOCUMENT_QUALITY "
-        f"reference_conflicts={len(reference_conflicts)} "
-        f"critical={'failed' if reference_conflicts else 'passed'} -->"
-    )
-    final_markdown = document_comment + "\n\n" + "\n\n".join(
-        item["markdown"].rstrip("\n") for item in page_results
-    ) + "\n"
+    final_markdown = "\n\n".join(item["markdown"].rstrip("\n") for item in page_results) + "\n"
 
     validation = ocr.validate_markdown_quality(final_markdown, page_count)
     if not validation.get("ok"):
-        # Une anomalie de rendu technique est signalée sans supprimer le contenu.
-        print("⚠️ Validation Markdown : " + " | ".join(validation.get("errors", [])))
+        print("⚠️ Validation technique du Markdown : " + " | ".join(validation.get("errors", [])))
 
     output_md_path = output_md_path or str(Path(pdf_path).with_suffix(".md"))
     _atomic_write_text(output_md_path, final_markdown)
@@ -511,8 +424,6 @@ def run_for_pdf(
     page_qualities = [dict(item["quality"]) for item in page_results]
     status_counts = Counter(str(item.get("status", "unknown")) for item in page_qualities)
     quality_status = _quality_status(page_qualities)
-    if reference_conflicts and quality_status == "ok":
-        quality_status = "warning"
     all_stats = [dict(item["stats"]) for item in page_results]
     costs = ocr.calculate_costs(all_stats)
 
@@ -520,9 +431,8 @@ def run_for_pdf(
     print("✅ EXTRACTION TERMINÉE")
     print("=" * 78)
     print(f"📝 Markdown            : {output_md_path}")
-    print(f"📊 Qualité globale     : {quality_status}")
+    print(f"📊 État technique      : {quality_status}")
     print(f"📊 Statuts pages       : {dict(sorted(status_counts.items()))}")
-    print(f"🔎 Conflits références : {len(reference_conflicts)}")
     print(f"⏱️ Durée               : {duration:.1f}s ({duration / page_count:.1f}s/page)")
     print("=" * 78 + "\n")
 
@@ -539,7 +449,6 @@ def run_for_pdf(
         "source_id": source_id,
         "markdown_structure_valid": bool(validation.get("ok")),
         "markdown_structure_errors": list(validation.get("errors", []) or []),
-        "reference_conflicts": reference_conflicts,
     }
 
 
@@ -622,10 +531,6 @@ def main() -> None:
                         "reasoningTokens": sum(int(item.get("reasoning_tokens", 0) or 0) for item in stats),
                         "imageTokens": sum(int(item.get("image_tokens", 0) or 0) for item in stats),
                         "payloadFallbacks": sum(int(item.get("payload_fallback_count", 0) or 0) for item in stats),
-                        "workerCountEffective": result["worker_count"],
-                        "generationsPerPage": 1,
-                        "semanticRetries": 0,
-                        "referenceConflicts": len(result.get("reference_conflicts", []) or []),
                         "ocrSeed": ocr.OCR_SEED,
                         "thinkingBudget": ocr.THINKING_BUDGET_OCR,
                         "maxCompletionTokens": ocr.MAX_COMPLETION_TOKENS_OCR,
