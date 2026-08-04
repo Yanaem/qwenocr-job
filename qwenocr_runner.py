@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v8.1.0, topologie auditable puis OCR par page.
+qwenocr_runner.py — runner Cloud Run/local v8.2.0, carte de preuves puis OCR par page.
 
-Appel 1 : cartographie topologique. Python crée ensuite des recadrages avec
+Appel 1 : cartographie de preuves visuelles. Python crée ensuite des recadrages avec
 marges. Appel 2 : OCR canonique guidé et vérifié sur les pixels. Le Markdown est
 rendu mécaniquement et complété par les annexes brutes géométrique et OCR.
 """
@@ -86,11 +86,11 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v8.1.0 topologie auditable. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v8.2.0 carte de preuves. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.TWO_PASS_GEOMETRY_OCR is not True:
-        raise RuntimeError("Contrat invalide : la cartographie puis l’OCR guidé sont obligatoires.")
+        raise RuntimeError("Contrat invalide : la carte de preuves puis l’OCR guidé sont obligatoires.")
     if ocr.CANONICAL_OCR_ONLY is not True:
         raise RuntimeError("Contrat invalide : Qwen doit produire uniquement la source canonique finale.")
     if ocr.DETERMINISTIC_MARKDOWN is not True:
@@ -102,7 +102,7 @@ def _validate_ocr_contract() -> None:
     if ocr.GEOMETRY_PROMPT_IN_USER_MESSAGE is not True:
         raise RuntimeError("Contrat invalide : le prompt géométrique doit être dans le message utilisateur.")
     if ocr.TWO_PASS_GEOMETRY_OCR is not True:
-        raise RuntimeError("Contrat invalide : la cartographie puis l’OCR guidé sont obligatoires.")
+        raise RuntimeError("Contrat invalide : la carte de preuves puis l’OCR guidé sont obligatoires.")
     if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 2 or int(ocr.SEMANTIC_RETRIES) != 0:
         raise RuntimeError("Contrat invalide : deux appels spécialisés et aucune relance sémantique.")
     if ocr.STREAMING_OCR is not True or ocr.STREAM_INCLUDE_USAGE is not True:
