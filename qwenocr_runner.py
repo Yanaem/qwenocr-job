@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v7.3.1 phase B — grille imprimée, une seule sortie Markdown.
+qwenocr_runner.py — runner Cloud Run/local v8.0.0, deux passes par page.
 
-Par page : trois vues JPEG -> une génération Qwen en SSE -> OCR canonique indépendant
--> rendu Markdown déterministe par Python. Python ne réalise aucun contrôle
-comptable ou sémantique et ne corrige aucune donnée documentaire.
+Appel 1 : cartographie topologique. Python crée ensuite des recadrages avec
+marges. Appel 2 : OCR canonique guidé et vérifié sur les pixels. Le Markdown est
+rendu mécaniquement et complété par les annexes brutes géométrique et OCR.
 """
 
 from __future__ import annotations
@@ -58,14 +58,19 @@ except Exception:
 
 def _validate_ocr_contract() -> None:
     required_attributes = [
-        "API_URL", "MODEL", "MODEL_OCR", "PIPELINE_VERSION",
+        "API_URL", "MODEL", "MODEL_OCR", "MODEL_GEOMETRY", "PIPELINE_VERSION",
         "CANONICAL_OCR_ONLY", "DETERMINISTIC_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
-        "OCR_PROMPT_IN_USER_MESSAGE", "NOMINAL_GENERATIONS_PER_PAGE", "SEMANTIC_RETRIES",
+        "TWO_PASS_GEOMETRY_OCR", "OCR_PROMPT_IN_USER_MESSAGE", "GEOMETRY_PROMPT_IN_USER_MESSAGE",
+        "TWO_PASS_GEOMETRY_OCR", "GEOMETRY_PROMPT", "OCR_PROMPT",
+        "NOMINAL_GENERATIONS_PER_PAGE", "SEMANTIC_RETRIES",
         "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT", "PUBLISH_DEGRADED_MARKDOWN",
+        "OCR_DIAGNOSTIC_MODE", "INCLUDE_GEOMETRY_ANNEX", "INCLUDE_OCR_ANNEX",
         "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "STREAMING_OCR",
-        "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_OCR", "MAX_COMPLETION_TOKENS_OCR",
-        "OCR_SEED", "RENDER_DPI", "DETAIL_DPI", "DETAIL_UPPER_END",
-        "DETAIL_LOWER_START", "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS",
+        "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_GEOMETRY", "MAX_COMPLETION_TOKENS_GEOMETRY",
+        "THINKING_BUDGET_OCR", "MAX_COMPLETION_TOKENS_OCR",
+        "GEOMETRY_SEED", "OCR_SEED", "RENDER_DPI", "DETAIL_DPI", "DETAIL_UPPER_END",
+        "DETAIL_LOWER_START", "TARGET_CROP_DPI", "TARGET_RIGHT_CROP_DPI",
+        "MAX_GUIDED_CROPS", "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS",
         "MAX_REQUEST_BODY_MB",
     ]
     required_callables = [
@@ -73,24 +78,32 @@ def _validate_ocr_contract() -> None:
         "get_pipeline_fingerprint", "get_progress_path", "get_pdf_info",
         "load_progress", "save_progress", "clear_progress", "process_page",
         "build_unavailable_page", "validate_markdown_quality", "calculate_costs",
+        "parse_geometry_map", "render_geometry_map", "build_geometry_annex",
+        "build_ocr_annex", "assemble_document_with_ocr_annex",
     ]
     missing = [name for name in required_attributes if not hasattr(ocr, name)]
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v7.3.1 phase B — grille imprimée. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v8.0.0 deux passes. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
+    if ocr.TWO_PASS_GEOMETRY_OCR is not True:
+        raise RuntimeError("Contrat invalide : la cartographie puis l’OCR guidé sont obligatoires.")
     if ocr.CANONICAL_OCR_ONLY is not True:
-        raise RuntimeError("Contrat invalide : Qwen doit produire uniquement la source canonique.")
+        raise RuntimeError("Contrat invalide : Qwen doit produire uniquement la source canonique finale.")
     if ocr.DETERMINISTIC_MARKDOWN is not True:
         raise RuntimeError("Contrat invalide : le Markdown doit être rendu par Python.")
     if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
         raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
     if ocr.OCR_PROMPT_IN_USER_MESSAGE is not True:
         raise RuntimeError("Contrat invalide : le prompt OCR doit être dans le message utilisateur.")
-    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1 or int(ocr.SEMANTIC_RETRIES) != 0:
-        raise RuntimeError("Contrat invalide : une génération nominale et aucune relance sémantique.")
+    if ocr.GEOMETRY_PROMPT_IN_USER_MESSAGE is not True:
+        raise RuntimeError("Contrat invalide : le prompt géométrique doit être dans le message utilisateur.")
+    if ocr.TWO_PASS_GEOMETRY_OCR is not True:
+        raise RuntimeError("Contrat invalide : la cartographie puis l’OCR guidé sont obligatoires.")
+    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 2 or int(ocr.SEMANTIC_RETRIES) != 0:
+        raise RuntimeError("Contrat invalide : deux appels spécialisés et aucune relance sémantique.")
     if ocr.STREAMING_OCR is not True or ocr.STREAM_INCLUDE_USAGE is not True:
         raise RuntimeError("Contrat invalide : le flux SSE avec usage final est obligatoire.")
 
@@ -263,28 +276,64 @@ def derive_progress_gcs_uri(gcs_input: str) -> str:
     return f"gs://{bucket_name}/progress/{base}.progress.json"
 
 
+def derive_diagnostics_gcs_uri(gcs_input: str) -> str:
+    """Chemin technique distinct du checkpoint de reprise.
+
+    Le fichier de diagnostic n'est créé que lorsque OCR_DIAGNOSTIC_MODE=true.
+    Il contient des données documentaires brutes et doit rester protégé.
+    """
+    bucket_name, blob_name = parse_gs_uri(gcs_input)
+    relative = blob_name[len("in/") :] if blob_name.startswith("in/") else blob_name
+    base = relative.rsplit(".", 1)[0] if "." in relative else relative
+    return f"gs://{bucket_name}/diagnostics/{base}.ocr-diagnostics.json"
+
+
 # =============================================================================
 # Traitement
 # =============================================================================
 
 
 def _checkpoint_record(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Le canonique reste interne au checkpoint et n'est jamais publié."""
-    return {
+    """Construit le record de reprise des deux appels et du rendu final."""
+    record: Dict[str, Any] = {
         "status": "done",
         "page_num": int(result["page_num"]),
-        "canonical": str(result["canonical"]),
+        "geometry_normalized": str(result.get("geometry_normalized", "")),
+        "geometry": dict(result.get("geometry") or {}),
+        "normalized_canonical": str(result.get("normalized_canonical", result["canonical"])),
         "markdown": str(result["markdown"]),
         "quality": dict(result["quality"]),
         "stats": dict(result["stats"]),
         "updated_at_utc": _utc_now(),
     }
+    if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_GEOMETRY_ANNEX):
+        record["geometry_raw"] = str(result.get("geometry_raw", ""))
+    if bool(ocr.OCR_DIAGNOSTIC_MODE):
+        record["geometry_sanitized"] = str(
+            result.get("geometry_sanitized", result.get("geometry_normalized", ""))
+        )
+    if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_OCR_ANNEX):
+        record["raw_response"] = str(result.get("raw_response", ""))
+    if bool(ocr.OCR_DIAGNOSTIC_MODE):
+        record["sanitized_canonical"] = str(
+            result.get("sanitized_canonical", result.get("canonical", ""))
+        )
+    return record
 
 
 def _record_to_result(record: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = str(record.get("normalized_canonical", record.get("canonical", "")))
+    geometry_normalized = str(record.get("geometry_normalized", ""))
     return {
         "page_num": int(record["page_num"]),
-        "canonical": str(record["canonical"]),
+        "geometry_raw": str(record.get("geometry_raw", "")),
+        "geometry_sanitized": str(record.get("geometry_sanitized", geometry_normalized)),
+        "geometry_normalized": geometry_normalized,
+        "geometry": dict(record.get("geometry") or {}),
+        "raw_response": str(record.get("raw_response", "")),
+        "sanitized_canonical": str(record.get("sanitized_canonical", normalized)),
+        "normalized_canonical": normalized,
+        "canonical": normalized,
         "markdown": str(record["markdown"]),
         "quality": dict(record["quality"]),
         "stats": dict(record["stats"]),
@@ -317,18 +366,21 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 OCR CANONIQUE INDÉPENDANT → MARKDOWN DÉTERMINISTE")
+    print("🔬 CARTOGRAPHIE QWEN → OCR GUIDÉ → MARKDOWN DÉTERMINISTE")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
     print(f"🧩 Module              : {_loaded_ocr_path()}")
-    print(f"🤖 Modèle              : {ocr.MODEL_OCR}")
-    print(f"📞 Générations/page    : {ocr.NOMINAL_GENERATIONS_PER_PAGE} nominale")
-    print("🌊 Streaming OCR       : SSE activé, usage dans le dernier événement")
-    print(f"🧠 Budget thinking     : {ocr.THINKING_BUDGET_OCR} tokens")
-    print(f"🧾 Budget total sortie : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
-    print(f"🎯 Graine déterministe : {ocr.OCR_SEED}")
-    print("🧭 Prompt OCR          : message utilisateur multimodal")
+    print(f"🤖 Modèle géométrie    : {ocr.MODEL_GEOMETRY}")
+    print(f"🤖 Modèle OCR          : {ocr.MODEL_OCR}")
+    print(f"📞 Appels/page         : {ocr.NOMINAL_GENERATIONS_PER_PAGE} (carte + OCR)")
+    print("🌊 Streaming           : SSE activé pour les deux appels")
+    print(f"🧠 Thinking géométrie  : {ocr.THINKING_BUDGET_GEOMETRY} tokens")
+    print(f"🧠 Thinking OCR        : {ocr.THINKING_BUDGET_OCR} tokens")
+    print(f"🧾 Sortie géométrie    : {ocr.MAX_COMPLETION_TOKENS_GEOMETRY} tokens")
+    print(f"🧾 Sortie OCR          : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
+    print(f"🎯 Graines             : geometry={ocr.GEOMETRY_SEED}, ocr={ocr.OCR_SEED}")
+    print("🧭 Prompts             : géométrie + OCR dans les messages utilisateur")
     print(f"🧵 Workers             : {effective_workers}")
     print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
     print(
@@ -340,6 +392,19 @@ def run_for_pdf(
     print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
     print("🛟 Repli 413            : compression/résolution seulement, aucune réanalyse")
     print("📝 Sortie documentaire : un seul fichier Markdown")
+    print(
+        "🗺️ Annexe géométrique : "
+        + ("incluse dans le Markdown" if ocr.INCLUDE_GEOMETRY_ANNEX else "désactivée")
+    )
+    print(
+        "📎 Annexe OCR brute   : "
+        + ("incluse dans le Markdown" if ocr.INCLUDE_OCR_ANNEX else "désactivée")
+    )
+    if ocr.OCR_DIAGNOSTIC_MODE:
+        print("🔬 Diagnostic interne   : activé — états géométriques, OCR et Markdown conservés")
+        print("🔐 Données sensibles    : le diagnostic doit rester en accès restreint")
+    else:
+        print("🔬 Diagnostic interne   : désactivé")
     print("=" * 78)
 
     checkpoint_pages = ocr.load_progress(
@@ -411,14 +476,25 @@ def run_for_pdf(
         shutil.rmtree(image_dir, ignore_errors=True)
 
     page_results = [results_by_page[page] for page in range(1, page_count + 1)]
-    final_markdown = "\n\n".join(item["markdown"].rstrip("\n") for item in page_results) + "\n"
+    rendered_markdown = (
+        "\n\n".join(item["markdown"].rstrip("\n") for item in page_results) + "\n"
+    )
 
-    validation = ocr.validate_markdown_quality(final_markdown, page_count)
+    # La validation porte uniquement sur le rendu lisible. L'annexe est un bloc
+    # d'audit contenant la réponse brute de Qwen et ne doit pas être interprétée
+    # comme un second document Markdown.
+    validation = ocr.validate_markdown_quality(rendered_markdown, page_count)
     if not validation.get("ok"):
         print("⚠️ Validation technique du Markdown : " + " | ".join(validation.get("errors", [])))
 
+    final_markdown = ocr.assemble_document_with_ocr_annex(
+        rendered_markdown, page_results
+    )
     output_md_path = output_md_path or str(Path(pdf_path).with_suffix(".md"))
     _atomic_write_text(output_md_path, final_markdown)
+    rendered_size_kb = len(rendered_markdown.encode("utf-8")) / 1024.0
+    final_size_kb = len(final_markdown.encode("utf-8")) / 1024.0
+    annex_size_kb = max(0.0, final_size_kb - rendered_size_kb)
 
     duration = time.time() - started
     page_qualities = [dict(item["quality"]) for item in page_results]
@@ -431,6 +507,8 @@ def run_for_pdf(
     print("✅ EXTRACTION TERMINÉE")
     print("=" * 78)
     print(f"📝 Markdown            : {output_md_path}")
+    if ocr.INCLUDE_GEOMETRY_ANNEX or ocr.INCLUDE_OCR_ANNEX:
+        print(f"📎 Annexes brutes      : {annex_size_kb:.1f} Ko")
     print(f"📊 État technique      : {quality_status}")
     print(f"📊 Statuts pages       : {dict(sorted(status_counts.items()))}")
     print(f"⏱️ Durée               : {duration:.1f}s ({duration / page_count:.1f}s/page)")
@@ -449,6 +527,10 @@ def run_for_pdf(
         "source_id": source_id,
         "markdown_structure_valid": bool(validation.get("ok")),
         "markdown_structure_errors": list(validation.get("errors", []) or []),
+        "include_geometry_annex": bool(ocr.INCLUDE_GEOMETRY_ANNEX),
+        "include_ocr_annex": bool(ocr.INCLUDE_OCR_ANNEX),
+        "rendered_size_kb": rendered_size_kb,
+        "annex_size_kb": annex_size_kb,
     }
 
 
@@ -508,11 +590,31 @@ def main() -> None:
                 source_id=source_id,
             )
             upload_to_gcs(result["path"], gcs_output)
+
+            diagnostics_gcs_uri: Optional[str] = None
+            if ocr.OCR_DIAGNOSTIC_MODE:
+                diagnostics_gcs_uri = (
+                    os.getenv("GCS_DIAGNOSTICS_URI")
+                    or derive_diagnostics_gcs_uri(gcs_input)
+                )
+                diagnostics_gcs_uri = _canonical_gs_uri(diagnostics_gcs_uri)
+                local_progress_path = ocr.get_progress_path(local_pdf)
+                if not Path(local_progress_path).exists():
+                    raise RuntimeError(
+                        "Diagnostic demandé mais checkpoint local introuvable après extraction."
+                    )
+                upload_to_gcs(local_progress_path, diagnostics_gcs_uri)
+
+            # Le checkpoint de reprise est toujours supprimé après succès afin
+            # qu'une nouvelle exécution relance réellement Qwen. Le diagnostic,
+            # lorsqu'il est activé, est conservé sous un chemin distinct.
             delete_from_gcs(progress_gcs_uri, quiet=True)
             ocr.clear_progress(local_pdf)
 
             print("=" * 78)
             print(f"🔗 LOVABLE_MARKDOWN_GCS={gcs_output}")
+            if diagnostics_gcs_uri:
+                print(f"🔬 OCR_DIAGNOSTICS_GCS={diagnostics_gcs_uri}")
             print("=" * 78)
 
             if callback_url and ocr_job_id:
@@ -531,14 +633,20 @@ def main() -> None:
                         "reasoningTokens": sum(int(item.get("reasoning_tokens", 0) or 0) for item in stats),
                         "imageTokens": sum(int(item.get("image_tokens", 0) or 0) for item in stats),
                         "payloadFallbacks": sum(int(item.get("payload_fallback_count", 0) or 0) for item in stats),
+                        "geometrySeed": ocr.GEOMETRY_SEED,
                         "ocrSeed": ocr.OCR_SEED,
-                        "thinkingBudget": ocr.THINKING_BUDGET_OCR,
-                        "maxCompletionTokens": ocr.MAX_COMPLETION_TOKENS_OCR,
+                        "thinkingBudgetGeometry": ocr.THINKING_BUDGET_GEOMETRY,
+                        "thinkingBudgetOcr": ocr.THINKING_BUDGET_OCR,
+                        "maxCompletionTokensGeometry": ocr.MAX_COMPLETION_TOKENS_GEOMETRY,
+                        "maxCompletionTokensOcr": ocr.MAX_COMPLETION_TOKENS_OCR,
                         "deterministicMarkdown": True,
                         "singleMarkdownOutput": True,
                         "ocrPromptInUserMessage": True,
+                        "diagnosticMode": bool(ocr.OCR_DIAGNOSTIC_MODE),
+                        "includeGeometryAnnex": bool(ocr.INCLUDE_GEOMETRY_ANNEX),
+                        "includeOcrAnnex": bool(ocr.INCLUDE_OCR_ANNEX),
                         "pipelineVersion": ocr.PIPELINE_VERSION,
-                        "models": {"ocr": ocr.MODEL_OCR},
+                        "models": {"geometry": ocr.MODEL_GEOMETRY, "ocr": ocr.MODEL_OCR},
                     },
                 }
                 try:
@@ -549,8 +657,23 @@ def main() -> None:
         elif local_input:
             output_md = (os.getenv("OUTPUT_MD_PATH") or "").strip() or None
             result = run_for_pdf(local_input, api_key, output_md_path=output_md)
+            diagnostics_path: Optional[str] = None
+            if ocr.OCR_DIAGNOSTIC_MODE:
+                diagnostics_path = (
+                    os.getenv("OUTPUT_DIAGNOSTICS_PATH") or ""
+                ).strip() or str(Path(local_input).with_suffix(".ocr-diagnostics.json"))
+                progress_path = Path(ocr.get_progress_path(local_input))
+                if not progress_path.exists():
+                    raise RuntimeError(
+                        "Diagnostic demandé mais checkpoint local introuvable après extraction."
+                    )
+                target = Path(diagnostics_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(progress_path, target)
             ocr.clear_progress(local_input)
             print(result["path"])
+            if diagnostics_path:
+                print(f"OCR_DIAGNOSTICS_PATH={diagnostics_path}")
         else:
             raise RuntimeError("Ni GCS_INPUT_URI ni INPUT_PDF_PATH définis.")
 
