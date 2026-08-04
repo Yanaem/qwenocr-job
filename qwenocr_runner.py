@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v9.0.0, OCR Qwen en une passe.
+qwenocr_runner.py — runner Cloud Run/local v10.0.0, deux passes Qwen.
 
-Par page : une image maîtresse → cinq vues déterministes → une génération Qwen
-avec thinking → OCR canonique → Markdown déterministe par Python → annexes OCR
-brute et thinking dans le même fichier. Python ne corrige aucune donnée documentaire.
+Par page : cinq vues → passe 1 OCR brut avec thinking → passe 2 Markdown
+textuelle avec thinking → assemblage d'un fichier Markdown. Le thinking de la
+première passe n'est jamais transmis à la seconde. Python ne corrige aucune donnée.
 """
 
 from __future__ import annotations
@@ -58,15 +58,18 @@ except Exception:
 
 def _validate_ocr_contract() -> None:
     required_attributes = [
-        "API_URL", "MODEL", "MODEL_OCR", "PIPELINE_VERSION",
-        "CANONICAL_OCR_ONLY", "DETERMINISTIC_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
-        "ONE_PASS_THINKING_OCR", "OCR_PROMPT_IN_USER_MESSAGE", "OCR_PROMPT",
-        "NOMINAL_GENERATIONS_PER_PAGE", "SEMANTIC_RETRIES",
-        "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT", "PUBLISH_DEGRADED_MARKDOWN",
-        "OCR_DIAGNOSTIC_MODE", "INCLUDE_OCR_ANNEX", "INCLUDE_THINKING_ANNEX",
-        "CAPTURE_REASONING_CONTENT", "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES",
-        "STREAMING_OCR", "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_OCR",
-        "MAX_COMPLETION_TOKENS_OCR", "OCR_SEED", "RENDER_DPI", "DETAIL_DPI",
+        "API_URL", "MODEL", "MODEL_OCR", "MODEL_MARKDOWN", "PIPELINE_VERSION",
+        "RAW_OCR_FIRST_PASS", "MARKDOWN_SECOND_PASS", "TWO_PASS_RAW_OCR_MARKDOWN",
+        "CANONICAL_OCR_ONLY", "MODEL_GENERATED_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
+        "OCR_PROMPT_IN_USER_MESSAGE", "MARKDOWN_PROMPT_IN_USER_MESSAGE",
+        "RAW_OCR_PROMPT", "MARKDOWN_PROMPT", "NOMINAL_GENERATIONS_PER_PAGE",
+        "SEMANTIC_RETRIES", "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT",
+        "PUBLISH_DEGRADED_MARKDOWN", "OCR_DIAGNOSTIC_MODE", "INCLUDE_OCR_ANNEX",
+        "INCLUDE_THINKING_ANNEX", "CAPTURE_REASONING_CONTENT", "ENABLE_EXPLICIT_CACHE",
+        "QWEN_HIGH_RES_IMAGES", "STREAMING_OCR", "STREAMING_MARKDOWN",
+        "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_OCR", "THINKING_BUDGET_MARKDOWN",
+        "MAX_COMPLETION_TOKENS_OCR", "MAX_COMPLETION_TOKENS_MARKDOWN",
+        "OCR_SEED", "MARKDOWN_SEED", "RENDER_DPI", "DETAIL_DPI",
         "DETAIL_UPPER_END", "DETAIL_MIDDLE_START", "DETAIL_MIDDLE_END",
         "DETAIL_LOWER_START", "RIGHT_VIEW_START", "EXPECTED_VIEW_COUNT",
         "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS", "MAX_REQUEST_BODY_MB",
@@ -82,25 +85,25 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v9.0.0 une passe. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v10.0.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
-    if ocr.ONE_PASS_THINKING_OCR is not True:
-        raise RuntimeError("Contrat invalide : une passe OCR avec thinking est obligatoire.")
+    if not (ocr.RAW_OCR_FIRST_PASS and ocr.MARKDOWN_SECOND_PASS and ocr.TWO_PASS_RAW_OCR_MARKDOWN):
+        raise RuntimeError("Contrat invalide : OCR brut puis Markdown sont obligatoires.")
     if ocr.CANONICAL_OCR_ONLY is not True:
-        raise RuntimeError("Contrat invalide : Qwen doit produire uniquement la source canonique.")
-    if ocr.DETERMINISTIC_MARKDOWN is not True:
-        raise RuntimeError("Contrat invalide : le Markdown doit être rendu par Python.")
+        raise RuntimeError("Contrat invalide : la passe 1 doit produire uniquement l'OCR brut canonique.")
+    if ocr.MODEL_GENERATED_MARKDOWN is not True:
+        raise RuntimeError("Contrat invalide : la passe 2 Qwen doit construire le Markdown.")
     if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
         raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
-    if ocr.OCR_PROMPT_IN_USER_MESSAGE is not True:
-        raise RuntimeError("Contrat invalide : le prompt OCR doit être dans le message utilisateur.")
-    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 1 or int(ocr.SEMANTIC_RETRIES) != 0:
-        raise RuntimeError("Contrat invalide : un appel nominal et aucune relance sémantique.")
+    if not (ocr.OCR_PROMPT_IN_USER_MESSAGE and ocr.MARKDOWN_PROMPT_IN_USER_MESSAGE):
+        raise RuntimeError("Contrat invalide : les deux prompts doivent être dans les messages utilisateur.")
+    if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 2 or int(ocr.SEMANTIC_RETRIES) != 0:
+        raise RuntimeError("Contrat invalide : deux appels nominaux et aucune relance sémantique.")
     if int(ocr.EXPECTED_VIEW_COUNT) != 5:
-        raise RuntimeError("Contrat invalide : cinq vues déterministes sont obligatoires.")
-    if ocr.STREAMING_OCR is not True or ocr.STREAM_INCLUDE_USAGE is not True:
-        raise RuntimeError("Contrat invalide : le flux SSE avec usage final est obligatoire.")
+        raise RuntimeError("Contrat invalide : cinq vues déterministes pour la passe OCR.")
+    if not (ocr.STREAMING_OCR and ocr.STREAMING_MARKDOWN and ocr.STREAM_INCLUDE_USAGE):
+        raise RuntimeError("Contrat invalide : SSE avec usage final sur les deux passes.")
 
 def _loaded_ocr_path() -> str:
     return str(Path(getattr(ocr, "__file__", "chemin inconnu")).resolve())
@@ -288,11 +291,11 @@ def derive_diagnostics_gcs_uri(gcs_input: str) -> str:
 
 
 def _checkpoint_record(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Construit le record de reprise de l'unique appel et du rendu final."""
+    """Record de reprise des deux passes et du Markdown final."""
     record: Dict[str, Any] = {
         "status": "done",
         "page_num": int(result["page_num"]),
-        "normalized_canonical": str(result.get("normalized_canonical", result["canonical"])),
+        "normalized_canonical": str(result.get("raw_ocr", result.get("canonical", ""))),
         "markdown": str(result["markdown"]),
         "quality": dict(result["quality"]),
         "stats": dict(result["stats"]),
@@ -300,28 +303,33 @@ def _checkpoint_record(result: Dict[str, Any]) -> Dict[str, Any]:
     }
     if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_OCR_ANNEX):
         record["raw_response"] = str(result.get("raw_response", ""))
+        record["raw_ocr"] = str(result.get("raw_ocr", ""))
     if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_THINKING_ANNEX):
         record["ocr_reasoning"] = str(result.get("ocr_reasoning", ""))
+        record["markdown_reasoning"] = str(result.get("markdown_reasoning", ""))
     if bool(ocr.OCR_DIAGNOSTIC_MODE):
-        record["sanitized_canonical"] = str(
-            result.get("sanitized_canonical", result.get("canonical", ""))
-        )
+        record["markdown_raw_response"] = str(result.get("markdown_raw_response", ""))
+        record["sanitized_canonical"] = str(result.get("sanitized_canonical", result.get("raw_ocr", "")))
     return record
 
 
 def _record_to_result(record: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = str(record.get("normalized_canonical", record.get("canonical", "")))
+    raw_ocr = str(record.get("raw_ocr", record.get("normalized_canonical", record.get("canonical", ""))))
     return {
         "page_num": int(record["page_num"]),
-        "raw_response": str(record.get("raw_response", "")),
+        "raw_response": str(record.get("raw_response", raw_ocr)),
+        "raw_ocr": raw_ocr,
         "ocr_reasoning": str(record.get("ocr_reasoning", "")),
-        "sanitized_canonical": str(record.get("sanitized_canonical", normalized)),
-        "normalized_canonical": normalized,
-        "canonical": normalized,
+        "markdown_raw_response": str(record.get("markdown_raw_response", "")),
+        "markdown_reasoning": str(record.get("markdown_reasoning", "")),
+        "sanitized_canonical": str(record.get("sanitized_canonical", raw_ocr)),
+        "normalized_canonical": raw_ocr,
+        "canonical": raw_ocr,
         "markdown": str(record["markdown"]),
         "quality": dict(record["quality"]),
         "stats": dict(record["stats"]),
     }
+
 
 def _quality_status(page_qualities: Iterable[Dict[str, Any]]) -> str:
     statuses = [str(item.get("status", "unknown")) for item in page_qualities]
@@ -349,18 +357,22 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 OCR QWEN UNE PASSE + THINKING → MARKDOWN DÉTERMINISTE")
+    print("🔬 QWEN DEUX PASSES : OCR BRUT + THINKING → MARKDOWN + THINKING")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
     print(f"🧩 Module              : {_loaded_ocr_path()}")
-    print(f"🤖 Modèle OCR          : {ocr.MODEL_OCR}")
+    print(f"🤖 Modèle OCR brut     : {ocr.MODEL_OCR}")
+    print(f"🤖 Modèle Markdown     : {ocr.MODEL_MARKDOWN}")
     print(f"📞 Appels/page         : {ocr.NOMINAL_GENERATIONS_PER_PAGE}")
     print("🌊 Streaming           : SSE activé")
-    print(f"🧠 Thinking OCR        : {ocr.THINKING_BUDGET_OCR} tokens")
-    print(f"🧾 Sortie OCR          : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
-    print(f"🎯 Graine              : {ocr.OCR_SEED}")
-    print("🧭 Prompt              : OCR canonique dans le message utilisateur")
+    print(f"🧠 Thinking OCR brut   : {ocr.THINKING_BUDGET_OCR} tokens")
+    print(f"🧾 Sortie OCR brut     : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
+    print(f"🧠 Thinking Markdown   : {ocr.THINKING_BUDGET_MARKDOWN} tokens")
+    print(f"🧾 Sortie Markdown     : {ocr.MAX_COMPLETION_TOKENS_MARKDOWN} tokens")
+    print(f"🎯 Graines             : OCR={ocr.OCR_SEED} / Markdown={ocr.MARKDOWN_SEED}")
+    print("🧭 Passe 1             : images → OCR brut canonique")
+    print("🧭 Passe 2             : OCR brut seul → Markdown")
     print(f"🧵 Workers             : {effective_workers}")
     print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
     print(
@@ -374,7 +386,7 @@ def run_for_pdf(
     print(f"🖼️ Nombre de vues      : {ocr.EXPECTED_VIEW_COUNT}")
     print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
     print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
-    print("🛟 Repli 413            : compression/résolution seulement, aucun second raisonnement")
+    print("🛟 Repli 413            : compression/résolution de la passe OCR seulement")
     print("📝 Sortie documentaire : un seul fichier Markdown")
     print(
         "📎 Annexe OCR brute   : "
@@ -385,7 +397,7 @@ def run_for_pdf(
         + ("incluse dans le Markdown" if ocr.INCLUDE_THINKING_ANNEX else "désactivée")
     )
     if ocr.OCR_DIAGNOSTIC_MODE:
-        print("🔬 Diagnostic interne  : activé — OCR brut, thinking et états normalisés conservés")
+        print("🔬 Diagnostic interne  : activé — deux réponses et deux thinkings conservés")
         print("🔐 Données sensibles   : le diagnostic doit rester en accès restreint")
     else:
         print("🔬 Diagnostic interne  : désactivé")
@@ -431,7 +443,7 @@ def run_for_pdf(
         if missing_pages:
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures: Dict[Future, int] = {
-                    executor.submit(ocr.process_page, pdf_path, page_num, api_key, image_dir): page_num
+                    executor.submit(ocr.process_page, pdf_path, page_num, api_key, image_dir, page_count): page_num
                     for page_num in missing_pages
                 }
                 for future in as_completed(futures):
@@ -618,16 +630,21 @@ def main() -> None:
                         "imageTokens": sum(int(item.get("image_tokens", 0) or 0) for item in stats),
                         "payloadFallbacks": sum(int(item.get("payload_fallback_count", 0) or 0) for item in stats),
                         "ocrSeed": ocr.OCR_SEED,
+                        "markdownSeed": ocr.MARKDOWN_SEED,
                         "thinkingBudgetOcr": ocr.THINKING_BUDGET_OCR,
+                        "thinkingBudgetMarkdown": ocr.THINKING_BUDGET_MARKDOWN,
                         "maxCompletionTokensOcr": ocr.MAX_COMPLETION_TOKENS_OCR,
-                        "deterministicMarkdown": True,
+                        "maxCompletionTokensMarkdown": ocr.MAX_COMPLETION_TOKENS_MARKDOWN,
+                        "modelGeneratedMarkdown": True,
                         "singleMarkdownOutput": True,
                         "ocrPromptInUserMessage": True,
+                        "markdownPromptInUserMessage": True,
                         "diagnosticMode": bool(ocr.OCR_DIAGNOSTIC_MODE),
                         "includeOcrAnnex": bool(ocr.INCLUDE_OCR_ANNEX),
                         "includeThinkingAnnex": bool(ocr.INCLUDE_THINKING_ANNEX),
                         "pipelineVersion": ocr.PIPELINE_VERSION,
-                        "model": ocr.MODEL_OCR,
+                        "modelOcr": ocr.MODEL_OCR,
+                        "modelMarkdown": ocr.MODEL_MARKDOWN,
                     },
                 }
                 try:
