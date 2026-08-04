@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner v11.0.0, deux lectures visuelles indépendantes.
+qwenocr_runner.py — runner v11.1.0, deux lectures visuelles indépendantes.
 
 Par page, Qwen reçoit deux jeux d'images séparés : un OCR d'audit rapide et un
 Markdown final approfondi. Les appels ne partagent ni sortie, ni carte, ni thinking.
@@ -87,7 +87,7 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v11.0.0. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v11.1.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if not (ocr.OCR_AUDIT_PASS and ocr.MARKDOWN_VISUAL_PASS and ocr.DUAL_INDEPENDENT_VISUAL_PASSES):
