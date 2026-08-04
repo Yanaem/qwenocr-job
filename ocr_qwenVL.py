@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-ocr_qwenVL.py — cartographie géométrique Qwen, OCR canonique guidé,
+ocr_qwenVL.py — carte de preuves visuelles Qwen, OCR canonique guidé,
 puis Markdown déterministe.
 
-Contrat v8.1.0 — exactement deux appels spécialisés par page :
-1. Qwen produit une carte topologique courte, sans transcrire les valeurs ;
+Contrat v8.2.0 — exactement deux appels spécialisés par page :
+1. Qwen produit une carte de preuves visuelles, sans transcrire les valeurs ;
 2. Python valide uniquement la syntaxe de la carte et crée des recadrages avec marges ;
-3. Qwen vérifie la carte contre les pixels et produit l’OCR canonique exhaustif ;
+3. Qwen reconstruit lui-même la grille depuis les pixels et les preuves, puis produit l’OCR canonique exhaustif ;
 4. Python ne juge, ne corrige et ne déduit aucune donnée documentaire ;
 5. Python transforme mécaniquement le canonique en Markdown ;
 6. le fichier final contient le Markdown, la carte brute et l’OCR brut.
 
-Les coordonnées normalisées sont des aides souples. La topologie est prioritaire
-et les pixels des images restent l’autorité finale.
+Les coordonnées normalisées sont des aides souples. La carte de preuves ne fixe jamais
+le nombre final de colonnes ; les pixels des images restent l’autorité finale.
 """
 
 from __future__ import annotations
@@ -96,9 +96,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =============================================================================
 
-PIPELINE_VERSION = "qwen-two-pass-topology-auditable-v8.1.0-20260804"
-CHECKPOINT_VERSION = 27
-CHECKPOINT_SCHEMA = "two-pass-topology-auditable-thinking-v22"
+PIPELINE_VERSION = "qwen-two-pass-evidence-grid-v8.2.0-20260804"
+CHECKPOINT_VERSION = 28
+CHECKPOINT_SCHEMA = "two-pass-evidence-grid-thinking-v23"
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
@@ -157,16 +157,18 @@ THINKING_ANNEX_START = '<!-- THINKING_ANNEX_START source="qwen_reasoning_content
 THINKING_ANNEX_END = "<!-- THINKING_ANNEX_END -->"
 
 # Le premier appel reçoit trois vues génériques. Le second reçoit la page complète
-# et jusqu’à quatre recadrages déterministes issus de la carte géométrique.
+# et jusqu’à six recadrages déterministes issus de la carte de preuves.
 RENDER_DPI = _env_int("RENDER_DPI", 300)
 DETAIL_DPI = _env_int("DETAIL_DPI", 500)
 ENABLE_DETAIL_VIEWS = _env_bool("ENABLE_DETAIL_VIEWS", True)
 DETAIL_UPPER_END = _env_float("DETAIL_UPPER_END", 0.60)
 DETAIL_LOWER_START = _env_float("DETAIL_LOWER_START", 0.40)
-MAX_GUIDED_CROPS = max(1, min(7, _env_int("MAX_GUIDED_CROPS", 5)))
+MAX_GUIDED_CROPS = max(1, min(8, _env_int("MAX_GUIDED_CROPS", 6)))
 GUIDED_CROP_MARGIN_X = max(0.005, min(0.08, _env_float("GUIDED_CROP_MARGIN_X", 0.02)))
 GUIDED_CROP_MARGIN_Y = max(0.005, min(0.08, _env_float("GUIDED_CROP_MARGIN_Y", 0.02)))
 GUIDED_RIGHT_EDGE_WIDTH = max(0.12, min(0.50, _env_float("GUIDED_RIGHT_EDGE_WIDTH", 0.28)))
+GUIDED_NUMERIC_CORE_START = max(0.25, min(0.70, _env_float("GUIDED_NUMERIC_CORE_START", 0.40)))
+GUIDED_NUMERIC_CORE_MARGIN = max(0.02, min(0.15, _env_float("GUIDED_NUMERIC_CORE_MARGIN", 0.07)))
 # Alias techniques conservés pour les fonctions de compatibilité interne.
 TARGET_CROP_DPI = DETAIL_DPI
 TARGET_RIGHT_CROP_DPI = DETAIL_DPI
@@ -325,65 +327,80 @@ PAGE_MARKER_RE = re.compile(r"^\s*<!--\s*PAGE\s+(\d+)\s*-->\s*$", re.IGNORECASE)
 
 TOPOLOGY_COORD_MAX = 1000
 
-PAGE_MAP_START_RE = re.compile(r"^\s*\[\[(?:PAGE_TOPOLOGY|PAGE_MAP)(?:\s+(.+?))?\]\]\s*$", re.IGNORECASE)
+PAGE_MAP_START_RE = re.compile(r"^\s*\[\[(?:PAGE_EVIDENCE|PAGE_TOPOLOGY|PAGE_MAP)(?:\s+(.+?))?\]\]\s*$", re.IGNORECASE)
 TABLE_MAP_START_RE = re.compile(r"^\s*\[\[(?:TABLE_REGION|TABLE_MAP)\s+(.+?)\]\]\s*$", re.IGNORECASE)
 TABLE_MAP_END_RE = re.compile(r"^\s*\[\[/(?:TABLE_REGION|TABLE_MAP)\]\]\s*$", re.IGNORECASE)
+MAP_PRINTED_RULE_RE = re.compile(r"^\s*\[\[PRINTED_RULE\s+(.+?)\]\]\s*$", re.IGNORECASE)
+MAP_DATA_TRACK_RE = re.compile(r"^\s*\[\[DATA_TRACK\s+(.+?)\]\]\s*$", re.IGNORECASE)
+MAP_HEADER_SPAN_RE = re.compile(r"^\s*\[\[HEADER_SPAN\s+(.+?)\]\]\s*$", re.IGNORECASE)
+# Compatibilité avec les cartes antérieures. Ces éléments sont convertis en preuves,
+# jamais en grille finale.
 MAP_COLUMN_RE = re.compile(r"^\s*\[\[COLUMN\s+(.+?)\]\]\s*$", re.IGNORECASE)
 MAP_SEPARATOR_RE = re.compile(r"^\s*\[\[SEPARATOR\s+(.+?)\]\]\s*$", re.IGNORECASE)
 MAP_REGION_RE = re.compile(r"^\s*\[\[REGION\s+(.+?)\]\]\s*$", re.IGNORECASE)
 MAP_AMBIGUITY_RE = re.compile(r"^\s*\[\[AMBIGUITY\s+(.+?)\]\]\s*$", re.IGNORECASE)
-END_MAP_RE = re.compile(r"^\s*\[\[(?:END_TOPOLOGY|END_MAP)(?:\s+(.+?))?\]\]\s*$", re.IGNORECASE)
+END_MAP_RE = re.compile(r"^\s*\[\[(?:END_EVIDENCE|END_TOPOLOGY|END_MAP)(?:\s+(.+?))?\]\]\s*$", re.IGNORECASE)
+GRID_DECISION_RE = re.compile(r"^\s*\[\[GRID_DECISION\s+(.+?)\]\]\s*$", re.IGNORECASE)
 
 
 def _build_geometry_prompt() -> str:
     upper = int(round(DETAIL_UPPER_END * 100))
     lower = int(round(DETAIL_LOWER_START * 100))
-    return f"""Tu es un moteur de topologie visuelle pour documents comptables et commerciaux.
+    return f"""Tu es un moteur de cartographie de preuves visuelles pour documents comptables et commerciaux.
 
 MISSION
-Produis uniquement une carte courte des régions et séparateurs imprimés. Ne transcris aucune valeur de cellule, référence, montant, adresse, manuscrit ou mention légale. N'utilise les en-têtes que pour localiser une région, jamais pour imposer son nombre de colonnes.
+Produis une carte courte des indices visuels utiles à la reconstruction des tableaux. Ne produis ni grille finale, ni nombre de colonnes, ni transcription des valeurs. Ne transcris aucune référence, montant, adresse, manuscrit ou mention légale.
 
 ENTRÉE
-Trois vues de la même page : page complète, partie supérieure 0–{upper} %, partie inférieure {lower}–100 %. La page complète fixe l'existence des zones, l'ordre global et les bords physiques. Les vues détaillées servent à préciser les séparateurs. Leurs bords sont artificiels.
+Trois vues de la même page : page complète, partie supérieure 0–{upper} %, partie inférieure {lower}–100 %. La page complète fixe les régions, l'ordre global et les bords physiques. Les vues détaillées servent à confirmer les règles imprimées et les alignements. Leurs bords sont artificiels.
 
 PAGE AUTONOME
-Cette page est ta seule source. Manuscrits et tampons sont des régions séparées et ne participent pas à la topologie imprimée.
+Cette page est ta seule source. Construis la carte sur la couche imprimée seule. Manuscrits, coches et tampons sont des REGION séparées et ne participent ni aux espaces, ni aux alignements, ni aux pistes imprimées.
 
-TOPOLOGIE
-1. Délimite chaque grille imprimée par une bbox sur la page complète.
-2. Dans chaque grille, cherche les séparateurs verticaux internes, pas les colonnes sémantiques.
-3. Un séparateur est confirmed s'il est soutenu par une bordure ou par un espace/alignment répété sur plusieurs lignes ordinaires.
-4. Un séparateur est candidate s'il est visuellement plausible mais insuffisamment certain, notamment entre un groupe court répété et un groupe numérique voisin.
-5. N'impose pas un nombre final de colonnes. Le second appel décidera quels séparateurs candidate conserver.
-6. Une colonne entièrement vide n'est jamais créée : seuls des séparateurs visibles ou récurrents sont cartographiés.
-7. Deux grilles contiguës restent deux régions si une séparation verticale ou des systèmes de lignes différents sont visibles.
-8. Signale toute hésitation structurelle par AMBIGUITY au lieu de choisir arbitrairement.
+PROCÉDURE OBLIGATOIRE
+1. Délimite chaque grille imprimée par TABLE_REGION.
+2. Dans chaque grille, sélectionne silencieusement les lignes ordinaires les plus complètes. Les lignes de frais, contribution, remise, sous-total ou note ne déterminent pas les pistes initiales.
+3. Cartographie séparément trois types de preuves :
+   - PRINTED_RULE : trait vertical réellement visible ;
+   - DATA_TRACK : bande où des groupes imprimés se répètent verticalement ;
+   - HEADER_SPAN : étendue horizontale d'un en-tête visible, sans supposer qu'il correspond à une seule piste.
+4. Pour chaque DATA_TRACK, indique support=N, nombre de lignes ordinaires concordantes. Un groupe court répété et un groupe numérique voisin sont deux DATA_TRACK distinctes, même sans bordure ni en-tête propre.
+5. Un en-tête large peut couvrir plusieurs DATA_TRACK. Le nombre d'en-têtes ne limite jamais le nombre de pistes.
+6. Ne produis jamais cols=N, boundaries ni rôle final de colonne. Le second appel reconstruira la grille.
+7. Signale par AMBIGUITY toute piste plausible mais difficile à séparer, notamment entre texte et nombres, entre deux groupes numériques, ou entre deux grilles contiguës.
+
+RÈGLES CRITIQUES
+- Une piste numérique courte répétée n'est jamais absorbée dans une zone de texte : elle devient DATA_TRACK.
+- PRINTED_RULE, DATA_TRACK et HEADER_SPAN sont des preuves différentes ; ne transforme pas automatiquement une règle imprimée en frontière finale.
+- Une occurrence isolée peut être candidate, mais ne devient confirmed que si une bordure ou une répétition la soutient.
+- Ne donne aucun nom de colonne et ne déduis aucune signification comptable.
 
 COORDONNÉES
-- Toutes les bbox et tous les x sont des entiers absolus de 0 à 1000 sur la page complète.
-- Un SEPARATOR x est une position approximative ; les pixels restent l'autorité finale.
-- Les bords gauche et droit d'une grille sont donnés uniquement par sa bbox ; SEPARATOR décrit seulement les frontières internes.
+Toutes les bbox, band et x sont des entiers absolus de 0 à 1000 sur la page complète. Les coordonnées sont approximatives ; les pixels restent l'autorité finale.
 
 VOCABULAIRE
-hint : metadata, items, summary, other. Ce hint sert seulement au choix des recadrages et ne fixe aucune section OCR.
+hint : metadata, items, summary, other. Ce hint sert uniquement au choix des recadrages.
 right_edge : complete, truncated, uncertain.
-status : confirmed, candidate.
-evidence : border, alignment, whitespace, header, mixed.
+status de PRINTED_RULE ou DATA_TRACK : confirmed, candidate.
+evidence de PRINTED_RULE : border, faint_border, mixed.
+shape de DATA_TRACK : short, numeric, alphanumeric, text, mixed.
+status de HEADER_SPAN : visible, uncertain.
 kind d'une REGION : handwritten, stamp, block.
-kind d'une AMBIGUITY : table_boundary, table_split, missing_separator, extra_separator, right_edge.
+kind d'une AMBIGUITY : table_boundary, table_split, missing_track, extra_track, track_overlap, right_edge.
 
 FORMAT STRICT
-[[PAGE_TOPOLOGY coordinate_system=page_0_1000]]
-[[TABLE_REGION id={{ID}} hint={{HINT}} bbox={{X0}},{{Y0}},{{X1}},{{Y1}} right_edge={{ETAT}}]]
-[[SEPARATOR index=1 x={{X}} status={{STATUS}} evidence={{EVIDENCE}}]]
-... zéro ou plusieurs SEPARATOR dans l'ordre gauche-droite ...
+[[PAGE_EVIDENCE coordinate_system=page_0_1000]]
+[[TABLE_REGION id={{ID}} hint={{HINT}} bbox={{X0}},{{Y0}},{{X1}},{{Y1}} right_edge={{ETAT}} ordinary_rows={{N}}]]
+[[PRINTED_RULE id={{ID}} x={{X}} status={{STATUS}} evidence={{EVIDENCE}}]]
+[[DATA_TRACK id={{ID}} band={{X0}},{{X1}} support={{N}} shape={{SHAPE}} status={{STATUS}}]]
+[[HEADER_SPAN id={{ID}} band={{X0}},{{X1}} status={{visible|uncertain}}]]
+... zéro ou plusieurs preuves dans l'ordre gauche-droite ...
 [[/TABLE_REGION]]
 [[REGION id={{ID}} kind={{KIND}} bbox={{X0}},{{Y0}},{{X1}},{{Y1}}]]
 [[AMBIGUITY id={{ID}} region={{TABLE_ID_OU_PAGE}} kind={{KIND}} bbox={{X0}},{{Y0}},{{X1}},{{Y1}} options={{DESCRIPTION_COURTE}}]]
-[[END_TOPOLOGY coverage={{complete|partial}}]]
+[[END_EVIDENCE coverage={{complete|partial}}]]
 
 Aucun Markdown, JSON, commentaire, bloc de code, valeur de cellule ou texte hors balise.""".strip()
-
 
 def _build_ocr_prompt() -> str:
     return r"""Tu es un moteur de transcription visuelle canonique pour documents comptables et commerciaux.
@@ -392,29 +409,48 @@ MISSION
 Produis l'OCR canonique complet de la page. Python ne relira pas l'image et ne corrigera aucune donnée. Chaque texte, chiffre et symbole lisible apparaît exactement une fois, sauf répétition réellement imprimée.
 
 ENTRÉE ET AUTORITÉ
-Tu reçois la page complète, des recadrages haute définition et une topologie issue d'un premier appel.
+Tu reçois la page complète, des recadrages haute définition et une carte de preuves issue d'un premier appel.
 - Les pixels sont l'autorité finale.
-- La topologie propose des régions et séparateurs confirmed/candidate ; vérifie-les avant toute transcription.
+- PRINTED_RULE, DATA_TRACK et HEADER_SPAN attirent ton attention ; ils ne fixent ni N, ni les frontières finales, ni la signification des colonnes.
 - La page complète fixe l'ordre global, les bords physiques et les troncatures.
-- Les recadrages servent à lire les caractères, les petits espaces et les frontières de cellules.
-- Tu peux ajouter, retirer ou déplacer un séparateur si les glyphes, bordures ou alignements répétés l'exigent.
+- Les recadrages servent à lire les caractères, les petits espaces et les pistes étroites.
 - Chaque page est autonome.
 
-DÉCISION TOPOLOGIQUE OBLIGATOIRE
-Pour chaque TABLE finale :
-1. Choisis les frontières verticales finales directement dans les images.
-2. Utilise les SEPARATOR confirmed comme hypothèses fortes et les candidate comme hypothèses à accepter ou rejeter.
-3. Écris dans l'ouverture de TABLE :
-   map_id={{ID_OU_NONE}}
-   map_status={{confirmed|revised|unmapped}}
-   map_reason={{as_proposed|added_separator|removed_separator|moved_separator|split_region|merged_regions|image_override|unmapped}}
-   map_ambiguities="{{A1,A2|none}}"
-   boundaries="{{X0}},{{X1}},...,{{XN}}"
-4. boundaries contient N+1 coordonnées absolues 0–1000 : bord gauche, séparateurs internes retenus, bord droit.
-5. cols=N doit être égal au nombre d'intervalles entre ces frontières.
-6. Affecte chaque valeur à l'intervalle qui contient son centre horizontal. Cette règle s'applique aussi aux lignes clairsemées.
-7. Une frontière candidate n'est jamais conservée seulement pour respecter la carte ; une frontière visible n'est jamais supprimée seulement pour respecter un en-tête.
-8. Chaque AMBIGUITY reçue doit être résolue dans les images. Son identifiant apparaît dans map_ambiguities d'au moins une TABLE concernée. Écris none uniquement lorsqu'aucune ambiguïté ne concerne la TABLE.
+PROTOCOLE DE GRILLE OBLIGATOIRE — À EXÉCUTER AVANT LA PREMIÈRE ROW
+A. OBSERVE : sélectionne au moins deux lignes ordinaires parmi les plus complètes. Ignore manuscrits, coches, tampons et lignes clairsemées pour construire la grille initiale.
+B. COMPTE : sur chaque ligne sélectionnée, compte tous les groupes imprimés distincts de gauche à droite. Un groupe numérique court répété reste un groupe autonome.
+C. REGROUPE : rapproche les centres horizontaux concordants en pistes répétées. Compare-les aux DATA_TRACK, PRINTED_RULE et HEADER_SPAN reçus.
+D. RÉSOUS : chaque piste répétée avec support>=2 doit soit devenir une colonne finale, soit être rejetée explicitement pour une raison visuelle. Elle ne peut jamais disparaître silencieusement.
+E. FIXE : définis seulement alors boundaries et cols=N.
+F. TRANSCRIS : place chaque valeur selon son centre horizontal dans les frontières finales.
+
+RÈGLES DE DÉCISION
+1. Si une ligne ordinaire contient plus de groupes distincts que la grille provisoire ne contient de colonnes, la grille provisoire est invalide : ajoute ou déplace une frontière.
+2. Un groupe numérique court répété au même emplacement ne peut jamais être incorporé à une DESIGNATION, même si sa fonction est inconnue. Il reçoit une colonne [SANS_ENTETE_n].
+3. Un DATA_TRACK support>=2 ne peut être rejeté à cause de l'en-tête, d'un calcul, d'un format habituel ou d'une signification supposée. Seule une raison visuelle est admise : mêmes glyphes, même cellule imprimée, piste hors région ou répétition non confirmée.
+4. Une table ne peut être decision=confirmed si unassigned_tracks n'est pas none.
+5. Un en-tête large peut couvrir plusieurs colonnes finales.
+6. Une ligne clairsemée utilise la grille déjà fixée ; ses valeurs sont placées par centre horizontal, jamais dans la première cellule libre.
+7. Deux grilles contiguës restent séparées si leurs régions, bordures ou systèmes de lignes diffèrent.
+8. Relis la dernière colonne ligne par ligne dans le recadrage le plus net.
+
+AUDIT DE GRILLE OBLIGATOIRE
+Avant chaque TABLE, émets exactement un GRID_DECISION d'une seule ligne :
+[[GRID_DECISION table_id={ID} map_id={MAP_ID_OU_NONE} ordinary_rows={N} max_visible_groups={N} repeated_tracks="{D1,D2|none}" accepted_tracks="{D1,D2|none}" rejected_tracks="{D3|none}" rejection_reason={none|same_visual_cell|single_occurrence|outside_region|not_repeated|other_visual} unassigned_tracks="{none|D4,D5}" final_cols={N} decision={confirmed|revised|unmapped} reason={as_observed|added_track|removed_track|moved_track|split_region|merged_regions|image_override|unmapped}]]
+- repeated_tracks contient les DATA_TRACK support>=2 reçues et toute piste répétée supplémentaire découverte dans les images.
+- accepted_tracks contient celles matérialisées par une colonne finale.
+- rejected_tracks contient seulement celles rejetées pour la raison visuelle indiquée.
+- unassigned_tracks doit être none avant decision=confirmed.
+- final_cols doit être identique à cols=N de la TABLE suivante.
+
+DÉCISION TOPOLOGIQUE FINALE
+Dans l'ouverture de chaque TABLE, écris :
+map_id={ID_OU_NONE}
+map_status={confirmed|revised|unmapped}
+map_reason={as_observed|added_track|removed_track|moved_track|split_region|merged_regions|image_override|unmapped}
+map_ambiguities="{A1,A2|none}"
+boundaries="{X0},{X1},...,{XN}"
+boundaries contient N+1 coordonnées absolues 0–1000, strictement croissantes.
 
 FIDÉLITÉ
 Conserve casse, accents, ponctuation, signes, espaces significatifs, séparateurs, décimales, unités, taux et devises.
@@ -425,17 +461,13 @@ Références, numéros, identifiants fiscaux, IBAN, BIC, codes produits et fisca
 Imprimé, manuscrit et tampon restent dans des éléments séparés. Une REGION handwritten limite uniquement le manuscrit ; les textes imprimés voisins restent printed.
 
 TABLEAUX
-1. Une bande courte répétée et une bande numérique voisine distincte deviennent deux colonnes, même sans en-tête.
-2. Un espace peut être un séparateur de milliers seulement si aucune frontière récurrente ne passe à cet endroit.
-3. Une colonne réelle sans libellé reçoit [SANS_ENTETE_n], n étant son numéro physique.
-4. Chaque ROW contient exactement les indices 1..N. Une position vide vaut <EMPTY> ; aucune valeur n'est tassée.
-5. Pour une ligne clairsemée, place chaque valeur selon son centre horizontal dans boundaries, jamais dans la première cellule libre.
-6. Une continuation certaine dans une cellule utilise <BR>. N'utilise pas kind=continuation.
-7. Deux grilles contiguës restent séparées si leurs régions, bordures ou systèmes de lignes diffèrent.
-8. Relis la dernière colonne ligne par ligne dans le recadrage le plus net.
+- Une colonne réelle sans libellé reçoit [SANS_ENTETE_n], n étant son numéro physique.
+- Chaque ROW contient exactement les indices 1..N. Une position vide vaut <EMPTY> ; aucune valeur n'est tassée.
+- Une continuation certaine dans une cellule utilise <BR>. N'utilise pas kind=continuation.
+- Un espace peut être un séparateur de milliers uniquement si aucune piste répétée indépendante ne le traverse.
 
 CONTRÔLE ARITHMÉTIQUE LIMITÉ
-Lorsque deux segmentations sont toutes deux visibles et plausibles, compare les relations compatibles avec les en-têtes sur plusieurs lignes. Une segmentation créant des écarts massifs répétés alors qu'une autre respecte les alignements visibles doit être réexaminée. Le calcul ne permet jamais de créer, modifier, compléter ou déduire une valeur.
+Le calcul peut uniquement rejeter une segmentation manifestement incohérente entre plusieurs lectures visibles. Il ne peut jamais déplacer un groupe dans une désignation, supprimer une piste répétée, créer une valeur, modifier un chiffre, compléter une donnée ou déduire une signification comptable.
 
 ÉLÉMENTS
 BLOCK : texte libre. TABLE : grille répétée. KV : paires libellé/valeur empilées.
@@ -448,6 +480,7 @@ FORMAT STRICT
 {TEXTE}
 [[/BLOCK]]
 
+[[GRID_DECISION table_id={ID} map_id={MAP_ID_OU_NONE} ordinary_rows={N} max_visible_groups={N} repeated_tracks="{LISTE_OU_NONE}" accepted_tracks="{LISTE_OU_NONE}" rejected_tracks="{LISTE_OU_NONE}" rejection_reason={RAISON_VISUELLE} unassigned_tracks="{LISTE_OU_NONE}" final_cols={N} decision={confirmed|revised|unmapped} reason={RAISON}]]
 [[TABLE id={ID} section={SECTION} source={SOURCE} cols={N} map_id={MAP_ID_OU_NONE} map_status={confirmed|revised|unmapped} map_reason={RAISON} map_ambiguities="{A1,A2|none}" boundaries="{X0,...,XN}"]]
 [[ROW kind=header]]
 1={CELLULE_1}
@@ -470,7 +503,6 @@ value={VALEUR_OU_EMPTY}
 
 Aucun texte hors balise, aucun Markdown, JSON, préambule, commentaire ni bloc de code. Chaque élément est fermé. Les ids sont uniques. Les seuls tokens techniques sont <EMPTY>, <BR>, [ILLISIBLE], [TRONQUE].
 Termine par [[END_PAGE coverage=complete]] si toute la page a été examinée, sinon coverage=partial. Page réellement vide : [PAGE VIDE] puis END_PAGE.""".strip()
-
 
 GEOMETRY_PROMPT = _build_geometry_prompt()
 OCR_PROMPT = _build_ocr_prompt()
@@ -880,11 +912,11 @@ def _union_page_bboxes(bboxes: Sequence[Sequence[int]]) -> Optional[List[int]]:
 
 
 def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Sélectionne au plus quatre recadrages à partir des régions, sans interprétation.
+    """Sélectionne des recadrages de lecture sans transformer les preuves en grille.
 
-    La page complète est toujours envoyée séparément. La topologie sert seulement
-    à choisir des zones de lecture plus nettes. Les séparateurs restent des
-    hypothèses et ne sont jamais dessinés sur l'image.
+    La page complète est toujours envoyée séparément. Le cœur numérique est
+    systématique pour le tableau principal, même si l'appel 1 manque précisément
+    une piste étroite.
     """
     tables = [
         table for table in (geometry.get("tables", []) or [])
@@ -904,6 +936,8 @@ def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
     def add(label: str, bbox: Sequence[int], description: str, priority: int) -> None:
         key = tuple(int(value) for value in bbox)
         if len(key) != 4 or key in used:
+            return
+        if not _valid_bbox(tuple(key)):
             return
         used.add(key)
         specs.append({
@@ -932,14 +966,43 @@ def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
             primary["bbox"],
             (
                 f"tableau principal {primary.get('id')} — "
-                f"{int(primary.get('separator_count', 0) or 0)} séparateur(s) proposé(s), à vérifier"
+                f"{int(primary.get('data_track_count', 0) or 0)} piste(s) de données observée(s), à reconstruire"
             ),
             1,
         )
 
+        bbox = [int(v) for v in primary["bbox"]]
+        x0, y0, x1, y1 = bbox
+        width = max(1, x1 - x0)
+        threshold = x0 + int(round(width * 0.30))
+        candidate_starts = []
+        for track in primary.get("data_tracks", []) or []:
+            band = track.get("band") or []
+            if len(band) != 2:
+                continue
+            midpoint = (int(band[0]) + int(band[1])) / 2.0
+            if midpoint < threshold:
+                continue
+            if str(track.get("shape", "mixed")) not in {"short", "numeric", "mixed"}:
+                continue
+            candidate_starts.append(int(band[0]))
+        if candidate_starts:
+            core_start = min(candidate_starts) - int(round(width * GUIDED_NUMERIC_CORE_MARGIN))
+        else:
+            core_start = x0 + int(round(width * GUIDED_NUMERIC_CORE_START))
+        core_start = max(x0, min(x1 - 1, core_start))
+        add(
+            f"numeric_core_{primary.get('id')}",
+            [core_start, y0, x1, y1],
+            (
+                f"cœur numérique du tableau {primary.get('id')} — fin de désignation, "
+                "groupes courts, quantités, prix, montants et codes ; rechercher toutes les pistes répétées"
+            ),
+            2,
+        )
+
     summary_tables = [
-        table for table in tables
-        if table.get("hint", table.get("role")) == "summary"
+        table for table in tables if table.get("hint", table.get("role")) == "summary"
     ]
     summary_bbox = _union_page_bboxes([table["bbox"] for table in summary_tables])
     if summary_bbox:
@@ -947,23 +1010,18 @@ def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
             "accounting_summary",
             summary_bbox,
             "zone financière détaillée — taxes, contributions, totaux et paiement",
-            2,
+            3,
         )
     else:
         add(
             "lower_context",
-            [
-                0,
-                min(650, int(round(DETAIL_LOWER_START * TOPOLOGY_COORD_MAX))),
-                TOPOLOGY_COORD_MAX,
-                TOPOLOGY_COORD_MAX,
-            ],
+            [0, min(650, int(round(DETAIL_LOWER_START * TOPOLOGY_COORD_MAX))),
+             TOPOLOGY_COORD_MAX, TOPOLOGY_COORD_MAX],
             "contexte inférieur détaillé — taxes, totaux, paiement et mentions",
-            2,
+            3,
         )
 
-    # Une zone explicitement ambiguë est plus utile qu'un recadrage générique.
-    primary_ambiguities = []
+    primary_ambiguities: List[Dict[str, Any]] = []
     if primary is not None:
         primary_id = str(primary.get("id"))
         primary_ambiguities = [item for item in ambiguities if str(item.get("region")) == primary_id]
@@ -973,8 +1031,9 @@ def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
             f"ambiguity_{chosen_ambiguity.get('id')}",
             chosen_ambiguity["bbox"],
             f"zone ambiguë {chosen_ambiguity.get('id')} — {chosen_ambiguity.get('kind','structure')}",
-            3,
+            4,
         )
+
     if primary is not None:
         bbox = [int(v) for v in primary["bbox"]]
         width = max(1, bbox[2] - bbox[0])
@@ -983,12 +1042,11 @@ def _guided_crop_specs(geometry: Dict[str, Any]) -> List[Dict[str, Any]]:
             f"right_{primary.get('id')}",
             [right_start, bbox[1], bbox[2], bbox[3]],
             f"bord droit agrandi du tableau {primary.get('id')} — dernières colonnes et codes courts",
-            4 if chosen_ambiguity is not None else 3,
+            5,
         )
 
     specs.sort(key=lambda item: (item["priority"], item["bbox"][1], item["bbox"][0]))
     return specs[:MAX_GUIDED_CROPS]
-
 
 def prepare_guided_views(
     source_path: str,
@@ -1615,27 +1673,27 @@ def _build_geometry_messages(
                 f"Page physique {page_num}. Les trois images suivantes représentent cette même page. "
                 f"La première est complète ; la deuxième couvre 0–{int(round(DETAIL_UPPER_END * 100))} % ; "
                 f"la troisième couvre {int(round(DETAIL_LOWER_START * 100))}–100 %. "
-                "Produis uniquement la topologie courte des régions et séparateurs. Ne transcris aucune valeur de cellule."
+                "Produis uniquement une carte de preuves visuelles. Ne transcris aucune valeur de cellule."
             ),
         },
     ]
     for index, view in enumerate(views, start=1):
         user_content.append({
             "type": "text",
-            "text": f"Vue géométrique {index}/{len(views)} — {view['description']}.",
+            "text": f"Vue de preuves {index}/{len(views)} — {view['description']}.",
         })
         user_content.append({"type": "image_url", "image_url": {"url": view["data_url"]}})
     user_content.append({
         "type": "text",
         "text": (
-            "Fixe d'abord les périmètres, puis les séparateurs confirmed/candidate. "
-            "Les coordonnées sont approximatives ; la topologie est prioritaire. "
-            "Signale toute ambiguïté sur le nombre ou les frontières des colonnes au lieu d'inventer une certitude. "
-            "Retourne seulement PAGE_TOPOLOGY/TABLE_REGION/SEPARATOR/REGION/AMBIGUITY/END_TOPOLOGY."
+            "Procède dans cet ordre : régions, lignes ordinaires, règles imprimées, pistes de données, "
+            "étendues d'en-tête, ambiguïtés. Ne fixe ni cols=N ni frontières finales. "
+            "Un groupe numérique court répété doit devenir DATA_TRACK, jamais être absorbé dans du texte. "
+            "Retourne seulement PAGE_EVIDENCE/TABLE_REGION/PRINTED_RULE/DATA_TRACK/HEADER_SPAN/"
+            "REGION/AMBIGUITY/END_EVIDENCE."
         ),
     })
     return [{"role": "user", "content": user_content}]
-
 
 def _build_ocr_messages(
     page_num: int,
@@ -1648,16 +1706,16 @@ def _build_ocr_messages(
             "type": "text",
             "text": (
                 f"Page physique {page_num}. La première image est la page complète ; les suivantes sont "
-                "des recadrages issus de la carte. Les bords des recadrages sont artificiels. "
-                "Vérifie la carte contre les pixels avant toute transcription."
+                "des recadrages de lecture. Les bords des recadrages sont artificiels. "
+                "Reconstruis la grille depuis les pixels ; la carte suivante sert uniquement de preuve et d'aide à l'attention."
             ),
         },
         {
             "type": "text",
             "text": (
-                "<PAGE_TOPOLOGY>\n" + geometry_map + "\n</PAGE_TOPOLOGY>\n"
-                "Cette carte n'est pas une vérité absolue. Conserve-la si les images la confirment ; "
-                "révise-la si les bordures, glyphes ou alignements répétés montrent clairement une autre topologie."
+                "<PAGE_EVIDENCE>\n" + geometry_map + "\n</PAGE_EVIDENCE>\n"
+                "Ne traite aucune preuve comme une colonne imposée. Toute piste répétée doit être acceptée, "
+                "rejetée visuellement ou déclarée non affectée dans GRID_DECISION."
             ),
         },
     ]
@@ -1675,15 +1733,13 @@ def _build_ocr_messages(
     user_content.append({
         "type": "text",
         "text": (
-            "Commence par vérifier la topologie proposée, puis transcris toute la page. "
-            "Relis spécialement les colonnes courtes sans en-tête, les lignes clairsemées, "
-            "les contributions, les taxes, les totaux et la dernière colonne. "
-            "Retourne uniquement la source canonique BLOCK/TABLE à cellules indexées/KV, "
-            "suivie de l'unique END_PAGE final."
+            "Exécute OBSERVE → COMPTE → REGROUPE → RÉSOUS → FIXE → TRANSCRIS. "
+            "Émets GRID_DECISION avant chaque TABLE. Une piste numérique répétée ne peut jamais entrer dans DESIGNATION. "
+            "Relis spécialement le cœur numérique, les colonnes sans en-tête, les lignes clairsemées, les taxes, "
+            "les totaux et le bord droit. Retourne uniquement la source canonique puis l'unique END_PAGE final."
         ),
     })
     return [{"role": "user", "content": user_content}]
-
 
 # =============================================================================
 # Parsing canonique et qualité
@@ -1799,7 +1855,7 @@ def sanitize_geometry_response(raw_text: str) -> Tuple[str, Dict[str, int]]:
 
 
 def parse_geometry_map(raw_text: str, page_num: int) -> Dict[str, Any]:
-    """Parse une topologie courte sans transformer les séparateurs en vérité métier."""
+    """Parse une carte de preuves sans en déduire une grille finale."""
     sanitized, sanitizations = sanitize_geometry_response(raw_text)
     warnings: List[str] = []
     tables: List[Dict[str, Any]] = []
@@ -1832,67 +1888,124 @@ def parse_geometry_map(raw_text: str, page_num: int) -> Dict[str, Any]:
             table_id = str(attrs.get("id", f"G{len(tables)+1:03d}"))
             bbox = _parse_int_bbox(attrs.get("bbox", ""))
             raw_hint = str(attrs.get("hint") or attrs.get("role") or "other").lower()
-            legacy_hint_aliases = {
-                "document_meta": "metadata",
-                "line_items": "items",
-                "taxes": "summary",
-                "totals": "summary",
-                "payment": "summary",
-            }
-            hint = legacy_hint_aliases.get(raw_hint, raw_hint)
+            hint = {
+                "document_meta": "metadata", "line_items": "items",
+                "taxes": "summary", "totals": "summary", "payment": "summary",
+            }.get(raw_hint, raw_hint)
             if hint not in {"metadata", "items", "summary", "other"}:
                 warnings.append(f"{table_id}: hint_invalide={raw_hint}")
                 hint = "other"
             right_edge = str(attrs.get("right_edge", "uncertain")).lower()
             if right_edge not in {"complete", "truncated", "uncertain"}:
                 right_edge = "uncertain"
+            try:
+                ordinary_rows = max(0, int(attrs.get("ordinary_rows", "0")))
+            except ValueError:
+                ordinary_rows = 0
+                warnings.append(f"{table_id}: ordinary_rows_invalide")
 
-            separators: List[Dict[str, Any]] = []
+            printed_rules: List[Dict[str, Any]] = []
+            data_tracks: List[Dict[str, Any]] = []
+            header_spans: List[Dict[str, Any]] = []
             legacy_columns: List[Dict[str, Any]] = []
             index += 1
             closed = False
             while index < len(lines):
-                if TABLE_MAP_END_RE.match(lines[index]):
+                current = lines[index]
+                if TABLE_MAP_END_RE.match(current):
                     closed = True
                     index += 1
                     break
-                separator_match = MAP_SEPARATOR_RE.match(lines[index])
-                if separator_match:
-                    sattrs = _parse_attributes(separator_match.group(1))
+
+                rule_match = MAP_PRINTED_RULE_RE.match(current)
+                if rule_match:
+                    rattrs = _parse_attributes(rule_match.group(1))
+                    rule_id = str(rattrs.get("id", f"PR{len(printed_rules)+1}"))
                     try:
-                        sindex = int(sattrs.get("index", "0"))
-                        xpos = int(sattrs.get("x", "-1"))
+                        xpos = int(rattrs.get("x", "-1"))
                     except ValueError:
-                        sindex, xpos = 0, -1
-                    status = str(sattrs.get("status", "candidate")).lower()
-                    evidence = str(sattrs.get("evidence", "mixed")).lower()
+                        xpos = -1
+                    status = str(rattrs.get("status", "candidate")).lower()
+                    evidence = str(rattrs.get("evidence", "mixed")).lower()
                     if status not in {"confirmed", "candidate"}:
                         status = "candidate"
-                    if evidence not in {"border", "alignment", "whitespace", "header", "mixed"}:
+                    if evidence not in {"border", "faint_border", "mixed"}:
                         evidence = "mixed"
-                    separators.append({
-                        "index": sindex,
-                        "x": xpos,
-                        "status": status,
-                        "evidence": evidence,
+                    printed_rules.append({
+                        "id": rule_id, "x": xpos, "status": status, "evidence": evidence,
                     })
                     index += 1
                     continue
-                # Compatibilité : ancienne carte COLUMN. Elle est seulement convertie
-                # en séparateurs candidate, sans transmettre les en-têtes au second appel.
-                column_match = MAP_COLUMN_RE.match(lines[index])
-                if column_match:
-                    cattrs = _parse_attributes(column_match.group(1))
+
+                track_match = MAP_DATA_TRACK_RE.match(current)
+                if track_match:
+                    tattrs = _parse_attributes(track_match.group(1))
+                    track_id = str(tattrs.get("id", f"D{len(data_tracks)+1}"))
+                    band = _parse_int_pair(tattrs.get("band", ""))
                     try:
-                        cindex = int(cattrs.get("index", "0"))
+                        support = int(tattrs.get("support", "0"))
                     except ValueError:
-                        cindex = 0
-                    band = _parse_int_pair(cattrs.get("band", ""))
-                    legacy_columns.append({"index": cindex, "band": list(band) if band else None})
+                        support = 0
+                    shape = str(tattrs.get("shape", "mixed")).lower()
+                    status = str(tattrs.get("status", "candidate")).lower()
+                    if shape not in {"short", "numeric", "alphanumeric", "text", "mixed"}:
+                        shape = "mixed"
+                    if status not in {"confirmed", "candidate"}:
+                        status = "candidate"
+                    data_tracks.append({
+                        "id": track_id,
+                        "band": list(band) if band else None,
+                        "support": support,
+                        "shape": shape,
+                        "status": status,
+                    })
                     index += 1
                     continue
-                if lines[index].strip():
-                    warnings.append(f"{table_id}: ligne_inattendue={lines[index][:120]}")
+
+                header_match = MAP_HEADER_SPAN_RE.match(current)
+                if header_match:
+                    hattrs = _parse_attributes(header_match.group(1))
+                    span_id = str(hattrs.get("id", f"H{len(header_spans)+1}"))
+                    band = _parse_int_pair(hattrs.get("band", ""))
+                    status = str(hattrs.get("status", "uncertain")).lower()
+                    if status not in {"visible", "uncertain"}:
+                        status = "uncertain"
+                    header_spans.append({
+                        "id": span_id, "band": list(band) if band else None, "status": status,
+                    })
+                    index += 1
+                    continue
+
+                # Compatibilité v8.1 : un SEPARATOR devient une règle imprimée/candidate,
+                # jamais une frontière finale.
+                separator_match = MAP_SEPARATOR_RE.match(current)
+                if separator_match:
+                    sattrs = _parse_attributes(separator_match.group(1))
+                    try:
+                        xpos = int(sattrs.get("x", "-1"))
+                    except ValueError:
+                        xpos = -1
+                    status = str(sattrs.get("status", "candidate")).lower()
+                    evidence = str(sattrs.get("evidence", "mixed")).lower()
+                    printed_rules.append({
+                        "id": f"LEGACY_PR{len(printed_rules)+1}",
+                        "x": xpos,
+                        "status": status if status in {"confirmed", "candidate"} else "candidate",
+                        "evidence": "border" if evidence == "border" else "mixed",
+                    })
+                    index += 1
+                    continue
+
+                column_match = MAP_COLUMN_RE.match(current)
+                if column_match:
+                    cattrs = _parse_attributes(column_match.group(1))
+                    band = _parse_int_pair(cattrs.get("band", ""))
+                    legacy_columns.append({"band": list(band) if band else None})
+                    index += 1
+                    continue
+
+                if current.strip():
+                    warnings.append(f"{table_id}: ligne_inattendue={current[:120]}")
                 index += 1
 
             if not closed:
@@ -1901,61 +2014,120 @@ def parse_geometry_map(raw_text: str, page_num: int) -> Dict[str, Any]:
             if not valid_bbox:
                 warnings.append(f"{table_id}: bbox_invalide")
 
-            if not separators and legacy_columns and valid_bbox:
-                ordered_legacy = sorted(
-                    [c for c in legacy_columns if c.get("band")],
-                    key=lambda item: int(item.get("index", 0) or 0),
-                )
-                # Les anciennes cartes pouvaient utiliser un repère relatif ou absolu.
-                # On ne prend que les fins de bandes strictement à l'intérieur de la bbox.
-                for legacy in ordered_legacy[:-1]:
-                    band = legacy.get("band") or []
-                    if len(band) != 2:
+            if legacy_columns and valid_bbox:
+                for idx, legacy in enumerate(legacy_columns, start=1):
+                    band = legacy.get("band")
+                    if not band or len(band) != 2:
                         continue
-                    xpos = int(band[1])
-                    if bbox and int(bbox[0]) < xpos < int(bbox[2]):
-                        separators.append({
-                            "index": len(separators) + 1,
-                            "x": xpos,
-                            "status": "candidate",
-                            "evidence": "mixed",
+                    header_spans.append({
+                        "id": f"LEGACY_H{idx}", "band": list(band), "status": "uncertain",
+                    })
+                    if idx < len(legacy_columns):
+                        xpos = int(band[1])
+                        printed_rules.append({
+                            "id": f"LEGACY_PR{len(printed_rules)+1}",
+                            "x": xpos, "status": "candidate", "evidence": "mixed",
                         })
-                if separators:
-                    warnings.append(f"{table_id}: anciennes_COLUMN_converties_en_SEPARATORS_candidate")
+                warnings.append(f"{table_id}: anciennes_COLUMN_converties_en_preuves")
 
-            separators.sort(key=lambda item: (int(item.get("x", -1)), int(item.get("index", 0))))
-            valid_separators = bool(valid_bbox)
-            if valid_separators:
-                seen_x: set[int] = set()
-                for expected, separator in enumerate(separators, start=1):
-                    xpos = int(separator.get("x", -1))
-                    if int(separator.get("index", 0)) != expected:
-                        valid_separators = False
-                    if not bbox or not (int(bbox[0]) < xpos < int(bbox[2])):
-                        valid_separators = False
-                    if xpos in seen_x:
-                        valid_separators = False
-                    seen_x.add(xpos)
-            if not valid_separators:
-                warnings.append(f"{table_id}: separateurs_invalides_ou_incoherents")
+            printed_rules.sort(key=lambda item: (int(item.get("x", -1)), str(item.get("id", ""))))
+            data_tracks.sort(key=lambda item: (
+                int((item.get("band") or [-1, -1])[0]), str(item.get("id", ""))
+            ))
+            header_spans.sort(key=lambda item: (
+                int((item.get("band") or [-1, -1])[0]), str(item.get("id", ""))
+            ))
 
+            all_evidence_valid = bool(valid_bbox)
+            valid_evidence_count = 0
+            seen_ids: set[str] = set()
+            seen_rule_x: set[int] = set()
+
+            for rule in printed_rules:
+                rid = str(rule.get("id", ""))
+                xpos = int(rule.get("x", -1))
+                valid = bool(
+                    valid_bbox and rid and rid not in seen_ids
+                    and bbox and int(bbox[0]) < xpos < int(bbox[2])
+                    and xpos not in seen_rule_x
+                )
+                rule["valid"] = valid
+                if valid:
+                    valid_evidence_count += 1
+                else:
+                    all_evidence_valid = False
+                    warnings.append(f"{table_id}: PRINTED_RULE_invalide={rid or '<absent>'}")
+                seen_ids.add(rid)
+                seen_rule_x.add(xpos)
+
+            for track in data_tracks:
+                tid = str(track.get("id", ""))
+                band = track.get("band")
+                support = int(track.get("support", 0) or 0)
+                valid = bool(
+                    valid_bbox and tid and tid not in seen_ids
+                    and band and len(band) == 2 and bbox
+                    and int(bbox[0]) <= int(band[0]) < int(band[1]) <= int(bbox[2])
+                    and support >= 1
+                )
+                track["valid"] = valid
+                if valid:
+                    valid_evidence_count += 1
+                else:
+                    all_evidence_valid = False
+                    warnings.append(f"{table_id}: DATA_TRACK_invalide={tid or '<absent>'}")
+                seen_ids.add(tid)
+
+            for span in header_spans:
+                hid = str(span.get("id", ""))
+                band = span.get("band")
+                valid = bool(
+                    valid_bbox and hid and hid not in seen_ids
+                    and band and len(band) == 2 and bbox
+                    and int(bbox[0]) <= int(band[0]) < int(band[1]) <= int(bbox[2])
+                )
+                span["valid"] = valid
+                if valid:
+                    valid_evidence_count += 1
+                else:
+                    all_evidence_valid = False
+                    warnings.append(f"{table_id}: HEADER_SPAN_invalide={hid or '<absent>'}")
+                seen_ids.add(hid)
+
+            if valid_bbox and not (printed_rules or data_tracks or header_spans):
+                all_evidence_valid = False
+                warnings.append(f"{table_id}: aucune_preuve_interne")
+
+            valid_evidence = bool(valid_bbox and valid_evidence_count > 0)
+            evidence_complete = bool(valid_evidence and all_evidence_valid)
             tables.append({
                 "id": table_id,
                 "hint": hint,
-                # Alias interne de compatibilité ; aucune sémantique comptable n'est déduite.
                 "role": hint,
                 "bbox": list(bbox) if bbox else None,
                 "right_edge": right_edge,
-                "separators": separators,
-                "separator_count": len(separators),
-                "proposed_cols": len(separators) + 1 if valid_bbox else 0,
+                "ordinary_rows": ordinary_rows,
+                "printed_rules": printed_rules,
+                "data_tracks": data_tracks,
+                "header_spans": header_spans,
+                "printed_rule_count": len(printed_rules),
+                "data_track_count": len(data_tracks),
+                "header_span_count": len(header_spans),
+                "repeated_track_ids": [
+                    str(track.get("id")) for track in data_tracks
+                    if int(track.get("support", 0) or 0) >= 2
+                ],
                 "valid_bbox": valid_bbox,
-                "valid_separators": valid_separators,
-                # Alias de compatibilité interne : une topologie est exploitable pour
-                # le guidage seulement si sa bbox est valide. Les séparateurs restent
-                # toujours des hypothèses, même lorsqu'ils sont syntaxiquement valides.
-                "valid_columns": valid_separators,
-                "cols": len(separators) + 1 if valid_bbox else 0,
+                "valid_evidence": valid_evidence,
+                "evidence_complete": evidence_complete,
+                "valid_evidence_count": valid_evidence_count,
+                # Alias de compatibilité interne.
+                "separators": printed_rules,
+                "separator_count": len(printed_rules),
+                "valid_separators": valid_evidence,
+                "valid_columns": valid_evidence,
+                "proposed_cols": 0,
+                "cols": 0,
             })
             continue
 
@@ -1991,24 +2163,21 @@ def parse_geometry_map(raw_text: str, page_num: int) -> Dict[str, Any]:
             continue
 
         if line.strip():
-            warnings.append(f"ligne_hors_topologie={line[:120]}")
+            warnings.append(f"ligne_hors_carte_preuves={line[:120]}")
         index += 1
 
     if not page_map_present:
-        warnings.append("PAGE_TOPOLOGY_absent")
+        warnings.append("PAGE_EVIDENCE_absent")
     if not end_map_present:
-        warnings.append("END_TOPOLOGY_absent")
+        warnings.append("END_EVIDENCE_absent")
     if coverage == "unknown":
-        warnings.append("coverage_topologie_absente_ou_invalide")
+        warnings.append("coverage_preuves_absente_ou_invalide")
 
     crop_tables = [table for table in tables if table.get("valid_bbox")]
-    valid_tables = [table for table in crop_tables if table.get("valid_separators")]
+    valid_tables = [table for table in crop_tables if table.get("valid_evidence")]
     unique_warnings = list(dict.fromkeys(warnings))
     format_complete = bool(
-        page_map_present
-        and end_map_present
-        and coverage == "complete"
-        and not unique_warnings
+        page_map_present and end_map_present and coverage == "complete" and not unique_warnings
     )
     return {
         "page_num": int(page_num),
@@ -2029,36 +2198,65 @@ def parse_geometry_map(raw_text: str, page_num: int) -> Dict[str, Any]:
         "warning_count": len(unique_warnings),
     }
 
-
 def render_geometry_map(parsed: Dict[str, Any]) -> str:
-    """Rend une topologie auditable et non contraignante pour le second appel."""
-    lines: List[str] = ["[[PAGE_TOPOLOGY coordinate_system=page_0_1000]]"]
+    """Rend une carte de preuves auditable et non contraignante."""
+    lines: List[str] = ["[[PAGE_EVIDENCE coordinate_system=page_0_1000]]"]
     auto_ambiguities: List[Dict[str, Any]] = []
     for table in parsed.get("tables", []) or []:
         bbox = table.get("bbox")
         if not table.get("valid_bbox") or not bbox or len(bbox) != 4:
             continue
-        topology_quality = "usable" if table.get("valid_separators") else "uncertain"
-        lines.append(
-            f"[[TABLE_REGION id={table.get('id')} hint={table.get('hint', table.get('role','other'))} "
-            f"bbox={','.join(str(int(v)) for v in bbox)} "
-            f"right_edge={table.get('right_edge','uncertain')} topology_quality={topology_quality}]]"
-        )
-        if table.get("valid_separators"):
-            for separator in table.get("separators", []) or []:
+        attrs = [
+            f"id={table.get('id')}",
+            f"hint={table.get('hint', table.get('role','other'))}",
+            f"bbox={','.join(str(int(v)) for v in bbox)}",
+            f"right_edge={table.get('right_edge','uncertain')}",
+        ]
+        ordinary_rows = int(table.get("ordinary_rows", 0) or 0)
+        if ordinary_rows > 0:
+            attrs.append(f"ordinary_rows={ordinary_rows}")
+        lines.append("[[TABLE_REGION " + " ".join(attrs) + "]]")
+
+        if table.get("valid_evidence"):
+            for rule in table.get("printed_rules", []) or []:
+                if rule.get("valid") is False:
+                    continue
                 lines.append(
-                    f"[[SEPARATOR index={int(separator.get('index',0) or 0)} "
-                    f"x={int(separator.get('x',0) or 0)} "
-                    f"status={separator.get('status','candidate')} "
-                    f"evidence={separator.get('evidence','mixed')}]]"
+                    f"[[PRINTED_RULE id={rule.get('id')} x={int(rule.get('x',0) or 0)} "
+                    f"status={rule.get('status','candidate')} evidence={rule.get('evidence','mixed')}]]"
+                )
+            for track in table.get("data_tracks", []) or []:
+                if track.get("valid") is False:
+                    continue
+                band = track.get("band") or [0, 0]
+                lines.append(
+                    f"[[DATA_TRACK id={track.get('id')} band={int(band[0])},{int(band[1])} "
+                    f"support={int(track.get('support',0) or 0)} shape={track.get('shape','mixed')} "
+                    f"status={track.get('status','candidate')}]]"
+                )
+            for span in table.get("header_spans", []) or []:
+                if span.get("valid") is False:
+                    continue
+                band = span.get("band") or [0, 0]
+                lines.append(
+                    f"[[HEADER_SPAN id={span.get('id')} band={int(band[0])},{int(band[1])} "
+                    f"status={span.get('status','uncertain')}]]"
                 )
         else:
             auto_ambiguities.append({
                 "id": f"AUTO_{table.get('id')}",
                 "region": str(table.get("id")),
-                "kind": "missing_separator",
+                "kind": "missing_track",
                 "bbox": list(bbox),
-                "options": "Séparateurs incomplets ou incohérents ; recompter directement dans les images.",
+                "options": "Aucune preuve interne valide ; reconstruire les pistes directement dans les images.",
+            })
+        if table.get("valid_evidence") and not table.get("evidence_complete"):
+            auto_ambiguities.append({
+                "id": f"AUTO_PARTIAL_{table.get('id')}",
+                "region": str(table.get("id")),
+                "kind": "missing_track",
+                "bbox": list(bbox),
+                "options": "Certaines preuves ont été écartées comme invalides ; compléter depuis les images.",
             })
         lines.append("[[/TABLE_REGION]]")
 
@@ -2078,9 +2276,8 @@ def render_geometry_map(parsed: Dict[str, Any]) -> str:
             f"kind={ambiguity.get('kind','unknown')} bbox={','.join(str(int(v)) for v in bbox)} "
             f'options="{options}"]]'
         )
-    lines.append(f"[[END_TOPOLOGY coverage={parsed.get('coverage','partial')}]]")
+    lines.append(f"[[END_EVIDENCE coverage={parsed.get('coverage','partial')}]]")
     return "\n".join(lines)
-
 
 def _normalize_section(raw: str, warnings: List[str], element_id: str) -> str:
     candidate = (raw or "").strip().lower()
@@ -2416,6 +2613,7 @@ def parse_canonical_page(
     coverage = "unknown"
     page_empty = False
     encountered_ids: Counter[str] = Counter()
+    grid_decisions: Dict[str, Dict[str, Any]] = {}
     auto_counter = 0
 
     lines = (canonical_text or "").splitlines()
@@ -2441,11 +2639,83 @@ def parse_canonical_page(
             index += 1
             continue
 
+        decision_match = GRID_DECISION_RE.match(line)
+        if decision_match:
+            attrs = _parse_attributes(decision_match.group(1))
+            table_id = str(attrs.get("table_id", "") or "").strip()
+            if not table_id:
+                table_id = f"T_DECISION_AUTO_{len(grid_decisions)+1:03d}"
+                warnings.append(f"{table_id}: GRID_DECISION_table_id_absent")
+            def _decision_int(name: str) -> int:
+                try:
+                    return int(attrs.get(name, "0"))
+                except ValueError:
+                    warnings.append(f"{table_id}: GRID_DECISION_{name}_invalide")
+                    return 0
+            def _decision_list(name: str) -> List[str]:
+                raw = str(attrs.get(name, "none") or "none")
+                return [
+                    token.strip() for token in raw.split(",")
+                    if token.strip() and token.strip().lower() != "none"
+                ]
+            decision = str(attrs.get("decision", "unmapped") or "unmapped").lower()
+            if decision not in {"confirmed", "revised", "unmapped"}:
+                warnings.append(f"{table_id}: GRID_DECISION_decision_invalide={decision}")
+                decision = "unmapped"
+            reason = str(attrs.get("reason", "unmapped") or "unmapped").lower()
+            allowed_decision_reasons = {
+                "as_observed", "added_track", "removed_track", "moved_track",
+                "split_region", "merged_regions", "image_override", "unmapped",
+            }
+            if reason not in allowed_decision_reasons:
+                warnings.append(f"{table_id}: GRID_DECISION_reason_invalide={reason}")
+                reason = "unmapped"
+            rejection_reason = str(attrs.get("rejection_reason", "none") or "none").lower()
+            if rejection_reason not in {
+                "none", "same_visual_cell", "single_occurrence", "outside_region",
+                "not_repeated", "other_visual",
+            }:
+                warnings.append(f"{table_id}: GRID_DECISION_rejection_reason_invalide={rejection_reason}")
+                rejection_reason = "other_visual"
+            record = {
+                "table_id": table_id,
+                "map_id": str(attrs.get("map_id", "") or ""),
+                "ordinary_rows": _decision_int("ordinary_rows"),
+                "max_visible_groups": _decision_int("max_visible_groups"),
+                "repeated_tracks": _decision_list("repeated_tracks"),
+                "accepted_tracks": _decision_list("accepted_tracks"),
+                "rejected_tracks": _decision_list("rejected_tracks"),
+                "rejection_reason": rejection_reason,
+                "unassigned_tracks": _decision_list("unassigned_tracks"),
+                "final_cols": _decision_int("final_cols"),
+                "decision": decision,
+                "reason": reason,
+                "raw_attrs": dict(attrs),
+            }
+            if table_id in grid_decisions:
+                warnings.append(f"{table_id}: GRID_DECISION_dupliquee_remplacee")
+            repeated = set(record["repeated_tracks"])
+            resolved = set(record["accepted_tracks"]) | set(record["rejected_tracks"]) | set(record["unassigned_tracks"])
+            missing = sorted(repeated - resolved)
+            if missing:
+                warnings.append(f"{table_id}: GRID_DECISION_pistes_non_resolues={','.join(missing)}")
+            if set(record["accepted_tracks"]) & set(record["rejected_tracks"]):
+                warnings.append(f"{table_id}: GRID_DECISION_pistes_acceptees_et_rejetees")
+            if record["unassigned_tracks"]:
+                warnings.append(
+                    f"{table_id}: GRID_DECISION_unassigned_tracks={','.join(record['unassigned_tracks'])}"
+                )
+            if decision == "confirmed" and record["unassigned_tracks"]:
+                warnings.append(f"{table_id}: GRID_DECISION_confirmed_avec_pistes_non_affectees")
+            grid_decisions[table_id] = record
+            index += 1
+            continue
+
         start = ELEMENT_START_RE.match(line)
         if not start:
             stray: List[str] = []
             while index < len(lines):
-                if ELEMENT_START_RE.match(lines[index]) or END_PAGE_RE.match(lines[index]):
+                if ELEMENT_START_RE.match(lines[index]) or GRID_DECISION_RE.match(lines[index]) or END_PAGE_RE.match(lines[index]):
                     break
                 if lines[index].strip() and lines[index].strip() != "[PAGE VIDE]":
                     stray.append(lines[index])
@@ -2487,7 +2757,7 @@ def parse_canonical_page(
                 closed = True
                 index += 1
                 break
-            if ELEMENT_START_RE.match(lines[index]) or END_PAGE_RE.match(lines[index]):
+            if ELEMENT_START_RE.match(lines[index]) or GRID_DECISION_RE.match(lines[index]) or END_PAGE_RE.match(lines[index]):
                 break
             raw_content.append(lines[index])
             index += 1
@@ -2522,9 +2792,9 @@ def parse_canonical_page(
                 warnings.append(f"{element_id}: map_status_invalide={map_status}")
                 map_status = "unmapped"
             allowed_map_reasons = {
-                "as_proposed", "added_separator", "removed_separator",
-                "moved_separator", "split_region", "merged_regions",
-                "image_override", "unmapped",
+                "as_observed", "added_track", "removed_track", "moved_track",
+                "as_proposed", "added_separator", "removed_separator", "moved_separator",
+                "split_region", "merged_regions", "image_override", "unmapped",
             }
             map_reason = str(attrs.get("map_reason", "unmapped") or "unmapped").lower()
             if map_reason not in allowed_map_reasons:
@@ -2540,6 +2810,20 @@ def parse_canonical_page(
             rows, cols, emitted_rows, emitted_cells, _column_map, _legacy_columns = _parse_table_content(
                 element_id, raw_content, declared_cols, warnings
             )
+            grid_decision = grid_decisions.get(raw_id) or grid_decisions.get(element_id)
+            if grid_decision is None:
+                warnings.append(f"{element_id}: GRID_DECISION_absente")
+            else:
+                if int(grid_decision.get("final_cols", 0) or 0) != int(cols):
+                    warnings.append(
+                        f"{element_id}: GRID_DECISION_final_cols={grid_decision.get('final_cols')} "
+                        f"different_de_cols={cols}"
+                    )
+                if str(grid_decision.get("decision", "unmapped")) != map_status:
+                    warnings.append(
+                        f"{element_id}: GRID_DECISION_decision={grid_decision.get('decision')} "
+                        f"different_de_map_status={map_status}"
+                    )
             if map_status in {"confirmed", "revised"} and not map_id:
                 warnings.append(f"{element_id}: map_id_absent_pour_status={map_status}")
             if boundaries is not None:
@@ -2571,6 +2855,7 @@ def parse_canonical_page(
                 "map_ambiguities_raw": map_ambiguities_raw,
                 "boundaries": boundaries,
                 "boundaries_raw": boundaries_raw,
+                "grid_decision": grid_decision,
                 "emitted_row_count": emitted_rows,
                 "emitted_cell_count": emitted_cells,
             })
@@ -2602,6 +2887,9 @@ def parse_canonical_page(
         warnings.append("coverage_absente_ou_invalide")
     if page_empty and elements:
         warnings.append("PAGE_VIDE_et_elements_presents")
+    table_ids = {str(element.get("id")) for element in elements if element.get("kind") == "TABLE"}
+    for decision_id in sorted(set(grid_decisions) - table_ids):
+        warnings.append(f"{decision_id}: GRID_DECISION_sans_TABLE")
 
     technical_markers = (
         "fermeture_", "cellule_dupliquee=", "ligne_sans_indice_",
@@ -2613,7 +2901,7 @@ def parse_canonical_page(
         "ligne_sans_cle_preservee", "cle_label_absente", "cle_value_absente",
         "item_entierement_vide_ignore", "section_invalide=", "source_absente",
         "END_PAGE_", "contenu_apres_END_PAGE", "marqueur_END_PAGE_absent",
-        "reponse_api_tronquee",
+        "reponse_api_tronquee", "GRID_DECISION_", "unassigned_tracks=",
     )
     technical_warnings = [w for w in warnings if any(marker in w for marker in technical_markers)]
     format_complete = bool(
@@ -2660,7 +2948,13 @@ def parse_canonical_page(
         "warning_count": len(list(dict.fromkeys(warnings))),
         "error_count": len(list(dict.fromkeys(errors))),
     }
-    return {"page_num": int(page_num), "page_empty": page_empty, "elements": elements, "quality": quality}
+    return {
+        "page_num": int(page_num),
+        "page_empty": page_empty,
+        "elements": elements,
+        "grid_decisions": grid_decisions,
+        "quality": quality,
+    }
 
 
 # =============================================================================
@@ -2844,6 +3138,26 @@ def render_canonical_page(parsed: Dict[str, Any]) -> str:
             output.append("[[/BLOCK]]")
         elif kind == "TABLE":
             counts["tables"] += 1
+            decision = element.get("grid_decision") or {}
+            if decision:
+                def _decision_raw_list(name: str) -> str:
+                    values = list(decision.get(name) or [])
+                    return ",".join(str(value) for value in values) if values else "none"
+                decision_attrs = [
+                    f"table_id={element_id}",
+                    f"map_id={decision.get('map_id') or element.get('map_id') or 'none'}",
+                    f"ordinary_rows={int(decision.get('ordinary_rows',0) or 0)}",
+                    f"max_visible_groups={int(decision.get('max_visible_groups',0) or 0)}",
+                    f'repeated_tracks="{_decision_raw_list("repeated_tracks")}"',
+                    f'accepted_tracks="{_decision_raw_list("accepted_tracks")}"',
+                    f'rejected_tracks="{_decision_raw_list("rejected_tracks")}"',
+                    f"rejection_reason={decision.get('rejection_reason','none')}",
+                    f'unassigned_tracks="{_decision_raw_list("unassigned_tracks")}"',
+                    f"final_cols={int(decision.get('final_cols',0) or 0)}",
+                    f"decision={decision.get('decision','unmapped')}",
+                    f"reason={decision.get('reason','unmapped')}",
+                ]
+                output.append("[[GRID_DECISION " + " ".join(decision_attrs) + "]]")
             attrs = [
                 f"id={element_id}",
                 f"section={section}",
@@ -2923,7 +3237,7 @@ def build_unavailable_page(page_num: int, error: BaseException | str) -> Dict[st
     parsed = {"page_num": int(page_num), "page_empty": False, "elements": [], "quality": quality}
     fallback_canonical = "[EXTRACTION_INDISPONIBLE]\n[[END_PAGE coverage=partial]]"
     fallback_markdown = render_markdown_page(parsed)
-    fallback_geometry = "[[PAGE_TOPOLOGY coordinate_system=page_0_1000]]\n[[END_TOPOLOGY coverage=partial]]"
+    fallback_geometry = "[[PAGE_EVIDENCE coordinate_system=page_0_1000]]\n[[END_EVIDENCE coverage=partial]]"
     return {
         "page_num": int(page_num),
         "geometry_raw": "",
@@ -3037,7 +3351,7 @@ def process_page(
                     _log(f"⚖️ Page {page_num}: carte trop lourde avant envoi — {reason}")
                     continue
                 _log(
-                    f"➡️ Page {page_num}: appel 1/2 cartographie, 3 vues, "
+                    f"➡️ Page {page_num}: appel 1/2 preuves visuelles, 3 vues, "
                     f"profil={view_stats['payload_profile']}, body={request_body_mb:.2f} Mo"
                 )
                 try:
@@ -3064,7 +3378,7 @@ def process_page(
 
         if geometry_raw is None:
             details = " | ".join(geometry_payload_failures[-4:]) or "aucun profil exploitable"
-            raise RuntimeError(f"Page {page_num}: cartographie impossible. {details}")
+            raise RuntimeError(f"Page {page_num}: carte de preuves impossible. {details}")
 
         geometry_parsed = parse_geometry_map(geometry_raw, page_num)
         geometry_sanitized = str(geometry_parsed.get("sanitized", ""))
@@ -3306,6 +3620,8 @@ def get_pipeline_fingerprint() -> str:
         "diagnostic_mode": OCR_DIAGNOSTIC_MODE,
         "include_geometry_annex": INCLUDE_GEOMETRY_ANNEX,
         "geometry_annex_source": GEOMETRY_ANNEX_SOURCE,
+        "guided_numeric_core_start": GUIDED_NUMERIC_CORE_START,
+        "guided_numeric_core_margin": GUIDED_NUMERIC_CORE_MARGIN,
         "include_ocr_annex": INCLUDE_OCR_ANNEX,
         "ocr_annex_source": OCR_ANNEX_SOURCE,
         "include_thinking_annex": INCLUDE_THINKING_ANNEX,
@@ -3479,7 +3795,7 @@ def _code_fence_for(text: str) -> str:
 def build_geometry_annex(page_results: Sequence[Dict[str, Any]]) -> str:
     """Construit l’annexe contenant la carte brute exacte de l’appel 1."""
     chunks: List[str] = [
-        "# Annexe — Cartographie géométrique brute\n\n",
+        "# Annexe — Carte de preuves visuelles brute\n\n",
         GEOMETRY_ANNEX_START + "\n\n",
         "Cette annexe contient la réponse brute du premier appel Qwen. "
         "Les coordonnées sont normalisées sur la page complète.\n",
@@ -3505,7 +3821,7 @@ def build_geometry_annex(page_results: Sequence[Dict[str, Any]]) -> str:
             f"warnings={len(warnings)} -->"
         )
         chunks.extend([
-            f"\n## Cartographie brute — Page {page_num}\n\n",
+            f"\n## Carte de preuves brute — Page {page_num}\n\n",
             meta + "\n\n",
             f"{fence}text\n",
             raw,
@@ -3821,6 +4137,8 @@ __all__ = [
     "THINKING_ANNEX_START", "THINKING_ANNEX_END",
     "RENDER_DPI", "DETAIL_DPI", "DETAIL_UPPER_END", "DETAIL_LOWER_START",
     "TARGET_CROP_DPI", "TARGET_RIGHT_CROP_DPI", "MAX_GUIDED_CROPS",
+    "GUIDED_CROP_MARGIN_X", "GUIDED_CROP_MARGIN_Y", "GUIDED_RIGHT_EDGE_WIDTH",
+    "GUIDED_NUMERIC_CORE_START", "GUIDED_NUMERIC_CORE_MARGIN",
     "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS", "MAX_REQUEST_BODY_MB",
     "ENABLE_DETAIL_VIEWS", "QWEN_HIGH_RES_IMAGES", "STREAMING_OCR",
     "STREAM_INCLUDE_USAGE", "ENABLE_THINKING_GEOMETRY", "ENABLE_THINKING_OCR",
