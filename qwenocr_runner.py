@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v8.0.0, deux passes par page.
+qwenocr_runner.py — runner Cloud Run/local v8.1.0, topologie auditable puis OCR par page.
 
 Appel 1 : cartographie topologique. Python crée ensuite des recadrages avec
 marges. Appel 2 : OCR canonique guidé et vérifié sur les pixels. Le Markdown est
@@ -65,6 +65,7 @@ def _validate_ocr_contract() -> None:
         "NOMINAL_GENERATIONS_PER_PAGE", "SEMANTIC_RETRIES",
         "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT", "PUBLISH_DEGRADED_MARKDOWN",
         "OCR_DIAGNOSTIC_MODE", "INCLUDE_GEOMETRY_ANNEX", "INCLUDE_OCR_ANNEX",
+        "INCLUDE_THINKING_ANNEX", "CAPTURE_REASONING_CONTENT",
         "ENABLE_EXPLICIT_CACHE", "QWEN_HIGH_RES_IMAGES", "STREAMING_OCR",
         "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_GEOMETRY", "MAX_COMPLETION_TOKENS_GEOMETRY",
         "THINKING_BUDGET_OCR", "MAX_COMPLETION_TOKENS_OCR",
@@ -79,13 +80,13 @@ def _validate_ocr_contract() -> None:
         "load_progress", "save_progress", "clear_progress", "process_page",
         "build_unavailable_page", "validate_markdown_quality", "calculate_costs",
         "parse_geometry_map", "render_geometry_map", "build_geometry_annex",
-        "build_ocr_annex", "assemble_document_with_ocr_annex",
+        "build_ocr_annex", "build_thinking_annex", "assemble_document_with_ocr_annex",
     ]
     missing = [name for name in required_attributes if not hasattr(ocr, name)]
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v8.0.0 deux passes. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v8.1.0 topologie auditable. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if ocr.TWO_PASS_GEOMETRY_OCR is not True:
@@ -134,7 +135,7 @@ def _read_int_env(
     return value
 
 
-_workers_raw = os.getenv("PAGE_WORKERS", os.getenv("PIPELINE_CONCURRENCY", "4")).strip()
+_workers_raw = os.getenv("PAGE_WORKERS", os.getenv("PIPELINE_CONCURRENCY", "1")).strip()
 try:
     PAGE_WORKERS = int(_workers_raw)
 except ValueError as exc:
@@ -308,12 +309,16 @@ def _checkpoint_record(result: Dict[str, Any]) -> Dict[str, Any]:
     }
     if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_GEOMETRY_ANNEX):
         record["geometry_raw"] = str(result.get("geometry_raw", ""))
+    if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_THINKING_ANNEX):
+        record["geometry_reasoning"] = str(result.get("geometry_reasoning", ""))
     if bool(ocr.OCR_DIAGNOSTIC_MODE):
         record["geometry_sanitized"] = str(
             result.get("geometry_sanitized", result.get("geometry_normalized", ""))
         )
     if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_OCR_ANNEX):
         record["raw_response"] = str(result.get("raw_response", ""))
+    if bool(ocr.OCR_DIAGNOSTIC_MODE or ocr.INCLUDE_THINKING_ANNEX):
+        record["ocr_reasoning"] = str(result.get("ocr_reasoning", ""))
     if bool(ocr.OCR_DIAGNOSTIC_MODE):
         record["sanitized_canonical"] = str(
             result.get("sanitized_canonical", result.get("canonical", ""))
@@ -327,10 +332,12 @@ def _record_to_result(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "page_num": int(record["page_num"]),
         "geometry_raw": str(record.get("geometry_raw", "")),
+        "geometry_reasoning": str(record.get("geometry_reasoning", "")),
         "geometry_sanitized": str(record.get("geometry_sanitized", geometry_normalized)),
         "geometry_normalized": geometry_normalized,
         "geometry": dict(record.get("geometry") or {}),
         "raw_response": str(record.get("raw_response", "")),
+        "ocr_reasoning": str(record.get("ocr_reasoning", "")),
         "sanitized_canonical": str(record.get("sanitized_canonical", normalized)),
         "normalized_canonical": normalized,
         "canonical": normalized,
@@ -366,7 +373,7 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 CARTOGRAPHIE QWEN → OCR GUIDÉ → MARKDOWN DÉTERMINISTE")
+    print("🔬 TOPOLOGIE QWEN → OCR GUIDÉ AUDITABLE → MARKDOWN DÉTERMINISTE")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
