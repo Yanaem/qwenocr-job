@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner Cloud Run/local v10.0.0, deux passes Qwen.
+qwenocr_runner.py — runner v11.0.0, deux lectures visuelles indépendantes.
 
-Par page : cinq vues → passe 1 OCR brut avec thinking → passe 2 Markdown
-textuelle avec thinking → assemblage d'un fichier Markdown. Le thinking de la
-première passe n'est jamais transmis à la seconde. Python ne corrige aucune donnée.
+Par page, Qwen reçoit deux jeux d'images séparés : un OCR d'audit rapide et un
+Markdown final approfondi. Les appels ne partagent ni sortie, ni carte, ni thinking.
+Python assemble un seul fichier .md contenant le Markdown, l'OCR d'audit et les
+traces de thinking lorsque le mode audit est activé.
 """
 
 from __future__ import annotations
@@ -59,8 +60,9 @@ except Exception:
 def _validate_ocr_contract() -> None:
     required_attributes = [
         "API_URL", "MODEL", "MODEL_OCR", "MODEL_MARKDOWN", "PIPELINE_VERSION",
-        "RAW_OCR_FIRST_PASS", "MARKDOWN_SECOND_PASS", "TWO_PASS_RAW_OCR_MARKDOWN",
-        "CANONICAL_OCR_ONLY", "MODEL_GENERATED_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
+        "OCR_AUDIT_PASS", "MARKDOWN_VISUAL_PASS", "DUAL_INDEPENDENT_VISUAL_PASSES",
+        "PARALLEL_INDEPENDENT_PASSES", "CANONICAL_OCR_ONLY",
+        "MODEL_GENERATED_MARKDOWN", "SINGLE_MARKDOWN_OUTPUT",
         "OCR_PROMPT_IN_USER_MESSAGE", "MARKDOWN_PROMPT_IN_USER_MESSAGE",
         "RAW_OCR_PROMPT", "MARKDOWN_PROMPT", "NOMINAL_GENERATIONS_PER_PAGE",
         "SEMANTIC_RETRIES", "STOP_ON_CRITICAL", "PUBLISH_PARTIAL_DOCUMENT",
@@ -70,9 +72,9 @@ def _validate_ocr_contract() -> None:
         "STREAM_INCLUDE_USAGE", "THINKING_BUDGET_OCR", "THINKING_BUDGET_MARKDOWN",
         "MAX_COMPLETION_TOKENS_OCR", "MAX_COMPLETION_TOKENS_MARKDOWN",
         "OCR_SEED", "MARKDOWN_SEED", "RENDER_DPI", "DETAIL_DPI",
-        "DETAIL_UPPER_END", "DETAIL_MIDDLE_START", "DETAIL_MIDDLE_END",
-        "DETAIL_LOWER_START", "RIGHT_VIEW_START", "EXPECTED_VIEW_COUNT",
-        "VIEW_JPEG_QUALITY", "MAX_VIEW_PIXELS", "MAX_REQUEST_BODY_MB",
+        "OCR_AUDIT_RENDER_DPI", "OCR_AUDIT_DETAIL_DPI",
+        "OCR_AUDIT_EXPECTED_VIEW_COUNT", "MARKDOWN_EXPECTED_VIEW_COUNT",
+        "MAX_VIEW_PIXELS", "MAX_REQUEST_BODY_MB",
     ]
     required_callables = [
         "validate_api_configuration", "configure_explicit_cache_for_batch",
@@ -85,25 +87,26 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v10.0.0. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v11.0.0. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
-    if not (ocr.RAW_OCR_FIRST_PASS and ocr.MARKDOWN_SECOND_PASS and ocr.TWO_PASS_RAW_OCR_MARKDOWN):
-        raise RuntimeError("Contrat invalide : OCR brut puis Markdown sont obligatoires.")
-    if ocr.CANONICAL_OCR_ONLY is not True:
-        raise RuntimeError("Contrat invalide : la passe 1 doit produire uniquement l'OCR brut canonique.")
-    if ocr.MODEL_GENERATED_MARKDOWN is not True:
-        raise RuntimeError("Contrat invalide : la passe 2 Qwen doit construire le Markdown.")
+    if not (ocr.OCR_AUDIT_PASS and ocr.MARKDOWN_VISUAL_PASS and ocr.DUAL_INDEPENDENT_VISUAL_PASSES):
+        raise RuntimeError("Contrat invalide : deux lectures visuelles indépendantes obligatoires.")
+    if ocr.TWO_PASS_RAW_OCR_MARKDOWN:
+        raise RuntimeError("Contrat invalide : le Markdown ne doit pas dépendre de l'OCR.")
+    if ocr.CANONICAL_OCR_ONLY is not True or ocr.MODEL_GENERATED_MARKDOWN is not True:
+        raise RuntimeError("Contrat invalide : OCR d'audit structuré et Markdown Qwen requis.")
     if ocr.SINGLE_MARKDOWN_OUTPUT is not True:
         raise RuntimeError("Contrat invalide : une seule sortie Markdown est autorisée.")
     if not (ocr.OCR_PROMPT_IN_USER_MESSAGE and ocr.MARKDOWN_PROMPT_IN_USER_MESSAGE):
         raise RuntimeError("Contrat invalide : les deux prompts doivent être dans les messages utilisateur.")
     if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 2 or int(ocr.SEMANTIC_RETRIES) != 0:
         raise RuntimeError("Contrat invalide : deux appels nominaux et aucune relance sémantique.")
-    if int(ocr.EXPECTED_VIEW_COUNT) != 5:
-        raise RuntimeError("Contrat invalide : cinq vues déterministes pour la passe OCR.")
+    if int(ocr.OCR_AUDIT_EXPECTED_VIEW_COUNT) != 4 or int(ocr.MARKDOWN_EXPECTED_VIEW_COUNT) != 5:
+        raise RuntimeError("Contrat invalide : 4 vues OCR audit et 5 vues Markdown.")
     if not (ocr.STREAMING_OCR and ocr.STREAMING_MARKDOWN and ocr.STREAM_INCLUDE_USAGE):
-        raise RuntimeError("Contrat invalide : SSE avec usage final sur les deux passes.")
+        raise RuntimeError("Contrat invalide : SSE avec usage final sur les deux appels.")
+
 
 def _loaded_ocr_path() -> str:
     return str(Path(getattr(ocr, "__file__", "chemin inconnu")).resolve())
@@ -357,52 +360,39 @@ def run_for_pdf(
     ocr.configure_explicit_cache_for_batch(page_count, effective_workers)
 
     print("\n" + "=" * 78)
-    print("🔬 QWEN DEUX PASSES : OCR BRUT + THINKING → MARKDOWN + THINKING")
+    print("🔬 QWEN : OCR D'AUDIT + MARKDOWN VISUEL, DEUX LECTURES INDÉPENDANTES")
     print("=" * 78)
     print(f"📄 PDF                 : {pdf_path}")
     print(f"📄 Pages               : {page_count}")
     print(f"🧩 Module              : {_loaded_ocr_path()}")
-    print(f"🤖 Modèle OCR brut     : {ocr.MODEL_OCR}")
+    print(f"🤖 Modèle OCR audit    : {ocr.MODEL_OCR}")
     print(f"🤖 Modèle Markdown     : {ocr.MODEL_MARKDOWN}")
     print(f"📞 Appels/page         : {ocr.NOMINAL_GENERATIONS_PER_PAGE}")
+    print("🔀 Indépendance        : aucun échange de sortie ou de thinking")
+    print("⚡ Exécution interne   : " + ("parallèle" if ocr.PARALLEL_INDEPENDENT_PASSES else "séquentielle"))
     print("🌊 Streaming           : SSE activé")
-    print(f"🧠 Thinking OCR brut   : {ocr.THINKING_BUDGET_OCR} tokens")
-    print(f"🧾 Sortie OCR brut     : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
+    print(f"🧠 Thinking OCR audit  : {ocr.THINKING_BUDGET_OCR} tokens")
+    print(f"🧾 Sortie OCR audit    : {ocr.MAX_COMPLETION_TOKENS_OCR} tokens")
     print(f"🧠 Thinking Markdown   : {ocr.THINKING_BUDGET_MARKDOWN} tokens")
     print(f"🧾 Sortie Markdown     : {ocr.MAX_COMPLETION_TOKENS_MARKDOWN} tokens")
     print(f"🎯 Graines             : OCR={ocr.OCR_SEED} / Markdown={ocr.MARKDOWN_SEED}")
-    print("🧭 Passe 1             : images → OCR brut canonique")
-    print("🧭 Passe 2             : OCR brut seul → Markdown")
-    print(f"🧵 Workers             : {effective_workers}")
-    print(f"🖼️ Vue complète        : JPEG {ocr.RENDER_DPI} DPI")
-    print(
-        f"🔎 Vues détaillées     : JPEG {ocr.DETAIL_DPI} DPI — "
-        f"haut 0-{int(round(ocr.DETAIL_UPPER_END * 100))}% / "
-        f"centre {int(round(ocr.DETAIL_MIDDLE_START * 100))}-"
-        f"{int(round(ocr.DETAIL_MIDDLE_END * 100))}% / "
-        f"bas {int(round(ocr.DETAIL_LOWER_START * 100))}-100% / "
-        f"droite {int(round(ocr.RIGHT_VIEW_START * 100))}-100%"
-    )
-    print(f"🖼️ Nombre de vues      : {ocr.EXPECTED_VIEW_COUNT}")
+    print(f"🧵 Workers pages       : {effective_workers}")
+    print(f"🖼️ OCR audit           : {ocr.OCR_AUDIT_EXPECTED_VIEW_COUNT} vues, "
+          f"{ocr.OCR_AUDIT_RENDER_DPI}/{ocr.OCR_AUDIT_DETAIL_DPI} DPI")
+    print(f"🖼️ Markdown visuel     : {ocr.MARKDOWN_EXPECTED_VIEW_COUNT} vues, "
+          f"{ocr.RENDER_DPI}/{ocr.DETAIL_DPI} DPI")
     print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
-    print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo (pré-contrôle exact)")
-    print("🛟 Repli 413            : compression/résolution de la passe OCR seulement")
+    print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo par appel")
+    print("🛟 Repli 413            : compression/résolution seulement")
     print("📝 Sortie documentaire : un seul fichier Markdown")
-    print(
-        "📎 Annexe OCR brute   : "
-        + ("incluse dans le Markdown" if ocr.INCLUDE_OCR_ANNEX else "désactivée")
-    )
-    print(
-        "🧠 Annexe thinking    : "
-        + ("incluse dans le Markdown" if ocr.INCLUDE_THINKING_ANNEX else "désactivée")
-    )
+    print("📎 OCR audit           : " + ("inclus" if ocr.INCLUDE_OCR_ANNEX else "désactivé"))
+    print("🧠 Thinkings           : " + ("inclus" if ocr.INCLUDE_THINKING_ANNEX else "désactivés"))
     if ocr.OCR_DIAGNOSTIC_MODE:
-        print("🔬 Diagnostic interne  : activé — deux réponses et deux thinkings conservés")
-        print("🔐 Données sensibles   : le diagnostic doit rester en accès restreint")
+        print("🔬 Diagnostic interne  : activé")
+        print("🔐 Données sensibles   : accès restreint requis")
     else:
         print("🔬 Diagnostic interne  : désactivé")
     print("=" * 78)
-
     checkpoint_pages = ocr.load_progress(
         pdf_path,
         expected_source_id=source_id,
@@ -636,6 +626,8 @@ def main() -> None:
                         "maxCompletionTokensOcr": ocr.MAX_COMPLETION_TOKENS_OCR,
                         "maxCompletionTokensMarkdown": ocr.MAX_COMPLETION_TOKENS_MARKDOWN,
                         "modelGeneratedMarkdown": True,
+                        "dualIndependentVisualPasses": True,
+                        "parallelIndependentPasses": bool(ocr.PARALLEL_INDEPENDENT_PASSES),
                         "singleMarkdownOutput": True,
                         "ocrPromptInUserMessage": True,
                         "markdownPromptInUserMessage": True,
