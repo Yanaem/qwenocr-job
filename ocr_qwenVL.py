@@ -97,9 +97,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =============================================================================
 
-PIPELINE_VERSION = "qwen-dual-independent-vision-accounting-double-check-v11.7.0-20260805"
-CHECKPOINT_VERSION = 38
-CHECKPOINT_SCHEMA = "dual-independent-vision-grid-fidelity-v36"
+PIPELINE_VERSION = "qwen-dual-independent-vision-tax-matrix-axis-v11.7.1-20260805"
+CHECKPOINT_VERSION = 39
+CHECKPOINT_SCHEMA = "dual-independent-vision-grid-fidelity-v37"
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
 _QWEN_API_URL_OVERRIDE = os.getenv("QWEN_API_URL", "").strip().rstrip("/")
@@ -500,6 +500,28 @@ Une ligne physique peut contenir des intitulés de colonnes dans une partie de l
 - Une valeur monétaire ou une devise isolée n'est jamais un en-tête uniquement parce qu'elle se trouve sur la même hauteur que des en-têtes.
 - Dans un tableau fiscal, un libellé de régime avec son code et son taux, empilés dans la même cellule de tête, peut être conservé comme un seul en-tête avec <br>. À l'inverse, un couple libellé de total + montant adjacent reste toujours une donnée.
 
+EXCEPTION GÉNÉRIQUE — EN-TÊTE D'AXE OU DE MATRICE FISCALE
+Dans une matrice de taxes, la cellule d'angle ou d'axe située dans la même bande physique d'en-tête que les catégories fiscales reste un en-tête H, même si les cellules situées verticalement sous elle contiennent des libellés de lignes tels que base, montant HT, montant de taxe ou équivalent.
+
+Classe obligatoirement cette cellule comme H lorsque les quatre conditions suivantes sont réunies :
+1. elle appartient visuellement à la bande d'en-tête : même hauteur, même encadrement, même fond, même typographie ou même alignement vertical que les en-têtes de régimes, catégories, codes ou taux adjacents ;
+2. son texte désigne l'axe, la famille ou la matrice fiscale — par exemple codes de taxe, codes TVA/VAT/GST, catégories de taxe, régimes, taux ou équivalent — et non un montant, une devise, une base chiffrée ou un solde ;
+3. elle n'est pas suivie dans la même ligne d'une valeur monétaire formant avec elle un couple libellé + montant ;
+4. les pistes adjacentes de la même bande contiennent des catégories, codes ou taux fiscaux.
+
+CONSÉQUENCE OBLIGATOIRE
+- Conserve cet en-tête d'axe dans la ligne d'en-tête Markdown, à sa position physique exacte.
+- Ne le remplace jamais par [SANS_ENTETE_n].
+- Ne le redescends jamais dans la première ligne de données uniquement parce que les cellules sous lui sont des libellés de lignes.
+- Dans la première ligne de données créée à partir d'une ligne mixte, laisse une cellule vide sous cet en-tête H.
+- Cette exception ne s'applique jamais aux libellés financiers verticaux tels que TOTAL HT, TOTAL TAXE, TOTAL TTC, CONTRIBUTION, NET A PAYER, SOLDE ou équivalent lorsqu'ils changent d'une ligne à l'autre et sont accompagnés d'un montant adjacent : ceux-ci restent D.
+
+ARBRE DE DÉCISION SILENCIEUX POUR LA CELLULE D'ANGLE D'UN TABLEAU FISCAL
+A. Est-elle dans la même bande visuelle d'en-tête que les catégories ou taux ? Si non : ne pas appliquer l'exception.
+B. Désigne-t-elle l'axe ou la famille fiscale, sans montant adjacent ? Si oui : H.
+C. Varie-t-elle verticalement avec des libellés financiers et des montants adjacents ? Si oui : D.
+D. En cas de doute entre B et C, reviens à la page complète puis à la vue détaillée de la zone fiscale ; ne déplace pas la cellule vers les données par défaut.
+
 PROCÉDURE OBLIGATOIRE POUR CHAQUE LIGNE MIXTE
 1. Numérote silencieusement les lignes physiques de données S1, S2, S3... dans leur ordre vertical. La partie données d'une ligne mixte compte comme S1.
 2. Pour chaque piste de la ligne mixte, classe le contenu en H = en-tête seulement, D = donnée seulement, ou H+D = les deux empilés dans la même piste.
@@ -525,6 +547,7 @@ Relis chaque tableau de haut en bas, puis une seconde fois de bas en haut et de 
 - aucune piste répétée fusionnée ; aucune expression compacte scindée ;
 - aucune piste sans en-tête absorbée dans une cellule voisine ;
 - aucun fragment d'en-tête visible remplacé par [SANS_ENTETE_n] ;
+- dans toute matrice fiscale, la cellule d'angle ou d'axe appartenant à la bande d'en-tête reste dans l'en-tête Markdown et ne réapparaît pas comme première donnée ;
 - aucune valeur copiée ; aucune colonne entièrement vide ;
 - aucune grille continue divisée ; aucun tableau physiquement distinct fusionné ;
 - chaque troncature conserve le fragment visible ; toute lecture reconnue comme hésitante reste marquée [INCERTAIN].
@@ -534,6 +557,7 @@ Sans utiliser le premier contrôle comme source, repars des images et dresse un 
 - Un même nombre imprimé plusieurs fois constitue plusieurs occurrences : ne déduplique jamais par valeur.
 - Chaque couple libellé/montant reste sur la même ligne relative que dans l'image.
 - Vérifie spécialement la première ligne mixte et les suites verticales de totaux, taxes, contributions, TTC, net à payer et solde.
+- Pour toute matrice fiscale, vérifie une seconde fois la cellule d'angle de la bande d'en-tête : si elle nomme l'axe ou la famille des codes/taux, elle doit apparaître dans l'en-tête Markdown et la cellule située sous elle dans la première ligne de données doit être vide.
 - Si les deux vérifications divergent, retourne aux images ; ne réconcilie jamais par calcul. Conserve la lecture visuelle ou marque [INCERTAIN]/[ILLISIBLE].
 
 PRÉSERVATION COMPTABLE — AUCUNE PERTE DE DONNÉE FINANCIÈRE
@@ -605,6 +629,7 @@ RÈGLES DE PRÉSENTATION
 - Si aucun en-tête n'est visible, utilise [SANS_ENTETE_1], [SANS_ENTETE_2], etc., uniquement pour les colonnes réelles.
 - Les tableaux ont une ligne d'en-tête, une ligne de séparation simple et des lignes de largeur identique.
 - Si une ligne physique mélange en-têtes fiscaux et couple libellé/montant, les colonnes du couple utilisent des [SANS_ENTETE_n] dans l'en-tête Markdown ; la partie données de cette même ligne devient une ligne de données autonome avant toute ligne physique suivante.
+- Dans une matrice fiscale, l'en-tête d'axe ou de coin appartenant à la bande d'en-tête reste dans cette bande ; il ne devient ni [SANS_ENTETE_n] ni donnée de la première ligne.
 - Une expression compacte valeur + unité/multiplicateur/suffixe reste dans une seule cellule tant qu'aucune piste indépendante répétée n'est démontrée.
 - Aucun total, sous-total, taxe, base, TTC, net, contribution ou ajustement imprimé ne peut être sacrifié pour fabriquer une ligne d'en-tête Markdown.
 - Les annotations, tampons, signatures et contenus non classables vont dans « Mentions Légales et Notes Complémentaires » lorsqu'ils sont distincts.
