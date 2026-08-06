@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-qwenocr_runner.py — runner v11.5.0, deux lectures visuelles indépendantes.
+qwenocr_runner.py — runner v12.5.1, deux lectures visuelles indépendantes.
 
 Par page, Qwen reçoit deux jeux d'images séparés : un OCR d'audit rapide et un
 Markdown final approfondi. Les appels ne partagent ni sortie, ni carte, ni thinking.
-Python assemble un seul fichier .md contenant le Markdown, l'OCR d'audit et les
-traces de thinking lorsque le mode audit est activé.
+Python assemble un seul fichier .md contenant, pour chaque page, le Markdown puis l'OCR d'audit indépendant. Le thinking reste dans le checkpoint ou le diagnostic et n'est pas inclus par défaut.
 """
 
 from __future__ import annotations
@@ -58,6 +57,7 @@ except Exception:
 
 
 def _validate_ocr_contract() -> None:
+    ocr.validate_runtime_package_contract()
     required_attributes = [
         "API_URL", "MODEL", "MODEL_OCR", "MODEL_MARKDOWN", "PIPELINE_VERSION",
         "OCR_AUDIT_PASS", "MARKDOWN_VISUAL_PASS", "DUAL_INDEPENDENT_VISUAL_PASSES",
@@ -73,11 +73,11 @@ def _validate_ocr_contract() -> None:
         "MAX_COMPLETION_TOKENS_OCR", "MAX_COMPLETION_TOKENS_MARKDOWN",
         "OCR_SEED", "MARKDOWN_SEED", "RENDER_DPI", "DETAIL_DPI",
         "OCR_AUDIT_RENDER_DPI", "OCR_AUDIT_DETAIL_DPI",
-        "OCR_AUDIT_EXPECTED_VIEW_COUNT", "MARKDOWN_EXPECTED_VIEW_COUNT",
+        "MARKDOWN_GEOMETRY_GUIDE", "OCR_AUDIT_EXPECTED_VIEW_COUNT", "MARKDOWN_EXPECTED_VIEW_COUNT",
         "MAX_VIEW_PIXELS", "MAX_REQUEST_BODY_MB",
     ]
     required_callables = [
-        "validate_api_configuration", "configure_explicit_cache_for_batch",
+        "validate_runtime_package_contract", "validate_api_configuration", "configure_explicit_cache_for_batch",
         "get_pipeline_fingerprint", "get_progress_path", "get_pdf_info",
         "load_progress", "save_progress", "clear_progress", "process_page",
         "build_unavailable_page", "validate_markdown_quality", "calculate_costs",
@@ -87,7 +87,7 @@ def _validate_ocr_contract() -> None:
     missing += [name for name in required_callables if not callable(getattr(ocr, name, None))]
     if missing:
         raise RuntimeError(
-            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v11.5.0. "
+            "ocr_qwenVL.py incompatible. Déploie ensemble les deux fichiers v12.5.1. "
             "Éléments absents : " + ", ".join(sorted(set(missing)))
         )
     if not (ocr.OCR_AUDIT_PASS and ocr.MARKDOWN_VISUAL_PASS and ocr.DUAL_INDEPENDENT_VISUAL_PASSES):
@@ -102,8 +102,10 @@ def _validate_ocr_contract() -> None:
         raise RuntimeError("Contrat invalide : les deux prompts doivent être dans les messages utilisateur.")
     if int(ocr.NOMINAL_GENERATIONS_PER_PAGE) != 2 or int(ocr.SEMANTIC_RETRIES) != 0:
         raise RuntimeError("Contrat invalide : deux appels nominaux et aucune relance sémantique.")
-    if int(ocr.OCR_AUDIT_EXPECTED_VIEW_COUNT) != 4 or int(ocr.MARKDOWN_EXPECTED_VIEW_COUNT) != 5:
-        raise RuntimeError("Contrat invalide : 4 vues OCR audit et 5 vues Markdown.")
+    if int(ocr.OCR_AUDIT_EXPECTED_VIEW_COUNT) != 4 or int(ocr.MARKDOWN_EXPECTED_VIEW_COUNT) != 6:
+        raise RuntimeError("Contrat invalide : 4 vues OCR audit et 6 vues Markdown.")
+    if ocr.MARKDOWN_GEOMETRY_GUIDE is not True:
+        raise RuntimeError("Contrat invalide : le repère géométrique Markdown est obligatoire.")
     if not (ocr.STREAMING_OCR and ocr.STREAMING_MARKDOWN and ocr.STREAM_INCLUDE_USAGE):
         raise RuntimeError("Contrat invalide : SSE avec usage final sur les deux appels.")
 
@@ -134,7 +136,7 @@ def _read_int_env(
     return value
 
 
-_workers_raw = os.getenv("PAGE_WORKERS", os.getenv("PIPELINE_CONCURRENCY", "1")).strip()
+_workers_raw = os.getenv("PAGE_WORKERS", os.getenv("PIPELINE_CONCURRENCY", "4")).strip()
 try:
     PAGE_WORKERS = int(_workers_raw)
 except ValueError as exc:
@@ -384,7 +386,7 @@ def run_for_pdf(
     print(f"🧮 Pixels max/vue      : {ocr.MAX_VIEW_PIXELS:,}")
     print(f"📦 Corps HTTP maximal  : {ocr.MAX_REQUEST_BODY_MB:.1f} Mo par appel")
     print("🛟 Repli 413            : compression/résolution seulement")
-    print("📝 Sortie documentaire : un seul fichier Markdown")
+    print("📝 Sortie documentaire : Markdown + OCR, regroupés page par page")
     print("📎 OCR audit           : " + ("inclus" if ocr.INCLUDE_OCR_ANNEX else "désactivé"))
     print("🧠 Thinkings           : " + ("inclus" if ocr.INCLUDE_THINKING_ANNEX else "désactivés"))
     if ocr.OCR_DIAGNOSTIC_MODE:
@@ -471,7 +473,10 @@ def run_for_pdf(
     # comme un second document Markdown.
     validation = ocr.validate_markdown_quality(rendered_markdown, page_count)
     if not validation.get("ok"):
-        print("⚠️ Validation technique du Markdown : " + " | ".join(validation.get("errors", [])))
+        diagnostics = list(validation.get("errors", []) or [])
+        diagnostics.extend(f"révision:{item}" for item in (validation.get("critical_warnings", []) or []))
+        print("⚠️ Validation technique du Markdown : " + (" | ".join(diagnostics) or "révision requise"))
+        print("ℹ️ Le Markdown complet reste publié ; aucun contenu n'est masqué.")
 
     final_markdown = ocr.assemble_document_with_ocr_annex(
         rendered_markdown, page_results
@@ -634,6 +639,7 @@ def main() -> None:
                         "diagnosticMode": bool(ocr.OCR_DIAGNOSTIC_MODE),
                         "includeOcrAnnex": bool(ocr.INCLUDE_OCR_ANNEX),
                         "includeThinkingAnnex": bool(ocr.INCLUDE_THINKING_ANNEX),
+                        "finalMdLayout": getattr(ocr, "FINAL_MD_LAYOUT", "page_interleaved"),
                         "pipelineVersion": ocr.PIPELINE_VERSION,
                         "modelOcr": ocr.MODEL_OCR,
                         "modelMarkdown": ocr.MODEL_MARKDOWN,
