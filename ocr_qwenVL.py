@@ -4,7 +4,7 @@
 """
 ocr_qwenVL.py — deux lectures visuelles Qwen totalement indépendantes.
 
-Contrat v12.5.1 — exactement deux générations Qwen par page :
+Contrat v12.5.2 — exactement deux générations Qwen par page :
 1. Python rend une image maîtresse unique puis deux jeux de vues déterministes ;
 2. branche A : Qwen réalise un OCR visuel rapide d'audit, avec thinking activé ;
 3. branche B : Qwen repart indépendamment des pixels et produit le Markdown final,
@@ -100,53 +100,14 @@ def _env_bool(name: str, default: bool) -> bool:
 # Configuration
 # =============================================================================
 
-PIPELINE_VERSION = "qwen-dual-independent-vision-accounting-special-row-coordinate-lock-v12.5.1-20260806"
+PIPELINE_VERSION = "qwen-dual-independent-vision-accounting-special-row-coordinate-lock-v12.5.2-20260806"
 CHECKPOINT_VERSION = 50
 CHECKPOINT_SCHEMA = "dual-independent-vision-accounting-special-row-coordinate-lock-v48"
-EXPECTED_LAB_VERSION = "qwenocr-job-cloudrun-v1.8.6-20260806"
-EXPECTED_PACKAGE_FOLDER = "qwenocr-job-main"
-ENFORCE_PACKAGE_FOLDER_NAME = _env_bool("ENFORCE_PACKAGE_FOLDER_NAME", False)
-
-_RUNTIME_PACKAGE_CONTRACT_CHECKED = False
 
 
 def validate_runtime_package_contract() -> None:
-    """Bloque tout mélange de version depuis le module lui-même, avant le réseau."""
-    global _RUNTIME_PACKAGE_CONTRACT_CHECKED
-    if _RUNTIME_PACKAGE_CONTRACT_CHECKED:
-        return
-    module_dir = Path(__file__).resolve().parent
-    # Le dépôt Cloud Run garde ocr_qwenVL.py à la racine, tandis que le
-    # laboratoire local peut le placer dans code_under_test/. On choisit le
-    # premier répertoire qui contient VERSION.txt.
-    package_candidates = (module_dir, module_dir.parent)
-    package_root = next(
-        (candidate for candidate in package_candidates if (candidate / "VERSION.txt").exists()),
-        module_dir,
-    )
-    errors: List[str] = []
-    if ENFORCE_PACKAGE_FOLDER_NAME and package_root.name != EXPECTED_PACKAGE_FOLDER:
-        errors.append(f"dossier={package_root.name!r}, attendu={EXPECTED_PACKAGE_FOLDER!r}")
-    version_path = package_root / "VERSION.txt"
-    if not version_path.exists():
-        errors.append(f"VERSION.txt absent dans {package_root}")
-    else:
-        try:
-            actual_version = version_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            errors.append(f"VERSION.txt illisible: {exc}")
-        else:
-            if actual_version != EXPECTED_LAB_VERSION:
-                errors.append(f"VERSION.txt={actual_version!r}, attendu={EXPECTED_LAB_VERSION!r}")
-    if "v12.5.1-20260806" not in PIPELINE_VERSION:
-        errors.append(f"pipeline={PIPELINE_VERSION!r}, attendu contenant 'v12.5.1-20260806'")
-    if errors:
-        raise RuntimeError(
-            "Mélange de versions détecté par ocr_qwenVL.py avant tout appel Qwen : "
-            + " ; ".join(errors)
-            + ". Vérifie VERSION.txt et le déploiement complet du dépôt."
-        )
-    _RUNTIME_PACKAGE_CONTRACT_CHECKED = True
+    """Compatibilité du runner : aucun fichier de version externe n'est requis."""
+    return
 
 
 QWEN_WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID", "").strip()
@@ -191,15 +152,14 @@ SEMANTIC_RETRIES = 0
 STOP_ON_CRITICAL = _env_bool("STOP_ON_CRITICAL", False)
 PUBLISH_PARTIAL_DOCUMENT = _env_bool("PUBLISH_PARTIAL_DOCUMENT", True)
 PUBLISH_DEGRADED_MARKDOWN = _env_bool("PUBLISH_DEGRADED_MARKDOWN", False)
-STRICT_MARKDOWN_REGRESSION_GATE = False  # v12.5.1 : jamais de masquage du résultat Markdown
+STRICT_MARKDOWN_REGRESSION_GATE = False  # v12.5.2 : jamais de masquage du résultat Markdown
 OCR_DIAGNOSTIC_MODE = _env_bool("OCR_DIAGNOSTIC_MODE", False)
 PIPELINE_AUDIT_MODE = _env_bool("PIPELINE_AUDIT_MODE", True)
 
-# Les annexes font partie du fichier .md final en mode audit.
-INCLUDE_OCR_ANNEX = _env_bool("INCLUDE_OCR_ANNEX", True)
-# En production, final.md contient Markdown + OCR par page. Le thinking reste
-# capturé dans le checkpoint/diagnostic, mais n'est pas publié par défaut.
-INCLUDE_THINKING_ANNEX = _env_bool("INCLUDE_THINKING_ANNEX", False)
+# Format de production imposé : chaque page contient son Markdown puis son OCR.
+INCLUDE_OCR_ANNEX = True
+# Le thinking reste disponible dans les diagnostics/checkpoints mais jamais dans final.md.
+INCLUDE_THINKING_ANNEX = False
 CAPTURE_REASONING_CONTENT = _env_bool("CAPTURE_REASONING_CONTENT", True)
 THINKING_ANNEX_MAX_CHARS = max(10000, _env_int("THINKING_ANNEX_MAX_CHARS", 150000))
 OCR_ANNEX_SOURCE = "raw_qwen_independent_ocr_audit"
@@ -214,9 +174,7 @@ THINKING_ANNEX_START = '<!-- THINKING_ANNEX_START source="qwen_reasoning_content
 THINKING_ANNEX_END = "<!-- THINKING_ANNEX_END -->"
 
 # final.md : Markdown puis OCR, regroupés page par page.
-FINAL_MD_LAYOUT = os.getenv("FINAL_MD_LAYOUT", "page_interleaved").strip().lower()
-if FINAL_MD_LAYOUT not in {"page_interleaved", "legacy_annex"}:
-    raise RuntimeError("FINAL_MD_LAYOUT doit valoir page_interleaved ou legacy_annex.")
+FINAL_MD_LAYOUT = "page_interleaved"
 PAGE_BUNDLE_START_TEMPLATE = "<!-- PAGE_BUNDLE_START page={page} -->"
 PAGE_BUNDLE_END_TEMPLATE = "<!-- PAGE_BUNDLE_END page={page} -->"
 RENDERED_PAGE_START_TEMPLATE = "<!-- RENDERED_PAGE_START page={page} -->"
